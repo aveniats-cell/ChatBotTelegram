@@ -22,6 +22,24 @@ CANAL_ID = int(os.getenv("CANAL_ID", "0") or "0")
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
 
+# Префиксы и слова админских команд. Сообщения с ними не должны проверяться
+# на подписку и удаляться — иначе админ без подписки потеряет свою же команду.
+_ADMIN_PREFIXES = ("+", "-", "–", "−")
+_ADMIN_WORDS = (
+    "топ", "шип", "сделать", "профиль", "мой", "мое",
+    "список", "поймать",
+)
+
+
+def _looks_like_admin_command(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if stripped.startswith(_ADMIN_PREFIXES):
+        return True
+    low = stripped.lower()
+    return any(low.startswith(w) for w in _ADMIN_WORDS)
+
 
 async def is_subscribed(bot, user_id: int) -> bool:
     try:
@@ -56,6 +74,12 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if not msg or not user or user.is_bot:
         return
+
+    # Админские команды (+Мут, -Бан, Топ все, Профиль, ...) не проверяем —
+    # это служебные сообщения, их нельзя удалять и на них нельзя спамить.
+    if _looks_like_admin_command(msg.text or ""):
+        return
+
     try:
         await db.upsert_user(user.id, user.username, user.first_name)
     except Exception as e:
