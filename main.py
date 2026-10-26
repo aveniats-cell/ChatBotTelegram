@@ -1,6 +1,7 @@
 """Точка входа: webhook-версия для Render Web Service (Free)."""
 import os
 import logging
+from datetime import time as dtime
 
 from telegram import Update
 from telegram.ext import (
@@ -18,6 +19,7 @@ import roles
 import top
 import ship
 import wedding
+import profile
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,9 +43,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.upsert_user(u.id, u.username, u.first_name)
     await update.message.reply_text(
         "Привет! Я PR-бот.\n"
-        "Проверяю подписку, роли, муты и баны, веду топ чата, шип и свадьбы.\n\n"
-        "/check — проверить подписку\n"
-        "/ping — проверить, что бот жив"
+        "/check — подписка\n"
+        "/ping — жив?\n"
+        "Профиль — посмотреть профиль"
     )
 
 
@@ -67,7 +69,9 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Топ все / Топ день / Мое место\n"
         "• Шип @u1 @u2\n"
         "• Сделать предложение @user\n"
-        "• Расторгнуть брак / Мой брак"
+        "• +Брак @u1 @u2 (принудительно)\n"
+        "• -Брак (свой) / -Брак @user (админ)\n"
+        "• Мой брак / Профиль"
     )
 
 
@@ -79,6 +83,13 @@ async def post_init(app: Application) -> None:
         allowed_updates=Update.ALL_TYPES,
     )
     logger.info("Webhook set to %s", full_url)
+
+    # ежедневная очистка Топ день в 00:05 UTC
+    if app.job_queue:
+        app.job_queue.run_daily(
+            top.cleanup_job, time=dtime(hour=0, minute=5, tzinfo=None),
+        )
+        logger.info("JobQueue: ежедневная очистка messages_day запланирована")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -130,12 +141,15 @@ def build_app() -> Application:
 
     # ---------- 2.5 Свадьба ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расторгнуть\s+брак(\s|$)"), wedding.cmd_divorce))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # ---------- трекинг сообщений для топа ----------
-    # group=1 — работает параллельно с check_and_delete (group=0)
+    # ---------- Профиль ----------
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"), profile.cmd_profile))
+
+    # ---------- трекинг сообщений ----------
     app.add_handler(
         MessageHandler(
             filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -144,10 +158,8 @@ def build_app() -> Application:
         group=1,
     )
 
-    # ---------- существующая логика подписки ----------
-    app.add_handler(
-        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, pr.on_new_member)
-    )
+    # ---------- подписка ----------
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, pr.on_new_member))
     app.add_handler(
         MessageHandler(
             filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -162,7 +174,7 @@ def main() -> None:
     if not TOKEN:
         raise SystemExit("BOT_TOKEN не задан")
     if not WEBHOOK_URL:
-        raise SystemExit("WEBHOOK_URL не задан (например https://my-bot.onrender.com)")
+        raise SystemExit("WEBHOOK_URL не задан")
 
     app = build_app()
     logger.info("Starting webhook server on port %s", PORT)
