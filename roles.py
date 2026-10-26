@@ -13,11 +13,12 @@ from telegram import (
     InlineKeyboardMarkup,
     Message,
 )
-from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import resolver
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,6 @@ TIME_UNITS = {"ч": 3600, "h": 3600, "m": 60, "м": 60, "s": 1, "с": 1}
 
 
 def parse_duration(text: str) -> Optional[int]:
-    """'1ч 30м 5с' -> секунды. None если не распознано."""
     total = 0
     found = False
     for amount, unit in TIME_RE.findall(text):
@@ -56,30 +56,36 @@ def format_duration(seconds: int) -> str:
 async def _resolve_target(
     update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str
 ) -> Optional[tuple[int, str]]:
-    """
-    Возвращает (user_id, display_name) из реплая или @username в тексте.
-    """
     msg: Message = update.effective_message
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         return u.id, u.first_name or (u.username or str(u.id))
 
     m = USERNAME_RE.search(arg_text)
-    if m:
-        uname = m.group(1)
-        try:
-            chat = await context.bot.get_chat(f"@{uname}")
-            return chat.id, chat.first_name or uname
-        except TelegramError as e:
-            logger.warning("get_chat @%s: %s", uname, e)
-            return None
+    if not m:
+        return None
+    uname = m.group(1)
+
+    # 1) БД
+    uid = await db.get_user_by_username(uname)
+    if uid:
+        return uid, uname
+
+    # 2) Telethon (MTProto)
+    result = await resolver.resolve_username(uname)
+    if result:
+        return result
+
+    # 3) Каналы/группы через Bot API
+    try:
+        chat = await context.bot.get_chat(f"@{uname}")
+        return chat.id, chat.first_name or uname
+    except TelegramError as e:
+        logger.warning("get_chat @%s: %s", uname, e)
     return None
 
 
-async def _require_role(
-    update: Update, roles: tuple[str, ...]
-) -> bool:
-    """Проверяет, что автор — админ или имеет одну из ролей."""
+async def _require_role(update: Update, roles: tuple[str, ...]) -> bool:
     user = update.effective_user
     if not user:
         return False
@@ -180,7 +186,6 @@ async def list_commissars(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------- Поймать (шериф) ----------
 
 async def sheriff_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Шериф пишет «Поймать @user» или реплай на сообщение — админу летит запрос."""
     if not await _require_role(update, ("sheriff",)):
         await _deny(update, "⛔ Только шериф.")
         return
@@ -233,7 +238,6 @@ async def catch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # accept -> бан
     try:
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=uid)
         await db.add_punishment(uid, chat_id, "ban", None, ADMIN_ID)
@@ -248,7 +252,7 @@ async def catch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-# ---------- Мут / Бан (комиссар/админ) ----------
+# ---------- Мут / Бан ----------
 
 async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_role(update, ("commissar",)):
