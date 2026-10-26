@@ -310,10 +310,10 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
-    perms = ChatPermissions(
-        can_send_messages=True, can_send_media_messages=True,
-        can_send_other_messages=True, can_add_web_page_previews=True,
-    )
+    # all_permissions() — сбрасывает ВСЕ ограничения (media/voice/stickers/...).
+    # Раньше перечисляли поля вручную, но в Bot API 6.5 can_send_media_messages
+    # удалён → пользователь оставался частично замученным (фото/голос не шли).
+    perms = ChatPermissions.all_permissions()
     try:
         await context.bot.restrict_chat_member(
             chat_id=update.effective_chat.id, user_id=uid, permissions=perms,
