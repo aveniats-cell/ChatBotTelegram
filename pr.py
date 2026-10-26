@@ -18,25 +18,17 @@ import db
 
 logger = logging.getLogger(__name__)
 
-# ID канала, на который нужно подписаться
-CANAL_ID = int(os.getenv("CANAL_ID", "0"))
-# Ссылка на канал для кнопки
+CANAL_ID = int(os.getenv("CANAL_ID", "0") or "0")
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
-# Название канала в тексте
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
-    """Проверка подписки пользователя на канал."""
     try:
         member = await bot.get_chat_member(chat_id=CANAL_ID, user_id=user_id)
-        return member.status not in (
-            ChatMember.LEFT,
-            ChatMember.BANNED,
-        )
+        return member.status not in (ChatMember.LEFT, ChatMember.BANNED)
     except TelegramError as e:
         logger.warning("Не удалось проверить подписку %s: %s", user_id, e)
-        # Если не смогли проверить — не блокируем пользователя
         return True
 
 
@@ -47,7 +39,6 @@ def _subscription_keyboard() -> InlineKeyboardMarkup:
 
 
 def _subscription_text(user) -> str:
-    """HTML-текст: имя со скрытой ссылкой на профиль, без @username."""
     name = escape(user.first_name or "друг")
     if user.username:
         link = f'<a href="https://t.me/{user.username}">{name}</a>'
@@ -60,14 +51,15 @@ def _subscription_text(user) -> str:
     )
 
 
-async def check_and_delete(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Обработчик всех сообщений в группе: если не подписан — удалить и напомнить."""
+async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg: Message | None = update.effective_message
     user = update.effective_user
     if not msg or not user or user.is_bot:
         return
+    try:
+        await db.upsert_user(user.id, user.username, user.first_name)
+    except Exception as e:
+        logger.warning("upsert_user: %s", e)
 
     ok = await is_subscribed(context.bot, user.id)
     await db.set_subscription(user.id, ok)
@@ -93,7 +85,6 @@ async def check_and_delete(
 
 
 async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветствие новых участников группы."""
     for member in update.message.new_chat_members:
         if member.is_bot:
             continue
@@ -114,10 +105,7 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.warning("Приветствие не отправлено: %s", e)
 
 
-async def recheck_subscription(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Команда /check — пользователь может проверить статус и получить фидбек."""
+async def recheck_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
