@@ -9,6 +9,9 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+import db
+import resolver
+
 logger = logging.getLogger(__name__)
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
@@ -31,19 +34,18 @@ async def cmd_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = msg.text or ""
 
-    # Собираем цели: реплай + @username
     names = []
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         names.append(u.first_name or (u.username or str(u.id)))
     for uname in USERNAME_RE.findall(text):
-        try:
-            chat = await context.bot.get_chat(f"@{uname}")
-            names.append(chat.first_name or uname)
-        except TelegramError:
-            names.append(uname)
         if len(names) >= 2:
             break
+        r = await resolver.resolve_username(uname)
+        if r:
+            names.append(r[1])
+        else:
+            names.append(uname)
 
     if len(names) < 2:
         await msg.reply_text(
