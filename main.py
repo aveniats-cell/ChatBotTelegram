@@ -21,6 +21,9 @@ import top
 import ship
 import wedding
 import profile
+import economy
+import tictactoe
+import sss
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -76,13 +79,20 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Сделать предложение @user\n"
         "• +Брак @u1 @u2 (принудительно)\n"
         "• -Брак (свой) / -Брак @user (админ)\n"
-        "• Мой брак / Профиль"
+        "• Мой брак / Профиль\n"
+        "• хо @user 50 — крестики-нолики\n"
+        "• +Кредит 50 / -Кредит 50\n"
+        "• +Монеты 100 @user (админ)\n"
+        "• +ССС @user / -ССС @user / Список ССС\n"
+        "• +Суд ССС @user / +Суд @user"
     )
 
 
 async def post_init(app: Application) -> None:
     await db.init_db()
+    await sss.restore_sss_members()
     await resolver.start_client()
+
     full_url = f"{WEBHOOK_URL}/{WEBHOOK_PATH}"
     await app.bot.set_webhook(
         url=full_url, drop_pending_updates=True,
@@ -95,6 +105,7 @@ async def post_init(app: Application) -> None:
             top.cleanup_job, time=dtime(hour=0, minute=5, tzinfo=None),
         )
         logger.info("JobQueue: ежедневная очистка messages_day запланирована")
+        economy.register_jobs(app)
     else:
         logger.warning("JobQueue не инициализирован — проверь "
                        "python-telegram-bot[webhooks,job-queue]")
@@ -125,6 +136,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
     app.add_handler(CommandHandler("check", pr.recheck_subscription))
 
+    # Роли
     app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Шериф(\s|$)"), roles.revoke_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^\+Комиссар(\s|$)"), roles.grant_commissar))
@@ -140,20 +152,44 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
+    # Экономика
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Кредит(\s|$)"), economy.cmd_credit_take))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
+
+    # Топ
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мое\s+место(\s|$)"), top.cmd_my_place))
 
+    # Шип
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Шип(\s|$)"), ship.cmd_ship))
 
+    # Свадьба
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
+    # Профиль
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"), profile.cmd_profile))
 
+    # Крестики-нолики
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
+    app.add_handler(CallbackQueryHandler(tictactoe.ttt_callback, pattern=r"^ttt:"))
+
+    # ССС и суды — порядок ВАЖЕН: +Суд ССС раньше, чем +Суд
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ССС(\s|$)"), sss.cmd_sss_add))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]ССС(\s|$)"), sss.cmd_sss_remove))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+ССС(\s|$)"), sss.cmd_sss_list))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Суд\s+ССС(\s|$)"), sss.cmd_sss_trial))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Суд(\s|$)"), sss.cmd_public_trial))
+    app.add_handler(CallbackQueryHandler(sss.sss_trial_callback, pattern=r"^ssstrial:"))
+    app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
+    app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
+
+    # Счётчик сообщений
     app.add_handler(
         MessageHandler(
             filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
