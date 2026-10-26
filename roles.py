@@ -266,7 +266,6 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update, "⛔ Только комиссар или админ.")
         return
     raw = (update.message.text or "")
-    # Убираем саму команду "+Мут" и парсим остаток
     rest = raw.split(maxsplit=1)
     rest = rest[1] if len(rest) > 1 else ""
     duration = parse_duration(rest)
@@ -274,7 +273,6 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Не понял время. Пример: +Мут @user 1ч 30м")
         return
 
-    # ВАЖНО: вырезаем время из строки, чтобы @user не путался
     clean = _strip_duration(rest)
     target = await _resolve_target(update, context, clean)
     if not target:
@@ -310,9 +308,6 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
-    # all_permissions() — сбрасывает ВСЕ ограничения (media/voice/stickers/...).
-    # Раньше перечисляли поля вручную, но в Bot API 6.5 can_send_media_messages
-    # удалён → пользователь оставался частично замученным (фото/голос не шли).
     perms = ChatPermissions.all_permissions()
     try:
         await context.bot.restrict_chat_member(
