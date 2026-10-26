@@ -70,7 +70,6 @@ async def _create_tables() -> None:
             active     INTEGER NOT NULL DEFAULT 1
         )
     """)
-    # Топ за всё время — НЕ чистится
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id   INTEGER NOT NULL,
@@ -79,7 +78,6 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-    # Топ за день — ЧИСТИТСЯ ежедневно
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS messages_day (
             chat_id   INTEGER NOT NULL,
@@ -170,6 +168,17 @@ async def get_user(user_id: int) -> Optional[dict]:
             "mutes_issued", "reports_made", "courts_held",
             "tictactoe_wins", "tictactoe_losses", "tictactoe_draws"]
     return dict(zip(keys, r))
+
+
+async def get_user_by_username(username: str) -> Optional[int]:
+    """Резолв @username -> user_id через локальную таблицу users."""
+    if not username:
+        return None
+    rs = await _client.execute(
+        "SELECT user_id FROM users WHERE username = ? COLLATE NOCASE",
+        [username.lstrip("@")],
+    )
+    return rs.rows[0][0] if rs.rows else None
 
 
 async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
@@ -354,8 +363,6 @@ async def top_messages_day(chat_id: int, day: str, limit: int = 50) -> List[tupl
 
 
 async def cleanup_old_days(keep_days: int = 0) -> int:
-    """Удаляет messages_day старше сегодняшнего дня (по UTC).
-    keep_days=0 -> оставить только сегодня."""
     if keep_days == 0:
         rs = await _client.execute(
             "DELETE FROM messages_day WHERE day < date('now')"
