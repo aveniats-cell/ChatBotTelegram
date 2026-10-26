@@ -2,7 +2,7 @@
 import os
 import logging
 from html import escape
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 # ---------- трекинг сообщений ----------
-# Регистрируется с group=1, чтобы работать параллельно с check_and_delete.
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -26,9 +25,23 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not chat:
         return
     try:
+        await db.upsert_user(user.id, user.username, user.first_name)
         await db.inc_message(chat.id, user.id)
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.inc_message_day(chat.id, user.id, day)
     except Exception as e:
-        logger.warning("inc_message: %s", e)
+        logger.warning("track_message: %s", e)
+
+
+# ---------- ежедневная очистка ----------
+
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет messages_day за прошлые дни. Запускается в 00:05 UTC."""
+    try:
+        deleted = await db.cleanup_old_days(keep_days=0)
+        logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
+    except Exception as e:
+        logger.warning("cleanup_job: %s", e)
 
 
 # ---------- вывод топов ----------
@@ -53,6 +66,26 @@ async def _build_top_text(
     return "\n".join(lines)
 
 
+async def _build_top_day_text(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, limit: int = 50,
+) -> str:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = await db.top_messages_day(chat_id, day, limit=limit)
+    if not rows:
+        return "Сегодня ещё никто не писал — топ дня пуст."
+    lines = [f"<b>🏆 Топ за день ({day})</b>"]
+    for i, (uid, cnt) in enumerate(rows, start=1):
+        name = str(uid)
+        try:
+            chat = await context.bot.get_chat(uid)
+            name = chat.first_name or chat.username or str(uid)
+        except TelegramError:
+            pass
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lines.append(f"{medal} {escape(name)} — <b>{cnt}</b>")
+    return "\n".join(lines)
+
+
 async def cmd_top_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
@@ -62,14 +95,10 @@ async def cmd_top_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_top_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Топ за последние 24 часа. Так как храним только total, считаем «день» = те, кто писал за сутки."""
-    # Внимание: чтобы «Топ день» работал корректно, нужна отдельная таблица.
-    # Здесь — упрощённый вариант: показываем тот же топ, но с пометкой.
-    # Для настоящего «дня» см. примечание ниже.
     chat = update.effective_chat
     if not chat:
         return
-    text = await _build_top_text(context, chat.id, limit=50, title="🏆 Топ за день")
+    text = await _build_top_day_text(context, chat.id, limit=50)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
