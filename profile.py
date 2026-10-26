@@ -14,7 +14,7 @@ import resolver
 
 logger = logging.getLogger(__name__)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
@@ -29,9 +29,12 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m:
         return None
     uname = m.group(1)
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid
+    try:
+        uid = await db.get_user_by_username(uname)
+        if uid:
+            return uid
+    except Exception as e:
+        logger.warning("get_user_by_username(%s): %s", uname, e)
     r = await resolver.resolve_username(uname)
     if r:
         return r[0]
@@ -44,6 +47,19 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await _cmd_profile_inner(update, context)
+    except Exception as e:
+        logger.exception("cmd_profile error: %s", e)
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Не удалось получить профиль. Попробуйте позже."
+            )
+        except Exception:
+            pass
+
+
+async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     msg = update.effective_message
     if not chat or not msg:
