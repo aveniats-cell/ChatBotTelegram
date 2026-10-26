@@ -1,7 +1,7 @@
 """Turso DB через HTTP-транспорт (libsql-client 0.3.1)."""
 import os
 import logging
-from typing import Optional, Any
+from typing import Optional, Any, List
 from libsql_client import create_client
 
 logger = logging.getLogger(__name__)
@@ -13,16 +13,14 @@ _client: Optional[Any] = None
 
 
 def _http_url(url: str) -> str:
-    """libsql:// -> https://, чтобы клиент шёл по HTTP, а не по WebSocket."""
     if url.startswith("libsql://"):
         return "https://" + url[len("libsql://"):]
     return url
 
 
 def _url_with_token(url: str, token: str) -> str:
-    """Добавляет authToken в URL — способ аутентификации в libsql-client 0.3.1."""
-    separator = "&" if "?" in url else "?"
-    return f"{url}{separator}authToken={token}"
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}authToken={token}"
 
 
 async def init_db() -> None:
@@ -30,10 +28,7 @@ async def init_db() -> None:
     if not TURSO_URL or not TURSO_TOKEN:
         raise SystemExit("TURSO_DATABASE_URL и/или TURSO_AUTH_TOKEN не заданы")
     if _client is None:
-        # В libsql-client 0.3.1 нет аргумента auth_token/scheme у create_client —
-        # токен передаётся query-параметром authToken в URL.
-        url = _url_with_token(_http_url(TURSO_URL), TURSO_TOKEN)
-        _client = create_client(url)
+        _client = create_client(_url_with_token(_http_url(TURSO_URL), TURSO_TOKEN))
     await _create_tables()
     logger.info("DB инициализирована")
 
@@ -54,6 +49,26 @@ async def _create_tables() -> None:
             checked_at   TEXT
         )
     """)
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS roles (
+            user_id    INTEGER PRIMARY KEY,
+            role       TEXT NOT NULL,           -- 'sheriff' | 'commissar'
+            granted_by INTEGER,
+            granted_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS punishments (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            chat_id    INTEGER NOT NULL,
+            kind       TEXT NOT NULL,           -- 'mute' | 'ban'
+            until_ts   INTEGER,                 -- unix ts, NULL = навсегда (для ban)
+            issued_by  INTEGER,
+            issued_at  TEXT DEFAULT (datetime('now')),
+            active     INTEGER NOT NULL DEFAULT 1
+        )
+    """)
 
 
 async def close_db() -> None:
@@ -62,6 +77,8 @@ async def close_db() -> None:
         await _client.close()
         _client = None
 
+
+# ---------- users ----------
 
 async def upsert_user(user_id: int, username: Optional[str], first_name: str) -> None:
     await _client.execute(
@@ -73,6 +90,8 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: str) ->
         [user_id, username or "", first_name or ""],
     )
 
+
+# ---------- subscriptions ----------
 
 async def set_subscription(user_id: int, is_subscribed: bool) -> None:
     await _client.execute(
@@ -92,3 +111,77 @@ async def get_subscription(user_id: int) -> Optional[bool]:
     if not rs.rows:
         return None
     return bool(rs.rows[0][0])
+
+
+# ---------- roles ----------
+
+async def set_role(user_id: int, role: str, granted_by: int) -> None:
+    """role = 'sheriff' | 'commissar'"""
+    await _client.execute(
+        """INSERT INTO roles (user_id, role, granted_by, granted_at)
+           VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             role=excluded.role,
+             granted_by=excluded.granted_by,
+             granted_at=excluded.granted_at""",
+        [user_id, role, granted_by],
+    )
+
+
+async def remove_role(user_id: int) -> None:
+    await _client.execute("DELETE FROM roles WHERE user_id = ?", [user_id])
+
+
+async def get_role(user_id: int) -> Optional[str]:
+    rs = await _client.execute(
+        "SELECT role FROM roles WHERE user_id = ?", [user_id]
+    )
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
+
+
+async def list_roles(role: str) -> List[int]:
+    rs = await _client.execute(
+        "SELECT user_id FROM roles WHERE role = ? ORDER BY granted_at", [role]
+    )
+    return [row[0] for row in rs.rows]
+
+
+# ---------- punishments ----------
+
+async def add_punishment(
+    user_id: int, chat_id: int, kind: str,
+    until_ts: Optional[int], issued_by: int,
+) -> None:
+    await _client.execute(
+        """INSERT INTO punishments (user_id, chat_id, kind, until_ts, issued_by)
+           VALUES (?, ?, ?, ?, ?)""",
+        [user_id, chat_id, kind, until_ts, issued_by],
+    )
+
+
+async def deactivate_punishment(user_id: int, chat_id: int, kind: str) -> int:
+    """Возвращает количество деактивированных записей."""
+    rs = await _client.execute(
+        """UPDATE punishments SET active = 0
+           WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1""",
+        [user_id, chat_id, kind],
+    )
+    # libsql-client возвращает rows_affected в rs.rows_affected (если поддерживается)
+    return getattr(rs, "rows_affected", 0)
+
+
+async def get_active_punishment(
+    user_id: int, chat_id: int, kind: str
+) -> Optional[dict]:
+    rs = await _client.execute(
+        """SELECT id, until_ts FROM punishments
+           WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1
+           ORDER BY id DESC LIMIT 1""",
+        [user_id, chat_id, kind],
+    )
+    if not rs.rows:
+        return None
+    row = rs.rows[0]
+    return {"id": row[0], "until_ts": row[1]}
