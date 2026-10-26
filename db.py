@@ -1,4 +1,4 @@
-"""Работа с Turso DB (libsql-client)."""
+"""Работа с Turso DB (libsql-client, HTTP-транспорт)."""
 import os
 import logging
 from typing import Optional, Any
@@ -16,8 +16,18 @@ _client: Optional[Any] = None
 async def init_db() -> None:
     """Инициализация клиента и создание таблиц."""
     global _client
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise SystemExit(
+            "TURSO_DATABASE_URL и/или TURSO_AUTH_TOKEN не заданы в Environment"
+        )
     if _client is None:
-        _client = create_client(url=TURSO_URL, auth_token=TURSO_TOKEN)
+        # scheme="http" — используем HTTPS /v2/pipeline вместо WebSocket,
+        # иначе Turso отвечает 400 на wss:// handshake
+        _client = create_client(
+            url=TURSO_URL,
+            auth_token=TURSO_TOKEN,
+            scheme="http",
+        )
     await _create_tables()
     logger.info("DB инициализирована")
 
