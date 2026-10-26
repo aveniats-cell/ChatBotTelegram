@@ -68,7 +68,6 @@ async def _exec(sql: str, params: Optional[list] = None, retries: int = 2):
                 await asyncio.sleep(0.2 * (attempt + 1))
 
     if last_exc is not None:
-        # Для write-запросов это особенно критично — молча потерянный INSERT
         logger.error("db exec failed (sql: %.80s): %s", sql, last_exc)
     return _EmptyResult()
 
@@ -174,11 +173,9 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
-    # Один раз получаем существующие колонки по таблицам
     existing: dict = {}
     for table in {t for t, _, _ in adds}:
         rs = await _exec(f"PRAGMA table_info({table})")
-        # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
         existing[table] = {row[1] for row in rs.rows}
 
     for table, col, decl in adds:
@@ -254,6 +251,13 @@ async def set_sss(user_id: int, is_member: bool) -> None:
     )
 
 
+async def list_sss_members() -> List[int]:
+    """Возвращает user_id всех, у кого sss_member = 1 (для восстановления
+    состава ССС после рестарта)."""
+    rs = await _exec("SELECT user_id FROM users WHERE sss_member = 1")
+    return [row[0] for row in rs.rows]
+
+
 async def add_balance(user_id: int, delta: int) -> None:
     await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
@@ -266,6 +270,16 @@ async def add_credit(user_id: int, delta: int) -> None:
         "UPDATE users SET credit = COALESCE(credit, 0) + ? WHERE user_id = ?",
         [delta, user_id],
     )
+
+
+async def apply_credit_interest(percent: float) -> int:
+    """Начисляет проценты на остаток долга. Возвращает rows_affected."""
+    rs = await _exec(
+        "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
+        "WHERE credit > 0",
+        [percent],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 # ---------- subscriptions ----------
@@ -434,9 +448,6 @@ async def cleanup_old_days(keep_days: int = 0) -> int:
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
-    # forced=True  -> запись сразу active (это принудительный брак)
-    # forced=False -> запись pending (active=0), активируется через accept_marriage
-    #
     # RETURNING id — атомарно в одном запросе. Без этого last_insert_rowid()
     # в HTTP-транспорте может уйти на другой коннект и вернуть чужой/0 id.
     rs = await _exec(
