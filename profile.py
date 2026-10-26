@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 import db
 import resolver
+import sss
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,16 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
             marriage_line = "нет"
 
     role = await db.get_role(target_uid)
+    sss_member = bool(user_row.get("sss_member")) or (target_uid in sss._sss_all())
+
     if target_uid == ADMIN_ID:
         role_str = "Создатель"
+    elif sss_member and role == "sheriff":
+        role_str = "Шериф · ССС"
+    elif sss_member and role == "commissar":
+        role_str = "Комиссар · ССС"
+    elif sss_member:
+        role_str = "ССС"
     elif role == "sheriff":
         role_str = "Шериф"
     elif role == "commissar":
@@ -121,7 +130,7 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if balance is None:
         balance = 10
     credit = user_row.get("credit") or 0
-    sss = "да" if user_row.get("sss_member") else "нет"
+    sss_label = "да" if sss_member else "нет"
 
     wins = user_row.get("tictactoe_wins") or 0
     losses = user_row.get("tictactoe_losses") or 0
@@ -139,7 +148,7 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Брак: {marriage_line}\n"
         f"Монеты: <b>{balance}</b>\n"
         f"Кредит: <b>{credit}</b>\n"
-        f"ССС: <b>{sss}</b>\n"
+        f"ССС: <b>{sss_label}</b>\n"
         f"Роль: <b>{role_str}</b>\n\n"
         f"🎮 Крестики-нолики:\n"
         f"  Побед: <b>{wins}</b>\n"
