@@ -1,4 +1,4 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение, «уровень» брака."""
+"""2.5 Свадьба: предложение, принятие/отклонение, расторжение."""
 import os
 import re
 import logging
@@ -15,6 +15,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import resolver
 
 logger = logging.getLogger(__name__)
 
@@ -24,37 +25,50 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str):
-    """Возвращает (user_id, display_name) из реплая или @username."""
     msg = update.effective_message
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         return u.id, u.first_name or (u.username or str(u.id))
     m = USERNAME_RE.search(arg_text)
-    if m:
-        uname = m.group(1)
-        try:
-            chat = await context.bot.get_chat(f"@{uname}")
-            return chat.id, chat.first_name or uname
-        except TelegramError as e:
-            logger.warning("get_chat @%s: %s", uname, e)
+    if not m:
+        return None
+    uname = m.group(1)
+    uid = await db.get_user_by_username(uname)
+    if uid:
+        return uid, uname
+    r = await resolver.resolve_username(uname)
+    if r:
+        return r
+    try:
+        chat = await context.bot.get_chat(f"@{uname}")
+        return chat.id, chat.first_name or uname
+    except TelegramError as e:
+        logger.warning("get_chat @%s: %s", uname, e)
     return None
 
 
 async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Возвращает до двух целей: из реплая + @username."""
     targets = []
     msg = update.effective_message
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         targets.append((u.id, u.first_name or u.username or str(u.id)))
     for uname in USERNAME_RE.findall(text):
+        if len(targets) >= 2:
+            break
+        uid = await db.get_user_by_username(uname)
+        if uid:
+            targets.append((uid, uname))
+            continue
+        r = await resolver.resolve_username(uname)
+        if r:
+            targets.append(r)
+            continue
         try:
             c = await context.bot.get_chat(f"@{uname}")
             targets.append((c.id, c.first_name or uname))
         except TelegramError as e:
             logger.warning("get_chat @%s: %s", uname, e)
-        if len(targets) >= 2:
-            break
     return targets
 
 
@@ -69,7 +83,7 @@ def _marriage_level(created_at_str: str) -> int:
         return 1
 
 
-# ---------- предложение (добровольное) ----------
+# ---------- предложение ----------
 
 async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -137,7 +151,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer("Предложение не найдено.", show_alert=True)
         return
 
-    # кнопки нажимает только адресат (user2)
     if user.id != m["user2_id"]:
         await q.answer("Это предложение не вам.", show_alert=True)
         return
@@ -162,7 +175,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # accept
     await db.accept_marriage(mid)
     await db.log_marriage_event(
         m["chat_id"], m["user1_id"], m["user2_id"], "married",
@@ -188,10 +200,9 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-# ---------- расторжение (добровольное) ----------
+# ---------- расторжение ----------
 
 async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Брак — расторгнуть свой брак. Нельзя для принудительных."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -217,10 +228,9 @@ async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-# ---------- принудительный брак (+Брак) ----------
+# ---------- принудительный брак ----------
 
 async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Брак @u1 @u2 — только админ. Создаёт принудительный брак."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -243,7 +253,6 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("Это один и тот же человек 🙂")
         return
 
-    # разводим существующие браки у обоих (принудительно)
     for uid in (id1, id2):
         m = await db.find_active_marriage(chat.id, uid)
         if m:
@@ -264,10 +273,9 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-# ---------- принудительный развод (админ) ----------
+# ---------- принудительный развод ----------
 
 async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Брак @user — только админ. Принудительно разводит пользователя."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -297,12 +305,9 @@ async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
-# ---------- обёртка для -Брак ----------
-
 async def cmd_force_divorce_or_self(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """-Брак — свой развод. -Брак @user — админский принудительный развод."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
