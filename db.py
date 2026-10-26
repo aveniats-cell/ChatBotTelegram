@@ -171,7 +171,7 @@ async def get_user(user_id: int) -> Optional[dict]:
 
 
 async def get_user_by_username(username: str) -> Optional[int]:
-    """Резолв @username -> user_id через локальную таблицу users."""
+    """@username -> user_id через локальную таблицу users."""
     if not username:
         return None
     rs = await _client.execute(
@@ -363,6 +363,7 @@ async def top_messages_day(chat_id: int, day: str, limit: int = 50) -> List[tupl
 
 
 async def cleanup_old_days(keep_days: int = 0) -> int:
+    """Удаляет messages_day старше сегодняшнего дня (UTC)."""
     if keep_days == 0:
         rs = await _client.execute(
             "DELETE FROM messages_day WHERE day < date('now')"
