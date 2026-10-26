@@ -3,6 +3,8 @@ import os
 import asyncio
 import logging
 from typing import Optional, Any, List
+
+import aiohttp
 from libsql_client import create_client
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,7 @@ def _is_read_only(sql: str) -> bool:
 
 
 async def _exec(sql: str, params: Optional[list] = None, retries: int = 2):
-    """Обёртка над _client.execute с ретраями при KeyError('result').
+    """Обёртка над _client.execute с ретраями.
 
     Ретраи применяются только к read-only запросам, чтобы не дублировать
     INSERT/UPDATE/DELETE на повторной попытке.
@@ -56,7 +58,7 @@ async def _exec(sql: str, params: Optional[list] = None, retries: int = 2):
             if params is None:
                 return await _client.execute(sql)
             return await _client.execute(sql, params)
-        except KeyError as e:
+        except (KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
@@ -66,7 +68,8 @@ async def _exec(sql: str, params: Optional[list] = None, retries: int = 2):
                 await asyncio.sleep(0.2 * (attempt + 1))
 
     if last_exc is not None:
-        logger.error("db exec failed after retries (sql: %.80s): %s", sql, last_exc)
+        # Для write-запросов это особенно критично — молча потерянный INSERT
+        logger.error("db exec failed (sql: %.80s): %s", sql, last_exc)
     return _EmptyResult()
 
 
@@ -433,12 +436,15 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
     # forced=True  -> запись сразу active (это принудительный брак)
     # forced=False -> запись pending (active=0), активируется через accept_marriage
-    await _exec(
+    #
+    # RETURNING id — атомарно в одном запросе. Без этого last_insert_rowid()
+    # в HTTP-транспорте может уйти на другой коннект и вернуть чужой/0 id.
+    rs = await _exec(
         """INSERT INTO marriages (chat_id, user1_id, user2_id, active, forced)
-           VALUES (?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?)
+           RETURNING id""",
         [chat_id, user1_id, user2_id, 1 if forced else 0, 1 if forced else 0],
     )
-    rs = await _exec("SELECT last_insert_rowid()")
     return rs.rows[0][0] if rs.rows else 0
 
 
