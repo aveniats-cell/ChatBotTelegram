@@ -42,22 +42,21 @@ async def is_subscribed(bot, user_id: int) -> bool:
 
 def _subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📢 Перейти в канал", url=CANAL_URL)]]
+        [[InlineKeyboardButton("📢 Подписаться на канал", url=CANAL_URL)]]
     )
 
 
 def _subscription_text(user) -> str:
-    """HTML-текст: имя со скрытой ссылкой на профиль."""
+    """HTML-текст: имя со скрытой ссылкой на профиль, без @username."""
     name = escape(user.first_name or "друг")
     if user.username:
         link = f'<a href="https://t.me/{user.username}">{name}</a>'
-        uname = f"(@{escape(user.username)})"
     else:
         link = f'<a href="tg://user?id={user.id}">{name}</a>'
-        uname = ""
     return (
-        f"👋 {link} {uname}, чтобы писать в чат, подпишитесь на "
-        f"<b>{escape(CANAL_TITLE)}</b> и нажмите кнопку ниже."
+        f"👋 {link}, чтобы писать в чат, сначала подпишитесь на "
+        f"<b>{escape(CANAL_TITLE)}</b>.\n\n"
+        f"После подписки возвращайтесь — и пишите. ✅"
     )
 
 
@@ -94,7 +93,7 @@ async def check_and_delete(
 
 
 async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветствие новых участников группы (по желанию)."""
+    """Приветствие новых участников группы."""
     for member in update.message.new_chat_members:
         if member.is_bot:
             continue
@@ -125,9 +124,10 @@ async def recheck_subscription(
     ok = await is_subscribed(context.bot, user.id)
     await db.set_subscription(user.id, ok)
     if ok:
-        await update.message.reply_text("✅ Подписка активна, можете писать в чат.")
+        await update.message.reply_text("✅ Подписка активна — можете писать в чат.")
     else:
         await update.message.reply_text(
-            "❌ Вы пока не подписаны на канал.",
+            f"❌ Вы пока не подписаны на «{CANAL_TITLE}».\n"
+            f"Подпишитесь и возвращайтесь — после этого сообщения будут проходить.",
             reply_markup=_subscription_keyboard(),
         )
