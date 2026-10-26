@@ -19,12 +19,21 @@ def _http_url(url: str) -> str:
     return url
 
 
+def _url_with_token(url: str, token: str) -> str:
+    """Добавляет authToken в URL — способ аутентификации в libsql-client 0.3.1."""
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}authToken={token}"
+
+
 async def init_db() -> None:
     global _client
     if not TURSO_URL or not TURSO_TOKEN:
         raise SystemExit("TURSO_DATABASE_URL и/или TURSO_AUTH_TOKEN не заданы")
     if _client is None:
-        _client = create_client(url=_http_url(TURSO_URL), auth_token=TURSO_TOKEN)
+        # В libsql-client 0.3.1 нет аргумента auth_token/scheme у create_client —
+        # токен передаётся query-параметром authToken в URL.
+        url = _url_with_token(_http_url(TURSO_URL), TURSO_TOKEN)
+        _client = create_client(url)
     await _create_tables()
     logger.info("DB инициализирована")
 
