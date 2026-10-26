@@ -52,7 +52,7 @@ async def _create_tables() -> None:
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS roles (
             user_id    INTEGER PRIMARY KEY,
-            role       TEXT NOT NULL,           -- 'sheriff' | 'commissar'
+            role       TEXT NOT NULL,
             granted_by INTEGER,
             granted_at TEXT DEFAULT (datetime('now'))
         )
@@ -62,11 +62,31 @@ async def _create_tables() -> None:
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id    INTEGER NOT NULL,
             chat_id    INTEGER NOT NULL,
-            kind       TEXT NOT NULL,           -- 'mute' | 'ban'
-            until_ts   INTEGER,                 -- unix ts, NULL = навсегда (для ban)
+            kind       TEXT NOT NULL,
+            until_ts   INTEGER,
             issued_by  INTEGER,
             issued_at  TEXT DEFAULT (datetime('now')),
             active     INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    # счётчик сообщений по чату
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            chat_id   INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            count     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    # браки
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS marriages (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id      INTEGER NOT NULL,
+            user1_id     INTEGER NOT NULL,
+            user2_id     INTEGER NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now')),
+            active       INTEGER NOT NULL DEFAULT 1
         )
     """)
 
@@ -116,7 +136,6 @@ async def get_subscription(user_id: int) -> Optional[bool]:
 # ---------- roles ----------
 
 async def set_role(user_id: int, role: str, granted_by: int) -> None:
-    """role = 'sheriff' | 'commissar'"""
     await _client.execute(
         """INSERT INTO roles (user_id, role, granted_by, granted_at)
            VALUES (?, ?, ?, datetime('now'))
@@ -133,9 +152,7 @@ async def remove_role(user_id: int) -> None:
 
 
 async def get_role(user_id: int) -> Optional[str]:
-    rs = await _client.execute(
-        "SELECT role FROM roles WHERE user_id = ?", [user_id]
-    )
+    rs = await _client.execute("SELECT role FROM roles WHERE user_id = ?", [user_id])
     if not rs.rows:
         return None
     return rs.rows[0][0]
@@ -150,10 +167,8 @@ async def list_roles(role: str) -> List[int]:
 
 # ---------- punishments ----------
 
-async def add_punishment(
-    user_id: int, chat_id: int, kind: str,
-    until_ts: Optional[int], issued_by: int,
-) -> None:
+async def add_punishment(user_id: int, chat_id: int, kind: str,
+                          until_ts: Optional[int], issued_by: int) -> None:
     await _client.execute(
         """INSERT INTO punishments (user_id, chat_id, kind, until_ts, issued_by)
            VALUES (?, ?, ?, ?, ?)""",
@@ -162,19 +177,15 @@ async def add_punishment(
 
 
 async def deactivate_punishment(user_id: int, chat_id: int, kind: str) -> int:
-    """Возвращает количество деактивированных записей."""
     rs = await _client.execute(
         """UPDATE punishments SET active = 0
            WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1""",
         [user_id, chat_id, kind],
     )
-    # libsql-client возвращает rows_affected в rs.rows_affected (если поддерживается)
     return getattr(rs, "rows_affected", 0)
 
 
-async def get_active_punishment(
-    user_id: int, chat_id: int, kind: str
-) -> Optional[dict]:
+async def get_active_punishment(user_id: int, chat_id: int, kind: str) -> Optional[dict]:
     rs = await _client.execute(
         """SELECT id, until_ts FROM punishments
            WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1
@@ -185,3 +196,103 @@ async def get_active_punishment(
         return None
     row = rs.rows[0]
     return {"id": row[0], "until_ts": row[1]}
+
+
+# ---------- messages (топ чата) ----------
+
+async def inc_message(chat_id: int, user_id: int) -> None:
+    await _client.execute(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, 1)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + 1""",
+        [chat_id, user_id],
+    )
+
+
+async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
+    """Возвращает [(user_id, count)] по убыванию."""
+    rs = await _client.execute(
+        """SELECT user_id, count FROM messages
+           WHERE chat_id = ? ORDER BY count DESC LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
+    """Возвращает (count, rank, total_users) или None, если юзер не писал."""
+    rs = await _client.execute(
+        "SELECT count FROM messages WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    count = rs.rows[0][0]
+    # место = число пользователей с count > моего + 1
+    rs2 = await _client.execute(
+        "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND count > ?",
+        [chat_id, count],
+    )
+    rank = (rs2.rows[0][0] or 0) + 1
+    rs3 = await _client.execute(
+        "SELECT COUNT(*) FROM messages WHERE chat_id = ?", [chat_id]
+    )
+    total = rs3.rows[0][0] or 0
+    return count, rank, total
+
+
+# ---------- marriages ----------
+
+async def create_proposal(chat_id: int, user1_id: int, user2_id: int) -> int:
+    """Создаёт неактивный брак (предложение). Возвращает id."""
+    await _client.execute(
+        """INSERT INTO marriages (chat_id, user1_id, user2_id, active)
+           VALUES (?, ?, ?, 0)""",
+        [chat_id, user1_id, user2_id],
+    )
+    rs = await _client.execute("SELECT last_insert_rowid()")
+    return rs.rows[0][0]
+
+
+async def accept_marriage(marriage_id: int) -> None:
+    await _client.execute(
+        "UPDATE marriages SET active = 1 WHERE id = ?", [marriage_id]
+    )
+
+
+async def delete_marriage(marriage_id: int) -> None:
+    await _client.execute("DELETE FROM marriages WHERE id = ?", [marriage_id])
+
+
+async def get_marriage(marriage_id: int) -> Optional[dict]:
+    rs = await _client.execute(
+        """SELECT id, chat_id, user1_id, user2_id, created_at, active
+           FROM marriages WHERE id = ?""",
+        [marriage_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "user1_id": r[2],
+        "user2_id": r[3], "created_at": r[4], "active": bool(r[5]),
+    }
+
+
+async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
+    rs = await _client.execute(
+        """SELECT id, chat_id, user1_id, user2_id, created_at, active
+           FROM marriages
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)
+           LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "user1_id": r[2],
+        "user2_id": r[3], "created_at": r[4], "active": bool(r[5]),
+    }
