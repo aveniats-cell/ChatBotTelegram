@@ -30,6 +30,7 @@ async def init_db() -> None:
     if _client is None:
         _client = create_client(_url_with_token(_http_url(TURSO_URL), TURSO_TOKEN))
     await _create_tables()
+    await _migrate_tables()
     logger.info("DB инициализирована")
 
 
@@ -69,7 +70,7 @@ async def _create_tables() -> None:
             active     INTEGER NOT NULL DEFAULT 1
         )
     """)
-    # счётчик сообщений по чату
+    # Топ за всё время — НЕ чистится
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id   INTEGER NOT NULL,
@@ -78,7 +79,16 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-    # браки
+    # Топ за день — ЧИСТИТСЯ ежедневно
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS messages_day (
+            chat_id   INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            day       TEXT NOT NULL,
+            count     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id, day)
+        )
+    """)
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS marriages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,9 +96,41 @@ async def _create_tables() -> None:
             user1_id     INTEGER NOT NULL,
             user2_id     INTEGER NOT NULL,
             created_at   TEXT DEFAULT (datetime('now')),
-            active       INTEGER NOT NULL DEFAULT 1
+            active       INTEGER NOT NULL DEFAULT 1,
+            forced       INTEGER NOT NULL DEFAULT 0
         )
     """)
+    await _client.execute("""
+        CREATE TABLE IF NOT EXISTS marriage_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            user1_id    INTEGER NOT NULL,
+            user2_id    INTEGER NOT NULL,
+            event       TEXT NOT NULL,
+            event_at    TEXT DEFAULT (datetime('now')),
+            by_user_id  INTEGER
+        )
+    """)
+
+
+async def _migrate_tables() -> None:
+    """Добавляет новые колонки в users (idempotent)."""
+    adds = [
+        ("users", "balance", "INTEGER NOT NULL DEFAULT 10"),
+        ("users", "credit", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "sss_member", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "mutes_issued", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "reports_made", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "courts_held", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "tictactoe_wins", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for table, col, decl in adds:
+        try:
+            await _client.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        except Exception:
+            pass
 
 
 async def close_db() -> None:
@@ -108,6 +150,57 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: str) ->
              username=excluded.username,
              first_name=excluded.first_name""",
         [user_id, username or "", first_name or ""],
+    )
+
+
+async def get_user(user_id: int) -> Optional[dict]:
+    rs = await _client.execute(
+        """SELECT user_id, username, first_name, created_at,
+                  balance, credit, sss_member,
+                  mutes_issued, reports_made, courts_held,
+                  tictactoe_wins, tictactoe_losses, tictactoe_draws
+           FROM users WHERE user_id = ?""",
+        [user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    keys = ["user_id", "username", "first_name", "created_at",
+            "balance", "credit", "sss_member",
+            "mutes_issued", "reports_made", "courts_held",
+            "tictactoe_wins", "tictactoe_losses", "tictactoe_draws"]
+    return dict(zip(keys, r))
+
+
+async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
+    allowed = {"mutes_issued", "reports_made", "courts_held",
+               "tictactoe_wins", "tictactoe_losses", "tictactoe_draws"}
+    if field not in allowed:
+        return
+    await _client.execute(
+        f"UPDATE users SET {field} = COALESCE({field}, 0) + ? WHERE user_id = ?",
+        [delta, user_id],
+    )
+
+
+async def set_sss(user_id: int, is_member: bool) -> None:
+    await _client.execute(
+        "UPDATE users SET sss_member = ? WHERE user_id = ?",
+        [1 if is_member else 0, user_id],
+    )
+
+
+async def add_balance(user_id: int, delta: int) -> None:
+    await _client.execute(
+        "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
+        [delta, user_id],
+    )
+
+
+async def add_credit(user_id: int, delta: int) -> None:
+    await _client.execute(
+        "UPDATE users SET credit = COALESCE(credit, 0) + ? WHERE user_id = ?",
+        [delta, user_id],
     )
 
 
@@ -198,7 +291,7 @@ async def get_active_punishment(user_id: int, chat_id: int, kind: str) -> Option
     return {"id": row[0], "until_ts": row[1]}
 
 
-# ---------- messages (топ чата) ----------
+# ---------- messages (Топ всё) ----------
 
 async def inc_message(chat_id: int, user_id: int) -> None:
     await _client.execute(
@@ -211,7 +304,6 @@ async def inc_message(chat_id: int, user_id: int) -> None:
 
 
 async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
-    """Возвращает [(user_id, count)] по убыванию."""
     rs = await _client.execute(
         """SELECT user_id, count FROM messages
            WHERE chat_id = ? ORDER BY count DESC LIMIT ?""",
@@ -221,7 +313,6 @@ async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
 
 
 async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
-    """Возвращает (count, rank, total_users) или None, если юзер не писал."""
     rs = await _client.execute(
         "SELECT count FROM messages WHERE chat_id = ? AND user_id = ?",
         [chat_id, user_id],
@@ -229,7 +320,6 @@ async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
     if not rs.rows:
         return None
     count = rs.rows[0][0]
-    # место = число пользователей с count > моего + 1
     rs2 = await _client.execute(
         "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND count > ?",
         [chat_id, count],
@@ -242,14 +332,50 @@ async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
     return count, rank, total
 
 
+# ---------- messages_day (Топ день) ----------
+
+async def inc_message_day(chat_id: int, user_id: int, day: str) -> None:
+    await _client.execute(
+        """INSERT INTO messages_day (chat_id, user_id, day, count)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             count = count + 1""",
+        [chat_id, user_id, day],
+    )
+
+
+async def top_messages_day(chat_id: int, day: str, limit: int = 50) -> List[tuple]:
+    rs = await _client.execute(
+        """SELECT user_id, count FROM messages_day
+           WHERE chat_id = ? AND day = ? ORDER BY count DESC LIMIT ?""",
+        [chat_id, day, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def cleanup_old_days(keep_days: int = 0) -> int:
+    """Удаляет messages_day старше сегодняшнего дня (по UTC).
+    keep_days=0 -> оставить только сегодня."""
+    if keep_days == 0:
+        rs = await _client.execute(
+            "DELETE FROM messages_day WHERE day < date('now')"
+        )
+    else:
+        rs = await _client.execute(
+            "DELETE FROM messages_day WHERE day < date('now', ?)",
+            [f"-{keep_days} days"],
+        )
+    return getattr(rs, "rows_affected", 0)
+
+
 # ---------- marriages ----------
 
-async def create_proposal(chat_id: int, user1_id: int, user2_id: int) -> int:
-    """Создаёт неактивный брак (предложение). Возвращает id."""
+async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
+                          forced: bool = False) -> int:
     await _client.execute(
-        """INSERT INTO marriages (chat_id, user1_id, user2_id, active)
-           VALUES (?, ?, ?, 0)""",
-        [chat_id, user1_id, user2_id],
+        """INSERT INTO marriages (chat_id, user1_id, user2_id, active, forced)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user1_id, user2_id, 1 if forced else 0, 1 if forced else 0],
     )
     rs = await _client.execute("SELECT last_insert_rowid()")
     return rs.rows[0][0]
@@ -267,7 +393,7 @@ async def delete_marriage(marriage_id: int) -> None:
 
 async def get_marriage(marriage_id: int) -> Optional[dict]:
     rs = await _client.execute(
-        """SELECT id, chat_id, user1_id, user2_id, created_at, active
+        """SELECT id, chat_id, user1_id, user2_id, created_at, active, forced
            FROM marriages WHERE id = ?""",
         [marriage_id],
     )
@@ -277,12 +403,13 @@ async def get_marriage(marriage_id: int) -> Optional[dict]:
     return {
         "id": r[0], "chat_id": r[1], "user1_id": r[2],
         "user2_id": r[3], "created_at": r[4], "active": bool(r[5]),
+        "forced": bool(r[6]),
     }
 
 
 async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
     rs = await _client.execute(
-        """SELECT id, chat_id, user1_id, user2_id, created_at, active
+        """SELECT id, chat_id, user1_id, user2_id, created_at, active, forced
            FROM marriages
            WHERE chat_id = ? AND active = 1
              AND (user1_id = ? OR user2_id = ?)
@@ -295,4 +422,24 @@ async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
     return {
         "id": r[0], "chat_id": r[1], "user1_id": r[2],
         "user2_id": r[3], "created_at": r[4], "active": bool(r[5]),
+        "forced": bool(r[6]),
     }
+
+
+async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
+                             event: str, by_user_id: Optional[int] = None) -> None:
+    await _client.execute(
+        """INSERT INTO marriage_history (chat_id, user1_id, user2_id, event, by_user_id)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user1_id, user2_id, event, by_user_id],
+    )
+
+
+async def count_divorces(chat_id: int, user_id: int) -> int:
+    rs = await _client.execute(
+        """SELECT COUNT(*) FROM marriage_history
+           WHERE chat_id = ? AND event IN ('divorced', 'forced_divorced')
+             AND (user1_id = ? OR user2_id = ?)""",
+        [chat_id, user_id, user_id],
+    )
+    return rs.rows[0][0] or 0
