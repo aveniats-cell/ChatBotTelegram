@@ -10,6 +10,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import resolver
 
 logger = logging.getLogger(__name__)
 
@@ -19,24 +20,30 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возвращает user_id из реплая или @username, либо None."""
     msg = update.effective_message
     if not msg:
         return None
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
     m = USERNAME_RE.search(msg.text or "")
-    if m:
-        try:
-            chat = await context.bot.get_chat(f"@{m.group(1)}")
-            return chat.id
-        except TelegramError as e:
-            logger.warning("get_chat @%s: %s", m.group(1), e)
+    if not m:
+        return None
+    uname = m.group(1)
+    uid = await db.get_user_by_username(uname)
+    if uid:
+        return uid
+    r = await resolver.resolve_username(uname)
+    if r:
+        return r[0]
+    try:
+        chat = await context.bot.get_chat(f"@{uname}")
+        return chat.id
+    except TelegramError as e:
+        logger.warning("get_chat @%s: %s", uname, e)
     return None
 
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Профиль. Формат: Профиль | Профиль @user | реплай + Профиль."""
     chat = update.effective_chat
     msg = update.effective_message
     if not chat or not msg:
@@ -49,7 +56,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         target_uid = u.id
 
-    # гарантируем наличие строки в users
     user_row = await db.get_user(target_uid)
     if not user_row:
         try:
@@ -64,11 +70,9 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     name = user_row.get("first_name") or str(target_uid)
 
-    # всего сообщений
     rank = await db.user_rank(chat.id, target_uid)
     total_msgs = rank[0] if rank else 0
 
-    # брак
     m = await db.find_active_marriage(chat.id, target_uid)
     if m:
         partner_id = m["user1_id"] if m["user2_id"] == target_uid else m["user2_id"]
@@ -87,7 +91,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             marriage_line = "нет"
 
-    # роль
     role = await db.get_role(target_uid)
     if target_uid == ADMIN_ID:
         role_str = "Создатель"
@@ -98,22 +101,17 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         role_str = "Участник"
 
-    # монеты / кредит
     balance = user_row.get("balance")
     if balance is None:
         balance = 10
     credit = user_row.get("credit") or 0
-
-    # ССС
     sss = "да" if user_row.get("sss_member") else "нет"
 
-    # игры
     wins = user_row.get("tictactoe_wins") or 0
     losses = user_row.get("tictactoe_losses") or 0
     draws = user_row.get("tictactoe_draws") or 0
     played = wins + losses + draws
 
-    # счётчики
     mutes = user_row.get("mutes_issued") or 0
     reports = user_row.get("reports_made") or 0
     courts = user_row.get("courts_held") or 0
