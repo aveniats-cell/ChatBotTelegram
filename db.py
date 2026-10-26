@@ -1,4 +1,4 @@
-"""Работа с Turso DB (libsql-client, HTTP-транспорт)."""
+"""Turso DB через HTTP-транспорт (libsql-client 0.3.1)."""
 import os
 import logging
 from typing import Optional, Any
@@ -6,36 +6,30 @@ from libsql_client import create_client
 
 logger = logging.getLogger(__name__)
 
-# Переменные окружения (задаются в Render → Environment)
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")      # libsql://xxx.turso.io
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")      # токен
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 _client: Optional[Any] = None
 
 
+def _http_url(url: str) -> str:
+    """libsql:// -> https://, чтобы клиент шёл по HTTP, а не по WebSocket."""
+    if url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    return url
+
+
 async def init_db() -> None:
-    """Инициализация клиента и создание таблиц."""
     global _client
     if not TURSO_URL or not TURSO_TOKEN:
-        raise SystemExit(
-            "TURSO_DATABASE_URL и/или TURSO_AUTH_TOKEN не заданы в Environment"
-        )
+        raise SystemExit("TURSO_DATABASE_URL и/или TURSO_AUTH_TOKEN не заданы")
     if _client is None:
-        # scheme="http" — используем HTTPS /v2/pipeline вместо WebSocket,
-        # иначе Turso отвечает 400 на wss:// handshake
-        _client = create_client(
-            url=TURSO_URL,
-            auth_token=TURSO_TOKEN,
-            scheme="http",
-        )
+        _client = create_client(url=_http_url(TURSO_URL), auth_token=TURSO_TOKEN)
     await _create_tables()
     logger.info("DB инициализирована")
 
 
 async def _create_tables() -> None:
-    """Создаём таблицы, если их нет.
-    Сюда же легко добавлять новые таблицы для новых фич.
-    """
     await _client.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id     INTEGER PRIMARY KEY,
@@ -60,8 +54,6 @@ async def close_db() -> None:
         _client = None
 
 
-# ---------- users ----------
-
 async def upsert_user(user_id: int, username: Optional[str], first_name: str) -> None:
     await _client.execute(
         """INSERT INTO users (user_id, username, first_name)
@@ -72,15 +64,6 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: str) ->
         [user_id, username or "", first_name or ""],
     )
 
-
-async def get_user(user_id: int) -> Optional[dict]:
-    rs = await _client.execute("SELECT * FROM users WHERE user_id = ?", [user_id])
-    if not rs.rows:
-        return None
-    return dict(zip(rs.columns, rs.rows[0]))
-
-
-# ---------- subscriptions ----------
 
 async def set_subscription(user_id: int, is_subscribed: bool) -> None:
     await _client.execute(
