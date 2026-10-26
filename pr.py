@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ID канала, на который нужно подписаться
 CANAL_ID = int(os.getenv("CANAL_ID", "0"))
-# Ссылка на канал для кнопки (публичная или приватная)
+# Ссылка на канал для кнопки
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
 # Название канала в тексте
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
@@ -76,13 +76,11 @@ async def check_and_delete(
     if ok:
         return
 
-    # Пытаемся удалить сообщение
     try:
         await msg.delete()
     except TelegramError as e:
         logger.info("Не удалось удалить сообщение (нет прав?): %s", e)
 
-    # Отправляем напоминание с кнопкой
     try:
         await context.bot.send_message(
             chat_id=msg.chat_id,
