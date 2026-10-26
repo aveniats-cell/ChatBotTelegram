@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 import db
+import resolver
 import pr
 import roles
 import top
@@ -77,6 +78,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def post_init(app: Application) -> None:
     await db.init_db()
+    await resolver.start_client()
     full_url = f"{WEBHOOK_URL}/{WEBHOOK_PATH}"
     await app.bot.set_webhook(
         url=full_url, drop_pending_updates=True,
@@ -84,7 +86,6 @@ async def post_init(app: Application) -> None:
     )
     logger.info("Webhook set to %s", full_url)
 
-    # ежедневная очистка Топ день в 00:05 UTC
     if app.job_queue:
         app.job_queue.run_daily(
             top.cleanup_job, time=dtime(hour=0, minute=5, tzinfo=None),
@@ -97,6 +98,7 @@ async def post_shutdown(app: Application) -> None:
         await app.bot.delete_webhook()
     except Exception as e:
         logger.warning("delete_webhook: %s", e)
+    await resolver.stop_client()
     await db.close_db()
     logger.info("Bot stopped")
 
@@ -131,15 +133,15 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
-    # ---------- 2.3 Топ ----------
+    # ---------- Топ ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мое\s+место(\s|$)"), top.cmd_my_place))
 
-    # ---------- 2.4 Шип ----------
+    # ---------- Шип ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Шип(\s|$)"), ship.cmd_ship))
 
-    # ---------- 2.5 Свадьба ----------
+    # ---------- Свадьба ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
