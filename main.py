@@ -15,6 +15,9 @@ from telegram.ext import (
 import db
 import pr
 import roles
+import top
+import ship
+import wedding
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -32,16 +35,13 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
 
 
-# ---------- служебные команды ----------
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if u:
         await db.upsert_user(u.id, u.username, u.first_name)
     await update.message.reply_text(
         "Привет! Я PR-бот.\n"
-        "Проверяю подписку, роли, муты и баны.\n\n"
-        "Команды:\n"
+        "Проверяю подписку, роли, муты и баны, веду топ чата, шип и свадьбы.\n\n"
         "/check — проверить подписку\n"
         "/ping — проверить, что бот жив"
     )
@@ -63,11 +63,13 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Список шерифы / Список комиссары\n"
         "• Поймать @user (шериф)\n"
         "• +Мут @user 1ч 30м / -Мут @user\n"
-        "• +Бан @user / -Бан @user"
+        "• +Бан @user / -Бан @user\n"
+        "• Топ все / Топ день / Мое место\n"
+        "• Шип @u1 @u2\n"
+        "• Сделать предложение @user\n"
+        "• Расторгнуть брак / Мой брак"
     )
 
-
-# ---------- hooks ----------
 
 async def post_init(app: Application) -> None:
     await db.init_db()
@@ -87,8 +89,6 @@ async def post_shutdown(app: Application) -> None:
     await db.close_db()
     logger.info("Bot stopped")
 
-
-# ---------- сборка ----------
 
 def build_app() -> Application:
     app = (
@@ -112,19 +112,39 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+шерифы(\s|$)"), roles.list_sheriffs))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+комиссары(\s|$)"), roles.list_commissars))
 
-    # ---------- Поймать + callback ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поймать(\s|$)"), roles.sheriff_catch))
     app.add_handler(CallbackQueryHandler(roles.catch_callback, pattern=r"^catch:"))
 
-    # ---------- муты/баны ----------
-    # (\s|$) вместо \b — надёжнее для кириллицы.
-    # [-–−] — обычный минус, en dash, математический минус.
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Мут(\s|$)"), roles.mute_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Мут(\s|$)"), roles.unmute_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
-    # ---------- существующая логика ----------
+    # ---------- 2.3 Топ ----------
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мое\s+место(\s|$)"), top.cmd_my_place))
+
+    # ---------- 2.4 Шип ----------
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Шип(\s|$)"), ship.cmd_ship))
+
+    # ---------- 2.5 Свадьба ----------
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расторгнуть\s+брак(\s|$)"), wedding.cmd_divorce))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
+    app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
+
+    # ---------- трекинг сообщений для топа ----------
+    # group=1 — работает параллельно с check_and_delete (group=0)
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            top.track_message,
+        ),
+        group=1,
+    )
+
+    # ---------- существующая логика подписки ----------
     app.add_handler(
         MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, pr.on_new_member)
     )
