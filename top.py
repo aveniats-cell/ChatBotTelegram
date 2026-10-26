@@ -1,5 +1,4 @@
 """2.3 Топ чата: счётчик сообщений, Топ день / Топ все, Моё место."""
-import os
 import logging
 from html import escape
 from datetime import datetime, timezone
@@ -13,8 +12,6 @@ import db
 
 logger = logging.getLogger(__name__)
 
-
-# ---------- трекинг сообщений ----------
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -33,18 +30,13 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("track_message: %s", e)
 
 
-# ---------- ежедневная очистка ----------
-
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удаляет messages_day за прошлые дни. Запускается в 00:05 UTC."""
     try:
         deleted = await db.cleanup_old_days(keep_days=0)
         logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
     except Exception as e:
         logger.warning("cleanup_job: %s", e)
 
-
-# ---------- вывод топов ----------
 
 async def _build_top_text(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, limit: int = 50,
@@ -109,9 +101,7 @@ async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     res = await db.user_rank(chat.id, user.id)
     if not res:
-        await update.message.reply_text(
-            "Вы ещё не писали в этом чате — места нет."
-        )
+        await update.message.reply_text("Вы ещё не писали в этом чате — места нет.")
         return
     count, rank, total = res
     await update.message.reply_text(
