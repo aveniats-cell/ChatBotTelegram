@@ -1,4 +1,4 @@
-"""Роли (Шериф/Комиссар), муты, баны, «Поймать» с подтверждением у админа."""
+"""Роли (Шериф/Комиссар), муты, баны, «Поймать»."""
 import os
 import re
 import time
@@ -22,10 +22,8 @@ import resolver
 
 logger = logging.getLogger(__name__)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
-
-# ---------- утилиты ----------
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
@@ -53,6 +51,11 @@ def format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
+def _strip_duration(text: str) -> str:
+    """Убирает '1ч 30м' из строки — чтобы @user не путался с временем."""
+    return TIME_RE.sub("", text or "").strip()
+
+
 async def _resolve_target(
     update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str
 ) -> Optional[tuple[int, str]]:
@@ -66,17 +69,17 @@ async def _resolve_target(
         return None
     uname = m.group(1)
 
-    # 1) БД
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid, uname
+    try:
+        uid = await db.get_user_by_username(uname)
+        if uid:
+            return uid, uname
+    except Exception as e:
+        logger.warning("get_user_by_username(%s): %s", uname, e)
 
-    # 2) Telethon (MTProto)
-    result = await resolver.resolve_username(uname)
-    if result:
-        return result
+    r = await resolver.resolve_username(uname)
+    if r:
+        return r
 
-    # 3) Каналы/группы через Bot API
     try:
         chat = await context.bot.get_chat(f"@{uname}")
         return chat.id, chat.first_name or uname
@@ -91,7 +94,11 @@ async def _require_role(update: Update, roles: tuple[str, ...]) -> bool:
         return False
     if user.id == ADMIN_ID:
         return True
-    role = await db.get_role(user.id)
+    try:
+        role = await db.get_role(user.id)
+    except Exception as e:
+        logger.warning("get_role(%s): %s", user.id, e)
+        return False
     return role in roles
 
 
@@ -183,7 +190,7 @@ async def list_commissars(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("🎖 Комиссары:\n" + "\n".join(lines))
 
 
-# ---------- Поймать (шериф) ----------
+# ---------- Поймать ----------
 
 async def sheriff_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_role(update, ("sheriff",)):
@@ -258,16 +265,18 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только комиссар или админ.")
         return
-    args = (update.message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text("Формат: +Мут @user 1ч 30м (или реплай + время)")
-        return
-    rest = args[1]
+    raw = (update.message.text or "")
+    # Убираем саму команду "+Мут" и парсим остаток
+    rest = raw.split(maxsplit=1)
+    rest = rest[1] if len(rest) > 1 else ""
     duration = parse_duration(rest)
     if not duration:
-        await update.message.reply_text("Не понял время. Пример: 1ч 30м 5с")
+        await update.message.reply_text("Не понял время. Пример: +Мут @user 1ч 30м")
         return
-    target = await _resolve_target(update, context, rest)
+
+    # ВАЖНО: вырезаем время из строки, чтобы @user не путался
+    clean = _strip_duration(rest)
+    target = await _resolve_target(update, context, clean)
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -283,6 +292,10 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ Не удалось замутить: {e}")
         return
     await db.add_punishment(uid, update.effective_chat.id, "mute", until, update.effective_user.id)
+    try:
+        await db.inc_user_counter(update.effective_user.id, "mutes_issued", 1)
+    except Exception:
+        pass
     await update.message.reply_text(
         f"🔇 {escape(name)} замучен на {format_duration(duration)}."
     )
