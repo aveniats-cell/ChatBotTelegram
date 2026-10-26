@@ -105,22 +105,24 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("check", pr.recheck_subscription))
 
     # ---------- роли ----------
-    app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф\b"), roles.grant_sheriff))
-    app.add_handler(MessageHandler(filters.Regex(r"^-Шериф\b"), roles.revoke_sheriff))
-    app.add_handler(MessageHandler(filters.Regex(r"^\+Комиссар\b"), roles.grant_commissar))
-    app.add_handler(MessageHandler(filters.Regex(r"^-Комиссар\b"), roles.revoke_commissar))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+шерифы\b"), roles.list_sheriffs))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+комиссары\b"), roles.list_commissars))
+    app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
+    app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Шериф(\s|$)"), roles.revoke_sheriff))
+    app.add_handler(MessageHandler(filters.Regex(r"^\+Комиссар(\s|$)"), roles.grant_commissar))
+    app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Комиссар(\s|$)"), roles.revoke_commissar))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+шерифы(\s|$)"), roles.list_sheriffs))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+комиссары(\s|$)"), roles.list_commissars))
 
     # ---------- Поймать + callback ----------
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поймать\b"), roles.sheriff_catch))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поймать(\s|$)"), roles.sheriff_catch))
     app.add_handler(CallbackQueryHandler(roles.catch_callback, pattern=r"^catch:"))
 
     # ---------- муты/баны ----------
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Мут\b"), roles.mute_user))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^-Мут\b"), roles.unmute_user))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан\b"), roles.ban_user))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^-Бан\b"), roles.unban_user))
+    # (\s|$) вместо \b — надёжнее для кириллицы.
+    # [-–−] — обычный минус, en dash, математический минус.
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Мут(\s|$)"), roles.mute_user))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Мут(\s|$)"), roles.unmute_user))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
     # ---------- существующая логика ----------
     app.add_handler(
