@@ -15,8 +15,10 @@ _client: Optional[Any] = None
 
 class _EmptyResult:
     """Заглушка, если Turso вернул ошибку — чтобы бот не падал."""
-    rows = []
-    rows_affected = 0
+
+    def __init__(self) -> None:
+        self.rows: list = []
+        self.rows_affected: int = 0
 
 
 def _http_url(url: str) -> str:
@@ -30,19 +32,41 @@ def _url_with_token(url: str, token: str) -> str:
     return f"{url}{sep}authToken={token}"
 
 
+def _is_read_only(sql: str) -> bool:
+    """True, если запрос можно безопасно повторять (SELECT/PRAGMA)."""
+    s = sql.lstrip().upper()
+    return s.startswith("SELECT") or s.startswith("PRAGMA")
+
+
 async def _exec(sql: str, params: Optional[list] = None, retries: int = 2):
-    """Обёртка над _client.execute с ретраями при KeyError('result')."""
-    last_exc = None
-    for attempt in range(retries + 1):
+    """Обёртка над _client.execute с ретраями при KeyError('result').
+
+    Ретраи применяются только к read-only запросам, чтобы не дублировать
+    INSERT/UPDATE/DELETE на повторной попытке.
+    """
+    if _client is None:
+        logger.error("db: _client не инициализирован (sql: %.80s)", sql)
+        return _EmptyResult()
+
+    max_retries = retries if _is_read_only(sql) else 0
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(max_retries + 1):
         try:
             if params is None:
                 return await _client.execute(sql)
             return await _client.execute(sql, params)
         except KeyError as e:
             last_exc = e
-            logger.warning("db retry %d/%d: %s", attempt + 1, retries, e)
-            await asyncio.sleep(0.2 * (attempt + 1))
-    logger.error("db exec failed after %d retries: %s", retries, last_exc)
+            if attempt < max_retries:
+                logger.warning(
+                    "db retry %d/%d (sql: %.60s): %s",
+                    attempt + 1, max_retries, sql, e,
+                )
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+    if last_exc is not None:
+        logger.error("db exec failed after retries (sql: %.80s): %s", sql, last_exc)
     return _EmptyResult()
 
 
@@ -146,11 +170,18 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
     ]
+
+    # Один раз получаем существующие колонки по таблицам
+    existing: dict = {}
+    for table in {t for t, _, _ in adds}:
+        rs = await _exec(f"PRAGMA table_info({table})")
+        # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
+        existing[table] = {row[1] for row in rs.rows}
+
     for table, col, decl in adds:
-        try:
-            await _exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-        except Exception:
-            pass
+        if col in existing[table]:
+            continue
+        await _exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 async def close_db() -> None:
@@ -305,7 +336,7 @@ async def deactivate_punishment(user_id: int, chat_id: int, kind: str) -> int:
            WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1""",
         [user_id, chat_id, kind],
     )
-    return getattr(rs, "rows_affected", 0)
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 async def get_active_punishment(user_id: int, chat_id: int, kind: str) -> Optional[dict]:
@@ -350,15 +381,17 @@ async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
     if not rs.rows:
         return None
     count = rs.rows[0][0]
+
     rs2 = await _exec(
         "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND count > ?",
         [chat_id, count],
     )
-    rank = (rs2.rows[0][0] or 0) + 1
+    rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
+
     rs3 = await _exec(
         "SELECT COUNT(*) FROM messages WHERE chat_id = ?", [chat_id]
     )
-    total = rs3.rows[0][0] or 0
+    total = (rs3.rows[0][0] if rs3.rows else 0) or 0
     return count, rank, total
 
 
@@ -391,13 +424,15 @@ async def cleanup_old_days(keep_days: int = 0) -> int:
             "DELETE FROM messages_day WHERE day < date('now', ?)",
             [f"-{keep_days} days"],
         )
-    return getattr(rs, "rows_affected", 0)
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 # ---------- marriages ----------
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
+    # forced=True  -> запись сразу active (это принудительный брак)
+    # forced=False -> запись pending (active=0), активируется через accept_marriage
     await _exec(
         """INSERT INTO marriages (chat_id, user1_id, user2_id, active, forced)
            VALUES (?, ?, ?, ?, ?)""",
@@ -466,4 +501,6 @@ async def count_divorces(chat_id: int, user_id: int) -> int:
              AND (user1_id = ? OR user2_id = ?)""",
         [chat_id, user_id, user_id],
     )
+    if not rs.rows:
+        return 0
     return rs.rows[0][0] or 0
