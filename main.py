@@ -30,12 +30,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -91,6 +95,9 @@ async def post_init(app: Application) -> None:
             top.cleanup_job, time=dtime(hour=0, minute=5, tzinfo=None),
         )
         logger.info("JobQueue: ежедневная очистка messages_day запланирована")
+    else:
+        logger.warning("JobQueue не инициализирован — проверь "
+                       "python-telegram-bot[webhooks,job-queue]")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -111,13 +118,13 @@ def build_app() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
+    app.add_error_handler(_error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
     app.add_handler(CommandHandler("check", pr.recheck_subscription))
 
-    # ---------- роли ----------
     app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Шериф(\s|$)"), roles.revoke_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^\+Комиссар(\s|$)"), roles.grant_commissar))
@@ -133,25 +140,20 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
-    # ---------- Топ ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мое\s+место(\s|$)"), top.cmd_my_place))
 
-    # ---------- Шип ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Шип(\s|$)"), ship.cmd_ship))
 
-    # ---------- Свадьба ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # ---------- Профиль ----------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"), profile.cmd_profile))
 
-    # ---------- трекинг сообщений ----------
     app.add_handler(
         MessageHandler(
             filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -160,7 +162,6 @@ def build_app() -> Application:
         group=1,
     )
 
-    # ---------- подписка ----------
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, pr.on_new_member))
     app.add_handler(
         MessageHandler(
