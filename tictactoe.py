@@ -1,7 +1,8 @@
 """Крестики-нолики 5×5 на монеты.
 
 Команда:  хо @user 50   /   хо (реплай) 50
-Поле 5×5. Игрок 1 — ❌, игрок 2 — ⭕. Побеждает первый, собравший 4 в ряд.
+Поле 5×5, победа — 5 в ряд (по горизонтали/вертикали/диагонали).
+При идеальной игре — ничья, при ошибке — победа.
 Победитель получает свою ставку обратно + ставку противника.
 
 Состояние — in-memory dict. При рестарте Render активные партии пропадают.
@@ -33,7 +34,7 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 BET_RE = re.compile(r"\b(\d+)\b")
 
 BOARD_SIZE = 5
-WIN_LEN = 4
+WIN_LEN = 5
 
 GAMES: dict[str, dict] = {}
 
@@ -117,7 +118,6 @@ async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     text = msg.text or ""
 
-    # ставка — последнее число в строке
     matches = list(BET_RE.finditer(text))
     if not matches:
         await msg.reply_text(
@@ -300,7 +300,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🎮 <b>Крестики-нолики 5×5</b>\n"
             f"{escape(g['p1_name'])} {g['symbols'][g['p1_id']]} vs "
             f"{escape(g['p2_name'])} {g['symbols'][g['p2_id']]}\n"
-            f"Ставка: <b>{g['bet']}</b> | Собрать 4 в ряд.\n"
+            f"Ставка: <b>{g['bet']}</b> | Собрать 5 в ряд.\n"
             f"Ход: {escape(g['p1_name'])}"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
