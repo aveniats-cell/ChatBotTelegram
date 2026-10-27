@@ -1,9 +1,15 @@
 """Экономика: кредит (+Кредит / -Кредит), выдача монет админом (+Монеты),
-ежедневное начисление процентов на остаток долга."""
+ежедневное начисление процентов на остаток долга.
+
+P0: +Кредит / -Кредит — один атомарный UPDATE (db.take_credit_atomic /
+db.repay_credit_atomic), проверка rows_affected.
+P2: CREDIT_DAILY_LIMIT проверяет «сегодня» через users.credit_taken_day.
+_resolve_target вынесен в utils.resolve_target.
+"""
 import os
 import re
 import logging
-from datetime import time as dtime
+from datetime import time as dtime, datetime, timezone
 from html import escape
 
 from telegram import Update
@@ -12,7 +18,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import resolver
+import utils
 
 logger = logging.getLogger(__name__)
 
@@ -22,30 +28,11 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 AMOUNT_RE = re.compile(r"\b(\d+)\b")
 
 CREDIT_DAILY_LIMIT = 100
-CREDIT_PERCENT_PER_DAY = 10  # % в день на остаток долга
+CREDIT_PERCENT_PER_DAY = 10
 
 
-async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    msg = update.effective_message
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        return u.id, u.first_name or u.username or str(u.id)
-    m = USERNAME_RE.search(text or "")
-    if not m:
-        return None
-    uname = m.group(1)
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid, uname
-    r = await resolver.resolve_username(uname)
-    if r:
-        return r
-    try:
-        c = await context.bot.get_chat(f"@{uname}")
-        return c.id, c.first_name or uname
-    except TelegramError as e:
-        logger.warning("get_chat @%s: %s", uname, e)
-    return None
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -78,6 +65,7 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     balance = row.get("balance") or 0
     credit = row.get("credit") or 0
+    taken_day = row.get("credit_taken_day")
 
     if balance < 0:
         await msg.reply_text(
@@ -92,12 +80,24 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML,
         )
         return
+    if taken_day == _today_utc():
+        await msg.reply_text(
+            "⛔ Вы уже брали кредит сегодня. Повторите завтра.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-    await db.add_credit(user.id, amount)
-    await db.add_balance(user.id, amount)
+    ok = await db.take_credit_atomic(user.id, amount)
+    if not ok:
+        await msg.reply_text("⚠️ Не удалось выдать кредит (ошибка БД). Попробуйте позже.")
+        return
+    await db.set_credit_taken_day(user.id, _today_utc())
+
+    new_row = await db.get_user(user.id)
+    new_credit = (new_row or {}).get("credit") or (credit + amount)
     await msg.reply_text(
         f"💳 Взят кредит: <b>{amount}</b>\n"
-        f"Долг: <b>{credit + amount}</b>\n"
+        f"Долг: <b>{new_credit}</b>\n"
         f"Ставка: <b>{CREDIT_PERCENT_PER_DAY}%</b> в день на остаток.\n"
         f"Погасить: <code>-Кредит СУММА</code>",
         parse_mode=ParseMode.HTML,
@@ -141,11 +141,19 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if amount > credit:
         amount = credit
 
-    await db.add_balance(user.id, -amount)
-    await db.add_credit(user.id, -amount)
+    ok = await db.repay_credit_atomic(user.id, amount)
+    if not ok:
+        await msg.reply_text(
+            "⚠️ Не удалось погасить (ошибка БД или изменился баланс). "
+            "Попробуйте ещё раз."
+        )
+        return
+
+    new_row = await db.get_user(user.id)
+    new_credit = (new_row or {}).get("credit") or 0
     await msg.reply_text(
         f"✅ Погашено <b>{amount}</b>.\n"
-        f"Остаток долга: <b>{credit - amount}</b>.",
+        f"Остаток долга: <b>{new_credit}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -156,7 +164,7 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     msg = update.effective_message
     if not user or not msg:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -172,7 +180,7 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     amount = int(m.group(1))
 
     clean = re.sub(r"\+Монеты\s+-?\d+", "", text, flags=re.IGNORECASE)
-    target = await _resolve_target(update, context, clean)
+    target = await utils.resolve_target(update, context, clean)
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -196,7 +204,6 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в день начисляет проценты на остаток долга."""
     try:
         affected = await db.apply_credit_interest(CREDIT_PERCENT_PER_DAY)
         logger.info("daily_interest_job: затронуто записей: %s", affected)
@@ -205,7 +212,6 @@ async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def register_jobs(app) -> None:
-    """Вызывается из main.post_init — вешает ежедневное начисление процентов."""
     if not app.job_queue:
         logger.warning("economy: job_queue нет, проценты по кредиту не будут начисляться")
         return
