@@ -1,8 +1,8 @@
-"""ИИ-модуль: запросы к Pollinations через актуальный gateway gen.pollinations.ai.
+"""ИИ-модуль: запросы к gemini через Pollinations.
 
-Использует AI_TOKEN из переменных окружения.
-BASE_URL по умолчанию https://gen.pollinations.ai — актуальный OpenAI-совместимый шлюз.
-Легаси-хост text.pollinations.ai выведен из эксплуатации и возвращает 404.
+Использует AI_TOKEN и BASE_URL из переменных окружения.
+BASE_URL должен указывать на https://gen.pollinations.ai (актуальный gateway).
+Легаси-хост text.pollinations.ai отключён и возвращает 404.
 """
 import os
 import time
@@ -14,17 +14,16 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# AI_TOKEN обязателен — gen.pollinations.ai требует ключ даже для бесплатных моделей.
+# Оба параметра обязательны — берутся из Values на Render.
 AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "https://gen.pollinations.ai").strip().rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
-# openai-fast — бесплатная без ключа модель (GPT-OSS 20B), стабильно доступна на gen-шлюзе.
-MODEL = "openai-fast"
+MODEL = "openai"
 
-# Анонимный лимит Pollinations около 15 секунд; с ключом лимит выше, но 15 сек безопасно.
-COOLDOWN_SEC = 15.0
+COOLDOWN_SEC = 5.0
 
 # Ограниченный кэш вместо безразмерного dict, чтобы не текла память.
+# maxsize=10000 — при большем числе активных пользователей старые записи вытесняются.
 _last_request: TTLCache = TTLCache(maxsize=10000, ttl=COOLDOWN_SEC * 2)
 
 # Одна сессия на модуль — переиспользование соединений, DNS-кэша и TLS.
@@ -59,9 +58,9 @@ async def close_session() -> None:
 
 
 def _api_url() -> str:
-    """Собирает URL к OpenAI-совместимому endpoint gen.pollinations.ai/v1."""
+    """Собирает URL к OpenAI-совместимому endpoint."""
     if not BASE_URL:
-        logger.error("ai: BASE_URL не задан")
+        logger.error("ai: BASE_URL не задан в переменных окружения")
         return ""
 
     if not BASE_URL.startswith(("http://", "https://")):
@@ -77,9 +76,9 @@ def _api_url() -> str:
 
 
 async def ask_ai(prompt: str) -> Optional[str]:
-    """Отправляет запрос в openai-fast. Возвращает текст или None."""
+    """Отправляет запрос в gemini. Возвращает текст или None."""
     if not AI_TOKEN:
-        logger.error("ai: AI_TOKEN не задан — gen.pollinations.ai требует ключ даже для бесплатных моделей")
+        logger.error("ai: AI_TOKEN не задан в переменных окружения")
         return None
 
     url = _api_url()
@@ -136,7 +135,8 @@ async def ask_ai(prompt: str) -> Optional[str]:
                 return None
 
             choice = choices[0]
-            if choice.get("finish_reason") == "length":
+            finish = choice.get("finish_reason")
+            if finish == "length":
                 logger.warning("ai: ответ обрезан по max_tokens")
 
             msg = choice.get("message") or {}
