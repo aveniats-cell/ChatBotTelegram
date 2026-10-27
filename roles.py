@@ -1,4 +1,9 @@
-"""Роли (Шериф/Комиссар), муты, баны, «Поймать»."""
+"""Роли (Шериф/Комиссар), муты, баны, «Поймать».
+
+P2: _require_role проверяет `not ADMIN_ID` — при ADMIN_ID=0 никто не админ.
+P2: unmute_user даёт явный набор прав, а не all_permissions().
+P2: _resolve_target вынесен в utils.resolve_target.
+"""
 import os
 import re
 import time
@@ -18,7 +23,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import resolver
+import utils
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,24 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
 TIME_RE = re.compile(r"(\d+)\s*([чhmsс])", re.IGNORECASE)
 TIME_UNITS = {"ч": 3600, "h": 3600, "m": 60, "м": 60, "s": 1, "с": 1}
+
+# Права «обычного участника» — для unmute (не даём админские).
+_UNMUTE_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_change_info=False,
+    can_invite_users=False,
+    can_pin_messages=False,
+    can_manage_topics=False,
+)
 
 
 def parse_duration(text: str) -> Optional[int]:
@@ -52,47 +75,15 @@ def format_duration(seconds: int) -> str:
 
 
 def _strip_duration(text: str) -> str:
-    """Убирает '1ч 30м' из строки — чтобы @user не путался с временем."""
     return TIME_RE.sub("", text or "").strip()
-
-
-async def _resolve_target(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str
-) -> Optional[tuple[int, str]]:
-    msg: Message = update.effective_message
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        return u.id, u.first_name or (u.username or str(u.id))
-
-    m = USERNAME_RE.search(arg_text)
-    if not m:
-        return None
-    uname = m.group(1)
-
-    try:
-        uid = await db.get_user_by_username(uname)
-        if uid:
-            return uid, uname
-    except Exception as e:
-        logger.warning("get_user_by_username(%s): %s", uname, e)
-
-    r = await resolver.resolve_username(uname)
-    if r:
-        return r
-
-    try:
-        chat = await context.bot.get_chat(f"@{uname}")
-        return chat.id, chat.first_name or uname
-    except TelegramError as e:
-        logger.warning("get_chat @%s: %s", uname, e)
-    return None
 
 
 async def _require_role(update: Update, roles: tuple[str, ...]) -> bool:
     user = update.effective_user
     if not user:
         return False
-    if user.id == ADMIN_ID:
+    # P2: при ADMIN_ID=0 никто не админ.
+    if ADMIN_ID and user.id == ADMIN_ID:
         return True
     try:
         role = await db.get_role(user.id)
@@ -112,7 +103,7 @@ async def grant_sheriff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только админ или комиссар.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -125,7 +116,7 @@ async def revoke_sheriff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только админ или комиссар.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -135,10 +126,10 @@ async def revoke_sheriff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def grant_commissar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+    if not ADMIN_ID or not update.effective_user or update.effective_user.id != ADMIN_ID:
         await _deny(update, "⛔ Только админ.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -148,10 +139,10 @@ async def grant_commissar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def revoke_commissar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+    if not ADMIN_ID or not update.effective_user or update.effective_user.id != ADMIN_ID:
         await _deny(update, "⛔ Только админ.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -196,7 +187,7 @@ async def sheriff_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await _require_role(update, ("sheriff",)):
         await _deny(update, "⛔ Только шериф.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -227,9 +218,10 @@ async def sheriff_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def catch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if not q or not update.effective_user or update.effective_user.id != ADMIN_ID:
-        if q:
-            await q.answer("Только админ.", show_alert=True)
+    if not q or not update.effective_user:
+        return
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        await q.answer("Только админ.", show_alert=True)
         return
     await q.answer()
     parts = q.data.split(":")
@@ -274,7 +266,7 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     clean = _strip_duration(rest)
-    target = await _resolve_target(update, context, clean)
+    target = await utils.resolve_target(update, context, clean)
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -303,15 +295,14 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только комиссар или админ.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
-    perms = ChatPermissions.all_permissions()
     try:
         await context.bot.restrict_chat_member(
-            chat_id=update.effective_chat.id, user_id=uid, permissions=perms,
+            chat_id=update.effective_chat.id, user_id=uid, permissions=_UNMUTE_PERMS,
         )
     except TelegramError as e:
         await update.message.reply_text(f"⚠️ Не удалось размутить: {e}")
@@ -324,7 +315,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только комиссар или админ.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -342,7 +333,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только комиссар или админ.")
         return
-    target = await _resolve_target(update, context, update.message.text or "")
+    target = await utils.resolve_target(update, context, update.message.text or "")
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
