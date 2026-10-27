@@ -277,11 +277,16 @@ async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
     )
 
 
-async def set_sss(user_id: int, is_member: bool) -> None:
-    await _exec(
+async def set_sss(user_id: int, is_member: bool) -> bool:
+    """Устанавливает флаг ССС. Возвращает True при успехе записи в БД."""
+    rs = await _exec(
         "UPDATE users SET sss_member = ? WHERE user_id = ?",
         [1 if is_member else 0, user_id],
     )
+    if getattr(rs, "error", False):
+        logger.error("set_sss: ошибка БД (user=%s member=%s)", user_id, is_member)
+        return False
+    return True
 
 
 async def list_sss_members() -> List[int]:
@@ -292,7 +297,9 @@ async def list_sss_members() -> List[int]:
 async def add_balance(user_id: int, delta: int) -> bool:
     """Меняет баланс. Возвращает True при успехе.
 
-    Если строки нет — создаёт через upsert. При ошибке БД — False.
+    Если строки нет — создаёт с корректным стартовым значением 10 + delta
+    (для delta < 0 — COALESCE(balance, 10) + delta, что соответствует
+    «стартовые 10»). При ошибке БД — False.
     """
     rs = await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
@@ -302,18 +309,38 @@ async def add_balance(user_id: int, delta: int) -> bool:
         logger.error("add_balance: ошибка UPDATE (user=%s delta=%s)", user_id, delta)
         return False
     if (getattr(rs, "rows_affected", 0) or 0) == 0:
+        # Строки нет — создаём со стартовым балансом 10 + delta.
         rs2 = await _exec(
             """INSERT INTO users (user_id, balance)
-               VALUES (?, COALESCE(?, 10) + ?)
-               ON CONFLICT(user_id) DO UPDATE SET
-                 balance = COALESCE(balance, 10) + ?""",
-            [user_id, delta, delta, delta],
+               VALUES (?, 10 + ?)""",
+            [user_id, delta],
         )
         if getattr(rs2, "error", False):
-            logger.error("add_balance: ошибка UPSERT (user=%s delta=%s)",
+            logger.error("add_balance: ошибка INSERT (user=%s delta=%s)",
                          user_id, delta)
             return False
     return True
+
+
+async def take_balance_atomic(user_id: int, amount: int) -> bool:
+    """Атомарно списывает amount, если balance >= amount. True при успехе.
+
+    Используется в эскроу игр (крестики-нолики), чтобы исключить уход
+    баланса в минус при параллельных списаниях.
+    """
+    if amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+        [amount, user_id, amount],
+    )
+    if getattr(rs, "error", False):
+        logger.error("take_balance_atomic: ошибка БД (user=%s amount=%s)",
+                     user_id, amount)
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def add_credit(user_id: int, delta: int) -> None:
