@@ -1,9 +1,8 @@
 """Профиль: базовый экран + разделы на inline-кнопках.
 
-- «Профиль» / «Профиль @user» / реплай → базовый экран.
-- Кнопки: Жалобы/Муты/Предупреждения, Игры, Аура, Счётчики, Назад.
+- Кнопки: Жалобы/Муты/Предупреждения, Игры, Аура, Награды, Счётчики, Назад.
 - callback_data: prof:<section>:<target_uid>
-  section: base | safety | games | aura | counters
+  section: base | safety | games | aura | awards | counters
 """
 import os
 import re
@@ -29,8 +28,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
-
-# ---------- resolve ----------
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -59,43 +56,24 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 
-# ---------- keyboards ----------
-
 def _kb(target_uid: int) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("🚨 Жалобы/Муты/Предупреждения",
-                                 callback_data=f"prof:safety:{target_uid}"),
-        ],
-        [
-            InlineKeyboardButton("🎮 Игры",
-                                 callback_data=f"prof:games:{target_uid}"),
-            InlineKeyboardButton("✨ Аура",
-                                 callback_data=f"prof:aura:{target_uid}"),
-        ],
-        [
-            InlineKeyboardButton("📊 Счётчики",
-                                 callback_data=f"prof:counters:{target_uid}"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚨 Жалобы/Муты/Предупреждения",
+                              callback_data=f"prof:safety:{target_uid}")],
+        [InlineKeyboardButton("🎮 Игры", callback_data=f"prof:games:{target_uid}"),
+         InlineKeyboardButton("✨ Аура", callback_data=f"prof:aura:{target_uid}")],
+        [InlineKeyboardButton("🎖️ Награды", callback_data=f"prof:awards:{target_uid}"),
+         InlineKeyboardButton("📊 Счётчики", callback_data=f"prof:counters:{target_uid}")],
+    ])
 
 
 def _kb_section(target_uid: int) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("⬅️ Назад",
-                                 callback_data=f"prof:base:{target_uid}"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof:base:{target_uid}")],
+    ])
 
 
-# ---------- render base ----------
-
-async def _render_base(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_uid: int,
-) -> str:
+async def _render_base(context, chat_id: int, target_uid: int) -> str:
     user_row = await db.get_user(target_uid)
     if not user_row:
         try:
@@ -108,7 +86,6 @@ async def _render_base(
         return "Не нашёл этого пользователя."
 
     name = user_row.get("first_name") or str(target_uid)
-
     rank = await db.user_rank(chat_id, target_uid)
     total_msgs = rank[0] if rank else 0
 
@@ -125,10 +102,7 @@ async def _render_base(
         marriage_line = f"в браке с {escape(partner_name)}{forced}"
     else:
         divorces = await db.count_divorces(chat_id, target_uid)
-        if divorces > 0:
-            marriage_line = f"разведён(а) ({divorces} раз)"
-        else:
-            marriage_line = "нет"
+        marriage_line = f"разведён(а) ({divorces} раз)" if divorces > 0 else "нет"
 
     role = await db.get_role(target_uid)
     sss_member = bool(user_row.get("sss_member")) or (target_uid in sss._sss_all())
@@ -154,6 +128,12 @@ async def _render_base(
     credit = user_row.get("credit") or 0
     sss_label = "да" if sss_member else "нет"
 
+    awards_total = 0
+    try:
+        awards_total = await db.award_total_stars(chat_id, target_uid)
+    except Exception as e:
+        logger.warning("profile awards_total: %s", e)
+
     return (
         f"👤 <b>Профиль</b>\n"
         f"Имя: <b>{escape(name)}</b>\n"
@@ -162,32 +142,20 @@ async def _render_base(
         f"Монеты: <b>{balance}</b>\n"
         f"Кредит: <b>{credit}</b>\n"
         f"ССС: <b>{sss_label}</b>\n"
-        f"Роль: <b>{role_str}</b>"
+        f"Роль: <b>{role_str}</b>\n"
+        f"Наград: <b>{awards_total}★</b>"
     )
 
 
-# ---------- render sections ----------
-
-async def _render_safety(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_uid: int,
-) -> str:
+async def _render_safety(context, chat_id: int, target_uid: int) -> str:
     user_row = await db.get_user(target_uid)
     name = (user_row or {}).get("first_name") or str(target_uid)
 
-    complaints_by = 0
-    complaints_against = 0
-    warnings_active = 0
-    warnings_total = 0
-    mutes = 0
-    try:
-        complaints_by = await db.count_complaints_by(chat_id, target_uid)
-        complaints_against = await db.count_complaints_against(chat_id, target_uid)
-        warnings_active = await db.count_active_warnings(chat_id, target_uid)
-        warnings_total = await db.count_warnings_total(chat_id, target_uid)
-        urow = await db.get_user(target_uid)
-        mutes = (urow or {}).get("mutes_issued") or 0
-    except Exception as e:
-        logger.warning("profile safety: %s", e)
+    complaints_by = await db.count_complaints_by(chat_id, target_uid)
+    complaints_against = await db.count_complaints_against(chat_id, target_uid)
+    warnings_active = await db.count_active_warnings(chat_id, target_uid)
+    warnings_total = await db.count_warnings_total(chat_id, target_uid)
+    mutes = (user_row or {}).get("mutes_issued") or 0
 
     return (
         f"🚨 <b>Жалобы / Муты / Предупреждения</b>\n"
@@ -202,9 +170,7 @@ async def _render_safety(
     )
 
 
-async def _render_games(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_uid: int,
-) -> str:
+async def _render_games(context, chat_id: int, target_uid: int) -> str:
     user_row = await db.get_user(target_uid)
     if not user_row:
         return "Не нашёл этого пользователя."
@@ -224,9 +190,7 @@ async def _render_games(
     )
 
 
-async def _render_aura(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_uid: int,
-) -> str:
+async def _render_aura(context, chat_id: int, target_uid: int) -> str:
     user_row = await db.get_user(target_uid)
     name = (user_row or {}).get("first_name") or str(target_uid)
     value = 0
@@ -248,9 +212,40 @@ async def _render_aura(
     )
 
 
-async def _render_counters(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_uid: int,
-) -> str:
+async def _render_awards(context, chat_id: int, target_uid: int) -> str:
+    user_row = await db.get_user(target_uid)
+    name = (user_row or {}).get("first_name") or str(target_uid)
+    try:
+        items = await db.list_awards(chat_id, target_uid)
+        total = await db.award_total_stars(chat_id, target_uid)
+    except Exception as e:
+        logger.warning("profile awards: %s", e)
+        items, total = [], 0
+
+    if not items:
+        return (
+            f"🎖️ <b>Награды</b>\n"
+            f"Имя: <b>{escape(name)}</b>\n\n"
+            f"Пока нет наград."
+        )
+
+    lines = [
+        f"🎖️ <b>Награды</b>",
+        f"Имя: <b>{escape(name)}</b>",
+        f"Всего: <b>{len(items)}</b> · <b>{total}★</b>",
+        "",
+    ]
+    for a in items:
+        stars = int(a.get("stars") or 0)
+        star_str = "★" * stars + "☆" * (10 - stars)
+        lines.append(
+            f"• {escape(str(a.get('title') or '—'))} — "
+            f"<b>{stars}/10</b> {star_str}"
+        )
+    return "\n".join(lines)
+
+
+async def _render_counters(context, chat_id: int, target_uid: int) -> str:
     user_row = await db.get_user(target_uid)
     if not user_row:
         return "Не нашёл этого пользователя."
@@ -271,11 +266,10 @@ _RENDERERS = {
     "safety": _render_safety,
     "games": _render_games,
     "aura": _render_aura,
+    "awards": _render_awards,
     "counters": _render_counters,
 }
 
-
-# ---------- handlers ----------
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -309,9 +303,7 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     await msg.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=_kb(target_uid),
+        text, parse_mode=ParseMode.HTML, reply_markup=_kb(target_uid),
     )
 
 
@@ -349,12 +341,9 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text = await renderer(context, chat.id, target_uid)
             kb = _kb_section(target_uid)
 
-        await q.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=kb,
-        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         await q.answer()
     except TelegramError as e:
-        # «message is not modified» — нормально, если нажали ту же кнопку.
         if "not modified" in str(e).lower():
             await q.answer()
             return
