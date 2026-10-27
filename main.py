@@ -8,6 +8,7 @@
 - cleanup_job запускается с tzinfo=UTC (единообразно с economy).
 - Добавлены +Жалоба / +жб / +жал (всем) и
   +Предупреждение / +пред / +варн (шериф/комиссар/админ).
+- Добавлен Аурометр: дроч / Аура / Топ аура.
 - Модуль предупреждений называется warns (а не warnings), чтобы не
   перекрывать стандартный модуль Python и не ломать pip/virtualenv/poetry
   на этапе сборки.
@@ -39,6 +40,7 @@ import tictactoe
 import sss
 import complaints
 import warns
+import aura
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -101,7 +103,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
         "• +Жалоба / +жб @user (всем)\n"
-        "• +Предупреждение / +пред @user (шериф/комиссар/админ)"
+        "• +Предупреждение / +пред @user (шериф/комиссар/админ)\n"
+        "• дроч / Аура / Топ аура — аурометр"
     )
 
 
@@ -211,6 +214,14 @@ def build_app() -> Application:
         filters.Regex(r"(?i)^\+(Предупреждение|Пред|Варн)(\s|$)"),
         warns.cmd_warn,
     ))
+
+    # Аурометр
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^дроч(\s|$)"),
+                                   aura.cmd_droch))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+аура(\s|$)"),
+                                   aura.cmd_aura_top))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аура(\s|$)"),
+                                   aura.cmd_aura))
 
     # Счётчик сообщений
     app.add_handler(
