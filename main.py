@@ -5,10 +5,11 @@
 - track_message использует два отдельных _exec вместо batch
   (libsql-client 0.3.1 через HTTP отдаёт 400 на batch).
 - delete_webhook в shutdown убран — не создаём окно недоставки.
+- cleanup_job запускается с tzinfo=UTC (единообразно с economy).
 """
 import os
 import logging
-from datetime import time as dtime
+from datetime import time as dtime, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -106,7 +107,8 @@ async def post_init(app: Application) -> None:
 
     if app.job_queue:
         app.job_queue.run_daily(
-            top.cleanup_job, time=dtime(hour=0, minute=5, tzinfo=None),
+            top.cleanup_job,
+            time=dtime(hour=0, minute=5, tzinfo=timezone.utc),
         )
         logger.info("JobQueue: ежедневная очистка messages_day запланирована")
         economy.register_jobs(app)
