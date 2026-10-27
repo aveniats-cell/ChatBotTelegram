@@ -1,19 +1,4 @@
-"""Точка входа: webhook-версия для Render Web Service (Free).
-
-- set_webhook вызывается только внутри run_webhook (в post_init убран),
-  чтобы не было Flood control exceeded.
-- track_message использует два отдельных _exec вместо batch
-  (libsql-client 0.3.1 через HTTP отдаёт 400 на batch).
-- delete_webhook в shutdown убран — не создаём окно недоставки.
-- cleanup_job запускается с tzinfo=UTC (единообразно с economy).
-- Добавлены +Жалоба / +жб / +жал (всем) и
-  +Предупреждение / +пред / +варн (шериф/комиссар/админ).
-- Добавлен Аурометр: дроч / Аура / Топ аура.
-- Профиль теперь с inline-кнопками разделов (prof:*).
-- Модуль предупреждений называется warns (а не warnings), чтобы не
-  перекрывать стандартный модуль Python и не ломать pip/virtualenv/poetry
-  на этапе сборки.
-"""
+"""Точка входа: webhook-версия для Render Web Service (Free)."""
 import os
 import logging
 from datetime import time as dtime, timezone
@@ -42,6 +27,8 @@ import sss
 import complaints
 import warns
 import aura
+import awards
+import actions
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -90,13 +77,16 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Комиссар / -Комиссар @user\n"
         "• Список шерифы / Список комиссары\n"
         "• Поймать @user (шериф)\n"
-        "• +Мут @user 1ч 30м / -Мут @user\n"
+        "• +Мут 5ч Богохульство / -Мут @user\n"
         "• +Бан @user / -Бан @user\n"
+        "• +Жалоба / +жб @user (всем)\n"
+        "• +Предупреждение / +пред / -Пред @user\n"
+        "• +Награда Название / 5 @user (админ 1–10, комиссар 1–6)\n"
+        "• -Награда Название @user\n"
+        "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
         "• Топ все / Топ день / Мое место\n"
         "• Шип @u1 @u2\n"
-        "• Сделать предложение @user\n"
-        "• +Брак @u1 @u2 (принудительно)\n"
-        "• -Брак (свой) / -Брак @user (админ)\n"
+        "• Сделать предложение @user / +Брак / -Брак\n"
         "• Мой брак\n"
         "• Профиль (базовый + кнопки разделов)\n"
         "• хо @user 50 — крестики-нолики\n"
@@ -104,8 +94,6 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Монеты 100 @user (админ)\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
-        "• +Жалоба / +жб @user (всем)\n"
-        "• +Предупреждение / +пред @user (шериф/комиссар/админ)\n"
         "• дроч / Аура / Топ аура — аурометр"
     )
 
@@ -115,10 +103,6 @@ async def post_init(app: Application) -> None:
     await sss.restore_sss_members()
     await resolver.start_client()
 
-    # set_webhook здесь НЕ вызываем: run_webhook сам выставит webhook
-    # с нужным url_path и drop_pending_updates. Двойной вызов даёт
-    # "Flood control exceeded".
-
     if app.job_queue:
         app.job_queue.run_daily(
             top.cleanup_job,
@@ -127,8 +111,7 @@ async def post_init(app: Application) -> None:
         logger.info("JobQueue: ежедневная очистка messages_day запланирована")
         economy.register_jobs(app)
     else:
-        logger.warning("JobQueue не инициализирован — проверь "
-                       "python-telegram-bot[webhooks,job-queue]")
+        logger.warning("JobQueue не инициализирован")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -198,7 +181,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
     app.add_handler(CallbackQueryHandler(tictactoe.ttt_callback, pattern=r"^ttt:"))
 
-    # ССС и суды — порядок ВАЖЕН: +Суд ССС раньше, чем +Суд
+    # ССС и суды — порядок ВАЖЕН
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ССС(\s|$)"), sss.cmd_sss_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]ССС(\s|$)"), sss.cmd_sss_remove))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+ССС(\s|$)"), sss.cmd_sss_list))
@@ -208,7 +191,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # Жалобы и предупреждения (полная и короткая формы)
+    # Жалобы и предупреждения
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
         complaints.cmd_complaint,
@@ -219,6 +202,10 @@ def build_app() -> Application:
         filters.Regex(r"(?i)^\+(Предупреждение|Пред|Варн)(\s|$)"),
         warns.cmd_warn,
     ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−](Предупреждение|Пред|Варн)(\s|$)"),
+        warns.cmd_unwarn,
+    ))
 
     # Аурометр
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^дроч(\s|$)"),
@@ -227,6 +214,26 @@ def build_app() -> Application:
                                    aura.cmd_aura_top))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аура(\s|$)"),
                                    aura.cmd_aura))
+
+    # Награды
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Награда(\s|$)"),
+                                   awards.cmd_award))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
+                                   awards.cmd_unaward))
+
+    # Действия
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
+                                   actions.cmd_slap))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"),
+                                   actions.cmd_kiss))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять(\s|$)"),
+                                   actions.cmd_hug))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Побить(\s|$)"),
+                                   actions.cmd_hit))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обоссать(\s|$)"),
+                                   actions.cmd_piss))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
+                                   actions.cmd_pat))
 
     # Счётчик сообщений
     app.add_handler(
