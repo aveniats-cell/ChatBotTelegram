@@ -1,12 +1,9 @@
 """ССС и суды.
 
-- +ССС @user / -ССС @user / Список ССС — состав совета (только админ).
-  Максимум 4 человека включая админа. Состав пишется в users.sss_member
-  и восстанавливается при старте.
-- +Суд ССС @user — голосуют только участники ССС. Если хоть один против —
-  бан не выдаётся. Если все за — мгновенный бан.
-- +Суд @user — голосуют все, большинством. По итогу (порог голосов или
-  таймаут) решение уходит админу в личку, он жмёт «Забанить»/«Оставить».
+P1: +Суд ССС теперь с таймаутом (10 мин). Если не все проголосовали —
+финализируем по текущим голосам: любой «no» = оставить, иначе бан.
+
+P2: _resolve_target вынесен в utils.resolve_target.
 """
 import os
 import re
@@ -25,7 +22,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import resolver
+import utils
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +31,15 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
-MAX_SSS = 4  # включая админа
+MAX_SSS = 4
 
-# --- in-memory состояние ---
-SSS_MEMBERS: set[int] = set()          # без админа, он всегда внутри
+SSS_MEMBERS: set[int] = set()
 SSS_TRIALS: dict[str, dict] = {}
 PUBLIC_TRIALS: dict[str, dict] = {}
 
-PUBLIC_TRIAL_VOTE_THRESHOLD = 5        # столько голосов — финализируем
-PUBLIC_TRIAL_TIMEOUT_SEC = 600         # или через 10 минут — принудительно
+PUBLIC_TRIAL_VOTE_THRESHOLD = 5
+PUBLIC_TRIAL_TIMEOUT_SEC = 600
+SSS_TRIAL_TIMEOUT_SEC = 600
 
 
 def _sss_all() -> set[int]:
@@ -52,8 +49,12 @@ def _sss_all() -> set[int]:
     return s
 
 
+def is_sss_member(user_id: int) -> bool:
+    """Публичный хелпер — не дёргай _sss_all() из других модулей."""
+    return user_id in _sss_all()
+
+
 async def restore_sss_members() -> None:
-    """Вызывается из main.post_init — восстанавливает состав ССС из БД."""
     try:
         ids = await db.list_sss_members()
     except Exception as e:
@@ -66,29 +67,6 @@ async def restore_sss_members() -> None:
     logger.info("sss: восстановлено участников: %s", len(SSS_MEMBERS))
 
 
-async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    msg = update.effective_message
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        return u.id, u.first_name or u.username or str(u.id)
-    m = USERNAME_RE.search(text or "")
-    if not m:
-        return None
-    uname = m.group(1)
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid, uname
-    r = await resolver.resolve_username(uname)
-    if r:
-        return r
-    try:
-        c = await context.bot.get_chat(f"@{uname}")
-        return c.id, c.first_name or uname
-    except TelegramError as e:
-        logger.warning("get_chat @%s: %s", uname, e)
-    return None
-
-
 # ---------- состав ССС ----------
 
 async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,7 +74,7 @@ async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = update.effective_message
     if not user or not msg:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -107,7 +85,7 @@ async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    target = await _resolve_target(update, context, msg.text or "")
+    target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -136,11 +114,11 @@ async def cmd_sss_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg = update.effective_message
     if not user or not msg:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
 
-    target = await _resolve_target(update, context, msg.text or "")
+    target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -189,7 +167,7 @@ async def cmd_sss_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("⛔ Только участники ССС.")
         return
 
-    target = await _resolve_target(update, context, msg.text or "")
+    target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -220,18 +198,27 @@ async def cmd_sss_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Подсудимый: {escape(name)} (id <code>{uid}</code>)\n\n"
         f"Голосуют <b>только участники ССС</b>.\n"
         f"Если хоть один против — бан не выдаётся.\n"
-        f"Участников: <b>{len(members)}</b>",
+        f"Участников: <b>{len(members)}</b>\n"
+        f"<i>Таймаут: {SSS_TRIAL_TIMEOUT_SEC // 60} мин.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
 
+    if context.job_queue:
+        context.job_queue.run_once(
+            sss_trial_timeout_job,
+            when=SSS_TRIAL_TIMEOUT_SEC,
+            data=trial_id,
+        )
 
-async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str) -> None:
+
+async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str,
+                              force: bool = False) -> None:
     t = SSS_TRIALS.get(trial_id)
     if not t:
         return
     members = _sss_all()
-    if not members.issubset(t["voters"]):
+    if not force and not members.issubset(t["voters"]):
         return
 
     any_no = any(v == "no" for v in t["votes"].values())
@@ -250,6 +237,23 @@ async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str)
             )
         except TelegramError as e:
             logger.warning("sss trial finalize: %s", e)
+        return
+
+    # force=True и никто не голосовал «no» — трактуем как «забанить»,
+    # только если есть хотя бы один «yes».
+    if force and not any(v == "yes" for v in t["votes"].values()):
+        try:
+            await context.bot.send_message(
+                chat_id=t["chat_id"],
+                text=(
+                    f"⚖️ <b>Суд ССС завершён</b>\n"
+                    f"Подсудимый: {escape(t['target_name'])}\n"
+                    f"Решение: ⏳ <b>Недостаточно голосов</b> — оставить."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError as e:
+            logger.warning("sss trial timeout: %s", e)
         return
 
     try:
@@ -277,12 +281,21 @@ async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str)
             text=(
                 f"⚖️ <b>Суд ССС завершён</b>\n"
                 f"Подсудимый: {escape(t['target_name'])}\n"
-                f"Решение: ✅ <b>Забанен</b> (единогласно)."
+                f"Решение: ✅ <b>Забанен</b>"
+                f"{'' if not force else ' (по таймауту)'}."
             ),
             parse_mode=ParseMode.HTML,
         )
     except TelegramError as e:
         logger.warning("sss trial finalize msg: %s", e)
+
+
+async def sss_trial_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    trial_id = job.data if job else None
+    if not trial_id:
+        return
+    await _sss_trial_finalize(context, trial_id, force=True)
 
 
 async def sss_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -321,7 +334,7 @@ async def cmd_public_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user or not msg or not chat:
         return
 
-    target = await _resolve_target(update, context, msg.text or "")
+    target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -455,7 +468,7 @@ async def public_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     if not q or not user:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await q.answer("Только админ.", show_alert=True)
         return
     parts = (q.data or "").split(":")
