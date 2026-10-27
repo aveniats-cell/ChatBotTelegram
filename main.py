@@ -85,14 +85,15 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    remain = ai.check_cooldown(user.id)
+    # try_acquire атомарно проверяет и занимает cooldown.
+    # Возвращает 0.0, если можно выполнять запрос, иначе — оставшиеся секунды.
+    remain = ai.try_acquire(user.id)
     if remain > 0:
         await msg.reply_text(
             f"⏳ Подожди {remain:.1f} сек. перед следующим запросом."
         )
         return
 
-    ai.touch_cooldown(user.id)
     thinking = await msg.reply_text("🤔 Думаю…")
 
     answer = await ai.ask_ai(prompt)
