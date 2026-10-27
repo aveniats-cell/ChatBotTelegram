@@ -2,6 +2,8 @@
 
 3 активных предупреждения за 5 дней → автоматический бан.
 Предупреждение истекает через WARN_TTL_DAYS дней (по умолчанию 5).
+
+Алиасы: +Предупреждение, +пред, +варн (регистр не важен).
 """
 import os
 import re
@@ -22,6 +24,10 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
+
+# Срезает команду в начале текста (полную или короткую), чтобы при выделении
+# причины «+пред @user мат» в причину попал только «мат».
+_CMD_RE = re.compile(r"(?i)^\s*\+(Предупреждение|Пред|Варн)\s*")
 
 WARN_TTL_DAYS = 5
 WARN_LIMIT = 3
@@ -79,9 +85,10 @@ async def _check_and_ban_if_needed(
 
 
 async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Предупреждение @user [причина] — доступно шерифу/комиссару/админу.
+    """+Предупреждение / +пред / +варн @user [причина].
 
-    Участнику (без роли) — отказ. Причина опциональна (текст после цели).
+    Доступно шерифу/комиссару/админу. Участнику (без роли) — отказ.
+    Причина опциональна (текст после цели).
     """
     user = update.effective_user
     chat = update.effective_chat
@@ -98,7 +105,8 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text(
-            "Формат: <code>+Предупреждение @user</code> или реплай.",
+            "Формат: <code>+Предупреждение @user</code> "
+            "(или <code>+пред @user</code>), либо реплай.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -119,7 +127,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Причина: всё, что осталось после удаления команды и @username.
     raw = (msg.text or "").strip()
     reason = None
-    cleaned = re.sub(r"(?i)^\s*\+Предупреждение\s*", "", raw)
+    cleaned = _CMD_RE.sub("", raw)
     cleaned = USERNAME_RE.sub("", cleaned).strip()
     if cleaned:
         reason = cleaned[:200]
