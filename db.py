@@ -252,8 +252,6 @@ async def set_sss(user_id: int, is_member: bool) -> None:
 
 
 async def list_sss_members() -> List[int]:
-    """Возвращает user_id всех, у кого sss_member = 1 (для восстановления
-    состава ССС после рестарта)."""
     rs = await _exec("SELECT user_id FROM users WHERE sss_member = 1")
     return [row[0] for row in rs.rows]
 
@@ -273,7 +271,6 @@ async def add_credit(user_id: int, delta: int) -> None:
 
 
 async def apply_credit_interest(percent: float) -> int:
-    """Начисляет проценты на остаток долга. Возвращает rows_affected."""
     rs = await _exec(
         "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
         "WHERE credit > 0",
@@ -448,15 +445,26 @@ async def cleanup_old_days(keep_days: int = 0) -> int:
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
-    # RETURNING id — атомарно в одном запросе. Без этого last_insert_rowid()
-    # в HTTP-транспорте может уйти на другой коннект и вернуть чужой/0 id.
+    # RETURNING в libsql-client 0.3.1 через HTTP иногда не кладёт строки
+    # в rs.rows (для INSERT библиотека может отдать пустой rows, даже если
+    # SQLite вернул строку). Поэтому — CTE + last_insert_rowid() одним
+    # statement: гарантия, что id вычислен в том же коннекте.
     rs = await _exec(
-        """INSERT INTO marriages (chat_id, user1_id, user2_id, active, forced)
-           VALUES (?, ?, ?, ?, ?)
-           RETURNING id""",
+        """WITH ins AS (
+               INSERT INTO marriages (chat_id, user1_id, user2_id, active, forced)
+               VALUES (?, ?, ?, ?, ?)
+           )
+           SELECT id FROM marriages WHERE rowid = last_insert_rowid()""",
         [chat_id, user1_id, user2_id, 1 if forced else 0, 1 if forced else 0],
     )
-    return rs.rows[0][0] if rs.rows else 0
+    if rs.rows:
+        return rs.rows[0][0]
+    # fallback: последний id для этого чата
+    rs2 = await _exec(
+        "SELECT id FROM marriages WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+        [chat_id],
+    )
+    return rs2.rows[0][0] if rs2.rows else 0
 
 
 async def accept_marriage(marriage_id: int) -> None:
