@@ -1,4 +1,8 @@
-"""2.3 Топ чата: счётчик сообщений, Топ день / Топ все, Моё место."""
+"""2.3 Топ чата: счётчик сообщений, Топ день / Топ все, Моё место.
+
+P1: track_message использует один batch (db.inc_message_and_day) вместо
+трёх HTTP-запросов на каждое сообщение.
+"""
 import logging
 from html import escape
 from datetime import datetime, timezone
@@ -23,9 +27,11 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     try:
         await db.upsert_user(user.id, user.username, user.first_name)
-        await db.inc_message(chat.id, user.id)
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await db.inc_message_day(chat.id, user.id, day)
+        ok = await db.inc_message_and_day(chat.id, user.id, day)
+        if not ok:
+            logger.warning("track_message: batch не выполнен (chat=%s user=%s)",
+                           chat.id, user.id)
     except Exception as e:
         logger.warning("track_message: %s", e)
 
@@ -36,6 +42,16 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
     except Exception as e:
         logger.warning("cleanup_job: %s", e)
+
+
+def _medal(i: int) -> str:
+    if i == 1:
+        return "🥇"
+    if i == 2:
+        return "🥈"
+    if i == 3:
+        return "🥉"
+    return f"{i}."
 
 
 async def _build_top_text(
@@ -53,8 +69,7 @@ async def _build_top_text(
             name = chat.first_name or chat.username or str(uid)
         except TelegramError:
             pass
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lines.append(f"{medal} {escape(name)} — <b>{cnt}</b>")
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
     return "\n".join(lines)
 
 
@@ -73,8 +88,7 @@ async def _build_top_day_text(
             name = chat.first_name or chat.username or str(uid)
         except TelegramError:
             pass
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lines.append(f"{medal} {escape(name)} — <b>{cnt}</b>")
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
     return "\n".join(lines)
 
 
