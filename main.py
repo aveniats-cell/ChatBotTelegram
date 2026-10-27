@@ -9,6 +9,7 @@
 - Добавлены +Жалоба / +жб / +жал (всем) и
   +Предупреждение / +пред / +варн (шериф/комиссар/админ).
 - Добавлен Аурометр: дроч / Аура / Топ аура.
+- Профиль теперь с inline-кнопками разделов (prof:*).
 - Модуль предупреждений называется warns (а не warnings), чтобы не
   перекрывать стандартный модуль Python и не ломать pip/virtualenv/poetry
   на этапе сборки.
@@ -96,7 +97,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Сделать предложение @user\n"
         "• +Брак @u1 @u2 (принудительно)\n"
         "• -Брак (свой) / -Брак @user (админ)\n"
-        "• Мой брак / Профиль\n"
+        "• Мой брак\n"
+        "• Профиль (базовый + кнопки разделов)\n"
         "• хо @user 50 — крестики-нолики\n"
         "• +Кредит 50 / -Кредит 50\n"
         "• +Монеты 100 @user (админ)\n"
@@ -186,8 +188,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # Профиль
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"), profile.cmd_profile))
+    # Профиль (базовый + кнопки разделов)
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
+                                   profile.cmd_profile))
+    app.add_handler(CallbackQueryHandler(profile.profile_callback,
+                                         pattern=r"^prof:"))
 
     # Крестики-нолики
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
