@@ -1,8 +1,11 @@
-"""ИИ-модуль: запросы к gemini через Pollinations.
+"""ИИ-модуль: запросы к gemini через Pollinations + контекст диалога.
 
 Использует AI_TOKEN и BASE_URL из переменных окружения.
 BASE_URL должен указывать на https://gen.pollinations.ai (актуальный gateway).
 Легаси-хост text.pollinations.ai отключён и возвращает 404.
+
+Контекст: на пользователя хранится до MAX_HISTORY сообщений (user+assistant)
+в TTLCache на час. Сброс — ai.reset_history(user_id) (/restart).
 """
 import os
 import time
@@ -14,7 +17,6 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# Оба параметра обязательны — берутся из Values на Render.
 AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
@@ -22,16 +24,17 @@ MODEL = "openai-fast"
 
 COOLDOWN_SEC = 5.0
 
-# Ограниченный кэш вместо безразмерного dict, чтобы не текла память.
-# maxsize=10000 — при большем числе активных пользователей старые записи вытесняются.
+MAX_HISTORY = 10  # сообщений (5 пар user/assistant)
+
 _last_request: TTLCache = TTLCache(maxsize=10000, ttl=COOLDOWN_SEC * 2)
 
-# Одна сессия на модуль — переиспользование соединений, DNS-кэша и TLS.
+# user_id -> list[{role, content}]
+_history: TTLCache = TTLCache(maxsize=5000, ttl=3600)
+
 _session: Optional[aiohttp.ClientSession] = None
 
 
 async def _get_session() -> aiohttp.ClientSession:
-    """Возвращает (и при необходимости создаёт) общую aiohttp-сессию."""
     global _session
     if _session is None or _session.closed:
         _session = aiohttp.ClientSession(
@@ -50,7 +53,6 @@ async def _get_session() -> aiohttp.ClientSession:
 
 
 async def close_session() -> None:
-    """Закрывает сессию. Вызывать при shutdown приложения."""
     global _session
     if _session and not _session.closed:
         await _session.close()
@@ -58,15 +60,12 @@ async def close_session() -> None:
 
 
 def _api_url() -> str:
-    """Собирает URL к OpenAI-совместимому endpoint."""
     if not BASE_URL:
         logger.error("ai: BASE_URL не задан в переменных окружения")
         return ""
-
     if not BASE_URL.startswith(("http://", "https://")):
         logger.error("ai: BASE_URL должен начинаться с http:// или https://")
         return ""
-
     base = BASE_URL
     if base.endswith("/v1/chat/completions"):
         return base
@@ -75,8 +74,27 @@ def _api_url() -> str:
     return f"{base}/v1/chat/completions"
 
 
-async def ask_ai(prompt: str) -> Optional[str]:
-    """Отправляет запрос в gemini. Возвращает текст или None."""
+def reset_history(user_id: int) -> None:
+    _history.pop(user_id, None)
+
+
+def _get_history(user_id: int) -> list:
+    return _history.setdefault(user_id, [])
+
+
+def _append(user_id: int, role: str, content: str) -> None:
+    h = _history.setdefault(user_id, [])
+    h.append({"role": role, "content": content})
+    if len(h) > MAX_HISTORY:
+        del h[: len(h) - MAX_HISTORY]
+
+
+async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
+    """Отправляет запрос в gemini. Возвращает текст или None.
+
+    Если user_id задан — учитывает историю диалога и дописывает пару
+    (user, assistant) в историю после успешного ответа.
+    """
     if not AI_TOKEN:
         logger.error("ai: AI_TOKEN не задан в переменных окружения")
         return None
@@ -85,22 +103,20 @@ async def ask_ai(prompt: str) -> Optional[str]:
     if not url:
         return None
 
-    # Ограничиваем длину prompt, чтобы не ловить 400/413 от API.
     if len(prompt) > 8000:
         prompt = prompt[:8000]
 
+    messages = [{
+        "role": "system",
+        "content": "Ты умный чат-бот в Telegram. Пиши максимально кратко.",
+    }]
+    if user_id is not None:
+        messages.extend(_get_history(user_id))
+    messages.append({"role": "user", "content": prompt})
+
     payload = {
         "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты умный чат бот в Telegram "
-                    "Пиши максимально кратко"
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "max_tokens": 2048,
     }
 
@@ -141,7 +157,13 @@ async def ask_ai(prompt: str) -> Optional[str]:
 
             msg = choice.get("message") or {}
             content = (msg.get("content") or "").strip()
-            return content or None
+            if not content:
+                return None
+
+            if user_id is not None:
+                _append(user_id, "user", prompt)
+                _append(user_id, "assistant", content)
+            return content
 
     except aiohttp.ClientError as e:
         logger.warning("ai: сеть — %s", e)
@@ -154,8 +176,7 @@ async def ask_ai(prompt: str) -> Optional[str]:
 def try_acquire(user_id: int) -> float:
     """Атомарно проверяет и занимает cooldown.
 
-    Возвращает 0, если можно выполнять запрос (и сразу записывает метку времени),
-    иначе — оставшиеся секунды.
+    Возвращает 0, если можно выполнять запрос, иначе — оставшиеся секунды.
     """
     now = time.monotonic()
     last = _last_request.get(user_id)
