@@ -8,7 +8,9 @@
   уже обработанного proposal.
 - кнопки проверяют, что callback пришёл из того же чата, где proposal.
 - _marriage_level считает от married_at (момент accept), а не created_at.
-- +Брак не женит ботов и админа.
+- +Брак не женит ботов и админа. Принудительный брак создаётся как
+  предложение (forced=1, active=0) и АКТИВИРУЕТСЯ через accept_marriage —
+  иначе активного брака не будет (регрессия исправлена).
 - При ошибке БД показываем «ошибка», а не «не найдено».
 """
 import os
@@ -367,6 +369,20 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning("cmd_force_marriage: create_proposal вернул 0")
         await msg.reply_text("⚠️ Не удалось создать брак. Попробуйте ещё раз.")
         return
+
+    # ВАЖНО: create_proposal создаёт запись с active=0. Принудительный брак
+    # активируется тем же атомарным accept_marriage, что и обычный — иначе
+    # активного брака в БД не будет.
+    affected = await db.accept_marriage(mid)
+    if affected == 0:
+        logger.warning("cmd_force_marriage: accept_marriage(%s) вернул 0", mid)
+        await db.delete_marriage(mid)
+        await msg.reply_text(
+            "⚠️ Не удалось активировать брак (возможно, у одного из "
+            "участников уже есть активный брак)."
+        )
+        return
+
     await db.log_marriage_event(chat.id, id1, id2, "forced_married", by_user_id=user.id)
 
     await msg.reply_text(
