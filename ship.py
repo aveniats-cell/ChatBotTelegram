@@ -56,6 +56,10 @@ async def cmd_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     a, b = names[0], names[1]
+    if a.casefold() == b.casefold():
+        await msg.reply_text("Шип с самим собой? Ну ладно 🙂")
+        return
+
     template = random.choice(TEMPLATES)
     phrase = template.format(a=escape(a), b=escape(b))
     await msg.reply_text(f"💘 <b>Шип</b>\n{phrase}", parse_mode=ParseMode.HTML)
