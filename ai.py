@@ -95,8 +95,8 @@ async def ask_ai(prompt: str) -> Optional[str]:
             {
                 "role": "system",
                 "content": (
-                    "Ты чат-бот в группе Telegram, тебя разработали Aveniats, "
-                    "а твое имя Brainy."
+                    "Ты умный чат бот в Telegram "
+                    "Пиши по дружески а не как агент."
                 ),
             },
             {"role": "user", "content": prompt},
