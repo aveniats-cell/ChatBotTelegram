@@ -1,10 +1,11 @@
 """Логика PR-бота: проверка подписки, удаление сообщений, приглашение.
 
-P1: _looks_like_admin_command — это белый список «команд, которые должны
+P1: _looks_like_admin_command — белый список «команд, которые должны
 работать без подписки» (первое слово совпадает полностью, а не по
-префиксу). «Профиль мой» действительно не попадает ни под один пункт
-списка — в списке ровно те команды, которые должны работать без
-подписки.
+префиксу).
+
+P2: сообщения-реплаи на сообщения бота (для чата с ИИ) не удаляются
+и не требуют подписки — иначе бот режет свой же диалог.
 """
 import os
 import logging
@@ -29,11 +30,12 @@ CANAL_ID = int(os.getenv("CANAL_ID", "0") or "0")
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
 
-# Команды, которые должны работать даже без подписки.
 _ADMIN_WORDS = {
     "топ", "шип", "сделать", "профиль", "мой", "мое",
     "список", "поймать", "хо",
     "статы", "stats", "start", "ping", "check",
+    "казино", "казик", "ии", "браин", "браини", "мозг", "brainy", "brain",
+    "help", "restart",
 }
 
 
@@ -47,6 +49,12 @@ def _looks_like_admin_command(text: str) -> bool:
         return True
     first = stripped.split(maxsplit=1)[0].casefold().strip(".,!?:;")
     return first in _ADMIN_WORDS
+
+
+def _is_reply_to_bot(msg: Message, bot_id: int) -> bool:
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return False
+    return msg.reply_to_message.from_user.id == bot_id
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
@@ -83,6 +91,14 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not msg or not user or user.is_bot:
         return
 
+    # Реплаи на сообщения бота — не трогаем (диалог с ИИ).
+    try:
+        bot_id = context.bot.id
+    except Exception:
+        bot_id = 0
+    if bot_id and _is_reply_to_bot(msg, bot_id):
+        return
+
     if _looks_like_admin_command(msg.text or ""):
         return
 
@@ -115,6 +131,8 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.new_chat_members:
+        return
     for member in update.message.new_chat_members:
         if member.is_bot:
             continue
