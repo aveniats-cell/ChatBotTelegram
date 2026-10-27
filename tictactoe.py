@@ -1,9 +1,10 @@
 """Крестики-нолики 5×5 на монеты.
 
-P0: эскроу ставок. При accept списываем bet у обоих; при finish:
+P0: эскроу ставок. При accept атомарно списываем bet у обоих
+(db.take_balance_atomic); при finish:
 - ничья: каждому +bet (возврат своей ставки)
 - победа: победителю +2*bet (своя + чужая), проигравший уже потерял свою.
-Никакого надувания экономики.
+Никакого надувания экономики и ухода в минус.
 """
 import os
 import re
@@ -270,29 +271,40 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
             return
 
-        # ACCEPT: эскроу — списываем ставку у обоих
+        # ACCEPT: эскроу — атомарно списываем ставку у обоих.
         bet = g["bet"]
         p1, p2 = g["p1_id"], g["p2_id"]
 
-        r1 = await db.get_user(p1)
-        r2 = await db.get_user(p2)
-        b1 = (r1 or {}).get("balance") or 0
-        b2 = (r2 or {}).get("balance") or 0
-        if b1 < bet or b2 < bet:
+        if not await db.take_balance_atomic(p1, bet):
             g["state"] = "declined"
             GAMES.pop(game_id, None)
-            await q.answer("У кого-то не хватает монет.", show_alert=True)
+            await q.answer("У вас не хватает монет.", show_alert=True)
             try:
                 await q.edit_message_text(
-                    (q.message.text or "") + "\n\n⚠️ <b>Отменено: недостаточно монет.</b>",
+                    (q.message.text or "") + "\n\n⚠️ <b>Отменено: "
+                    "у инициатора недостаточно монет.</b>",
                     parse_mode=ParseMode.HTML,
                 )
             except TelegramError:
                 pass
             return
 
-        await db.add_balance(p1, -bet)
-        await db.add_balance(p2, -bet)
+        if not await db.take_balance_atomic(p2, bet):
+            # вернуть ставку инициатору
+            await db.add_balance(p1, bet)
+            g["state"] = "declined"
+            GAMES.pop(game_id, None)
+            await q.answer("У соперника не хватает монет.", show_alert=True)
+            try:
+                await q.edit_message_text(
+                    (q.message.text or "") + "\n\n⚠️ <b>Отменено: "
+                    "у соперника недостаточно монет.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
         g["escrow_taken"] = True
         g["state"] = "active"
 
