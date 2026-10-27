@@ -225,6 +225,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
     app.add_handler(CommandHandler("check", pr.recheck_subscription))
     app.add_handler(CommandHandler("help", help_menu.cmd_help))
+    app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
 
