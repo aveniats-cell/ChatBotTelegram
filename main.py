@@ -4,6 +4,7 @@ import logging
 from datetime import time as dtime, timezone
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -29,6 +30,7 @@ import warns
 import aura
 import awards
 import actions
+import ai
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -66,6 +68,55 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong 🏓")
 
 
+async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик Brainy/Браини/Мозг — запрос к gemini через Pollinations."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    text = (msg.text or "").strip()
+    parts = text.split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) > 1 else ""
+    if not prompt:
+        await msg.reply_text(
+            "Формат: <code>Браини Привет</code> — напиши запрос после команды.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    remain = ai.check_cooldown(user.id)
+    if remain > 0:
+        await msg.reply_text(
+            f"⏳ Подожди {remain:.1f} сек. перед следующим запросом."
+        )
+        return
+
+    ai.touch_cooldown(user.id)
+    thinking = await msg.reply_text("🤔 Думаю…")
+
+    answer = await ai.ask_ai(prompt)
+    if not answer:
+        try:
+            await thinking.edit_text(
+                "⚠️ ИИ не ответил. Попробуй позже."
+            )
+        except Exception:
+            pass
+        return
+
+    if len(answer) > 4000:
+        answer = answer[:4000] + "…"
+
+    try:
+        await thinking.edit_text(answer)
+    except Exception:
+        try:
+            await msg.reply_text(answer)
+        except Exception:
+            pass
+
+
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not ADMIN_ID or not u or u.id != ADMIN_ID:
@@ -81,7 +132,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Бан @user / -Бан @user\n"
         "• +Жалоба / +жб @user (всем)\n"
         "• +Предупреждение / +пред / -Пред @user\n"
-        "• +Награда Название / 5 @user (админ 1–10, комиссар 1–6)\n"
+        "• +Награда Название / 5 @user\n"
         "• -Награда Название @user\n"
         "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
         "• Топ все / Топ день / Мое место\n"
@@ -94,7 +145,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Монеты 100 @user (админ)\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
-        "• дроч / Аура / Топ аура — аурометр"
+        "• дроч / Аура / Топ аура — аурометр\n"
+        "• Браини / Мозг / Brainy <запрос> — ИИ"
     )
 
 
@@ -234,6 +286,12 @@ def build_app() -> Application:
                                    actions.cmd_piss))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
+
+    # ИИ (gemini через Pollinations)
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(б|Браин|Мозг|Браини|Brainy|Brain)(\s|$)"),
+        cmd_ai,
+    ))
 
     # Счётчик сообщений
     app.add_handler(
