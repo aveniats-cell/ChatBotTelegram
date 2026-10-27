@@ -1,9 +1,7 @@
-"""+Предупреждение: шериф/комиссар/админ выписывает предупреждение.
+"""+Предупреждение / -Предупреждение (снятие).
 
-3 активных предупреждения за 5 дней → автоматический бан.
-Предупреждение истекает через WARN_TTL_DAYS дней (по умолчанию 5).
-
-Алиасы: +Предупреждение, +пред, +варн (регистр не важен).
+Алиасы: +пред, +варн, -пред, -варн.
+3 активных за 5 дней → автобан.
 """
 import os
 import re
@@ -25,8 +23,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
-# Срезает команду в начале текста (полную или короткую), чтобы при выделении
-# причины «+пред @user мат» в причину попал только «мат».
 _CMD_RE = re.compile(r"(?i)^\s*\+(Предупреждение|Пред|Варн)\s*")
 
 WARN_TTL_DAYS = 5
@@ -34,7 +30,6 @@ WARN_LIMIT = 3
 
 
 async def _is_staff(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Шериф / комиссар / админ. Участник — нет."""
     if ADMIN_ID and user_id == ADMIN_ID:
         return True
     try:
@@ -46,13 +41,8 @@ async def _is_staff(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
 
 
 async def _check_and_ban_if_needed(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
-    name: str,
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, name: str,
 ) -> bool:
-    """Если у юзера >= WARN_LIMIT активных предупреждений — банит.
-
-    Возвращает True, если бан произошёл.
-    """
     cnt = await db.count_active_warnings(chat_id, user_id)
     if cnt < WARN_LIMIT:
         return False
@@ -60,23 +50,13 @@ async def _check_and_ban_if_needed(
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
     except TelegramError as e:
         logger.warning("auto-ban after warnings: %s", e)
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(f"⚠️ У {escape(name)} <b>{cnt}</b> предупреждений, "
-                      f"но Telegram не дал забанить: {escape(str(e))}"),
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
         return False
     await db.add_punishment(user_id, chat_id, "ban", None, ADMIN_ID)
     await db.deactivate_warnings(chat_id, user_id)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(f"🔨 {escape(name)} забанен(а): "
-                  f"<b>{cnt}</b> предупреждений за {WARN_TTL_DAYS} дней."),
+            text=f"🔨 {escape(name)} забанен(а): <b>{cnt}</b> предупреждений.",
             parse_mode=ParseMode.HTML,
         )
     except TelegramError:
@@ -85,11 +65,6 @@ async def _check_and_ban_if_needed(
 
 
 async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Предупреждение / +пред / +варн @user [причина].
-
-    Доступно шерифу/комиссару/админу. Участнику (без роли) — отказ.
-    Причина опциональна (текст после цели).
-    """
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -105,8 +80,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text(
-            "Формат: <code>+Предупреждение @user</code> "
-            "(или <code>+пред @user</code>), либо реплай.",
+            "Формат: <code>+Предупреждение @user</code> или реплай.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -118,13 +92,10 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ADMIN_ID and uid == ADMIN_ID:
         await msg.reply_text("Админу предупреждение выдать нельзя.")
         return
-
-    # Нельзя выдавать предупреждение другому сотруднику (шериф/комиссар/админ).
     if await _is_staff(context, uid):
         await msg.reply_text("Нельзя выдать предупреждение сотруднику.")
         return
 
-    # Причина: всё, что осталось после удаления команды и @username.
     raw = (msg.text or "").strip()
     reason = None
     cleaned = _CMD_RE.sub("", raw)
@@ -148,22 +119,59 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Кому: {escape(name)}\n"
         f"Выдал: {escape(user.first_name or str(user.id))}"
         f"{reason_line}\n"
-        f"Активных предупреждений: <b>{cnt}/{WARN_LIMIT}</b> "
-        f"(истекают за {WARN_TTL_DAYS} дней).",
+        f"Активных: <b>{cnt}/{WARN_LIMIT}</b> (истекают за {WARN_TTL_DAYS} дней).",
         parse_mode=ParseMode.HTML,
     )
 
-    # Автобан при достижении лимита.
     if cnt >= WARN_LIMIT:
         await _check_and_ban_if_needed(context, chat.id, uid, name)
     else:
-        # мягкое напоминание нарушителю в чат
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=(f"👀 {escape(name)}, у вас предупреждение "
-                      f"({cnt}/{WARN_LIMIT}). Ещё немного — и бан."),
+                text=f"👀 {escape(name)}, у вас предупреждение ({cnt}/{WARN_LIMIT}).",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             pass
+
+
+async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """-Пред / -Предупреждение / -Варн @user — снимает последнее активное."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    if not await _is_staff(context, user.id):
+        await msg.reply_text(
+            "⛔ Снимать предупреждения может только шериф, комиссар или админ."
+        )
+        return
+
+    target = await utils.resolve_target(update, context, msg.text or "")
+    if not target:
+        await msg.reply_text(
+            "Формат: <code>-Пред @user</code> или реплай.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    uid, name = target
+
+    cnt_before = await db.count_active_warnings(chat.id, uid)
+    if cnt_before <= 0:
+        await msg.reply_text(f"У {escape(name)} нет активных предупреждений.")
+        return
+
+    removed = await db.remove_last_active_warning(chat.id, uid)
+    if removed == 0:
+        await msg.reply_text("⚠️ Не удалось снять предупреждение (ошибка БД).")
+        return
+
+    cnt_after = await db.count_active_warnings(chat.id, uid)
+    await msg.reply_text(
+        f"✅ Снято предупреждение с {escape(name)}.\n"
+        f"Активных: <b>{cnt_after}/{WARN_LIMIT}</b>",
+        parse_mode=ParseMode.HTML,
+    )
