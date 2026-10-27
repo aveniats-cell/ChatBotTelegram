@@ -1,4 +1,8 @@
-"""Точка входа: webhook-версия для Render Web Service (Free)."""
+"""Точка входа: webhook-версия для Render Web Service (Free).
+
+P1: track_message использует один batch (см. top.py + db.inc_message_and_day).
+P3: delete_webhook в shutdown убран — не создаём окно недоставки.
+"""
 import os
 import logging
 from datetime import time as dtime
@@ -63,7 +67,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
-    if not u or u.id != ADMIN_ID:
+    if not ADMIN_ID or not u or u.id != ADMIN_ID:
         await update.message.reply_text("⛔ Только для админа.")
         return
     await update.message.reply_text(
@@ -112,10 +116,7 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
-    try:
-        await app.bot.delete_webhook()
-    except Exception as e:
-        logger.warning("delete_webhook: %s", e)
+    # P3: delete_webhook убран — не создаём окно недоставки апдейтов.
     await resolver.stop_client()
     await db.close_db()
     logger.info("Bot stopped")
@@ -214,6 +215,8 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN не задан")
     if not WEBHOOK_URL:
         raise SystemExit("WEBHOOK_URL не задан")
+    if not WEBHOOK_URL.startswith("https://"):
+        raise SystemExit("WEBHOOK_URL должен начинаться с https://")
 
     app = build_app()
     logger.info("Starting webhook server on port %s", PORT)
