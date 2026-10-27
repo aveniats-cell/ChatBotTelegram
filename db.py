@@ -248,6 +248,10 @@ async def _migrate_tables() -> None:
         "ON warnings(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_complaints_status "
         "ON complaints(chat_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_complaints_reporter "
+        "ON complaints(chat_id, reporter_id)",
+        "CREATE INDEX IF NOT EXISTS idx_complaints_target "
+        "ON complaints(chat_id, target_id)",
         "CREATE INDEX IF NOT EXISTS idx_aura_chat_value "
         "ON aura(chat_id, value DESC)",
     ]
@@ -886,6 +890,17 @@ async def deactivate_warnings(chat_id: int, user_id: int) -> int:
     return getattr(rs, "rows_affected", 0) or 0
 
 
+async def count_warnings_total(chat_id: int, user_id: int) -> int:
+    """Сколько всего предупреждений было выдано юзеру (включая истёкшие)."""
+    rs = await _exec(
+        "SELECT COUNT(*) FROM warnings WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
 # ---------- complaints ----------
 
 async def add_complaint(chat_id: int, target_id: int, reporter_id: int,
@@ -937,6 +952,28 @@ async def resolve_complaint(complaint_id: int, status: str,
         [status, resolved_by, complaint_id],
     )
     return getattr(rs, "rows_affected", 0) or 0
+
+
+async def count_complaints_by(chat_id: int, reporter_id: int) -> int:
+    """Сколько жалоб подал пользователь в этом чате (все статусы)."""
+    rs = await _exec(
+        "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND reporter_id = ?",
+        [chat_id, reporter_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def count_complaints_against(chat_id: int, target_id: int) -> int:
+    """Сколько жалоб подано НА пользователя в этом чате (все статусы)."""
+    rs = await _exec(
+        "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND target_id = ?",
+        [chat_id, target_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
 
 
 # ---------- aura ----------
