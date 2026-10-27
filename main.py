@@ -50,6 +50,8 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
 
+# Скомпилированный паттерн используется ТОЛЬКО внутри cmd_ai (_AI_WORD.sub/.match).
+# В MessageHandler его передавать нельзя — там нужен filters.Regex(...).
 _AI_WORD = re.compile(
     r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"
 )
@@ -334,8 +336,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
 
-    # ИИ: триггер словом
-    app.add_handler(MessageHandler(_AI_WORD, cmd_ai))
+    # ИИ: триггер словом. ВАЖНО: filters.Regex, а не сырой re.Pattern.
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
+        cmd_ai,
+    ))
     # ИИ: реплай на сообщение бота (без триггера)
     app.add_handler(MessageHandler(
         filters.REPLY & filters.Chat(chat_id=CHAT_ID),
