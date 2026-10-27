@@ -1,8 +1,4 @@
-"""Общие утилиты: единый resolve @username -> user_id.
-
-Используется всеми модулями (roles, wedding, sss, profile, economy,
-tictactoe) — вместо шести копий _resolve_target.
-"""
+"""Общие утилиты: resolve @username -> user_id, парсер длительности."""
 import re
 import logging
 from typing import Optional
@@ -18,13 +14,65 @@ logger = logging.getLogger(__name__)
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
+_DUR_RE = re.compile(
+    r"(?i)(\d+)\s*"
+    r"(ч(?:ас(?:а|ов)?)?|h|м(?:ин(?:ут(?:а|ы)?)?)?|m|с(?:ек(?:унд(?:а|ы)?)?)?|s)"
+)
+
+
+def _unit_to_sec(unit: str) -> int:
+    u = unit.lower()
+    if u.startswith("ч") or u == "h":
+        return 3600
+    if u.startswith("м") or u == "m":
+        return 60
+    return 1
+
+
+def parse_duration(text: str) -> tuple[int, str]:
+    """'5с' -> (5,''), '5ч 3с' -> (18003,''), '5ч Богохульство' -> (18000,'Богохульство')."""
+    if not text:
+        return 0, text
+
+    total = 0
+    last_end = 0
+    found = False
+
+    for m in _DUR_RE.finditer(text):
+        try:
+            num = int(m.group(1))
+        except ValueError:
+            continue
+        total += num * _unit_to_sec(m.group(2))
+        last_end = m.end()
+        found = True
+
+    if not found:
+        return 0, text
+
+    rest = text[last_end:].strip(" ,;:-")
+    return total, rest
+
+
+def fmt_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}ч")
+    if m:
+        parts.append(f"{m}м")
+    if s or not parts:
+        parts.append(f"{s}с")
+    return " ".join(parts)
+
 
 async def resolve_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     arg_text: str,
 ) -> Optional[tuple[int, str]]:
-    """Резолвит цель: реплай → @username (БД → Telethon → get_chat)."""
     msg = update.effective_message
     if not msg:
         return None
@@ -61,7 +109,6 @@ async def resolve_two(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
 ) -> list[tuple[int, str]]:
-    """Резолвит до двух целей: реплай + @username'ы из текста."""
     targets: list[tuple[int, str]] = []
     msg = update.effective_message
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
