@@ -77,29 +77,6 @@ async def _exec(
     return _EmptyResult(error=True)
 
 
-async def _exec_batch(statements: list) -> bool:
-    """Выполняет несколько стейтментов одним вызовом (libsql-client batch)."""
-    if _client is None:
-        logger.error("db: _client не инициализирован (batch)")
-        return False
-    try:
-        batch = getattr(_client, "batch", None)
-        if batch is not None:
-            await batch(statements)
-            return True
-    except Exception as e:
-        logger.exception("db batch error: %s", e)
-        return False
-    ok = True
-    for st in statements:
-        sql = st.get("sql") if isinstance(st, dict) else st[0]
-        params = st.get("args") if isinstance(st, dict) else st[1]
-        rs = await _exec(sql, params, retries=0)
-        if getattr(rs, "error", False):
-            ok = False
-    return ok
-
-
 async def init_db() -> None:
     global _client
     if not TURSO_URL or not TURSO_TOKEN:
@@ -204,7 +181,10 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
-        # married_at уже есть в CREATE TABLE, миграция не нужна
+        # married_at уже есть в CREATE TABLE для новых БД, но для старых
+        # таблиц (созданных до этой схемы) колонки может не быть —
+        # ALTER TABLE ADD COLUMN идемпотентен и безопасен.
+        ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
     ]
 
@@ -218,9 +198,7 @@ async def _migrate_tables() -> None:
             continue
         await _exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
-    # Индексы и уникальность client_token.
-    # UNIQUE-индекс не создастся, если в таблице уже есть дубли токенов
-    # (теоретически невозможно при UUID4, но на всякий случай — логируем).
+    # Индексы.
     idx_stmts = [
         "CREATE INDEX IF NOT EXISTS idx_marriages_chat_active "
         "ON marriages(chat_id, active)",
@@ -314,9 +292,7 @@ async def list_sss_members() -> List[int]:
 async def add_balance(user_id: int, delta: int) -> bool:
     """Меняет баланс. Возвращает True при успехе.
 
-    Если строки нет — создаёт через upsert (не полагаемся на то, что
-    пользователь уже в БД). При ошибке БД — False, чтобы вызывающий
-    код не показывал «успех» впустую.
+    Если строки нет — создаёт через upsert. При ошибке БД — False.
     """
     rs = await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
@@ -357,11 +333,7 @@ async def set_credit_taken_day(user_id: int, day: str) -> None:
 # ---------- атомарные экономические операции ----------
 
 async def take_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: +credit и +balance одним UPDATE. True при успехе.
-
-    ВНИМАНИЕ: не проверяет лимит «раз в день» и отсутствие текущего долга.
-    Для команды +Кредит используйте take_credit_daily_atomic.
-    """
+    """Атомарно: +credit и +balance одним UPDATE. True при успехе."""
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) + ?,
@@ -380,16 +352,7 @@ async def take_credit_daily_atomic(
     today: str,
     balance_floor: int = 0,
 ) -> bool:
-    """Атомарно выдаёт кредит с проверкой всех условий в одном UPDATE.
-
-    Условия (все внутри WHERE):
-      - balance >= balance_floor (обычно 0),
-      - credit = 0 (нет текущего долга),
-      - credit_taken_day IS NULL OR != today (не брали сегодня).
-
-    При успехе: credit += amount, balance += amount,
-    credit_taken_day = today. Возвращает True при rows_affected > 0.
-    """
+    """Атомарно выдаёт кредит с проверкой всех условий в одном UPDATE."""
     rs = await _exec(
         """UPDATE users
            SET credit           = COALESCE(credit, 0) + ?,
@@ -411,11 +374,7 @@ async def take_credit_daily_atomic(
 
 
 async def repay_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: -credit и -balance одним UPDATE. True при успехе.
-
-    Дополнительно проверяет credit >= amount, чтобы долг не ушёл
-    в минус при параллельных погашениях.
-    """
+    """Атомарно: -credit и -balance одним UPDATE. True при успехе."""
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) - ?,
@@ -539,24 +498,35 @@ async def inc_message(chat_id: int, user_id: int) -> None:
 
 
 async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
-    """Один batch: инкремент messages и messages_day. True при успехе."""
-    stmts = [
-        {
-            "sql": """INSERT INTO messages (chat_id, user_id, count)
-                      VALUES (?, ?, 1)
-                      ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                        count = count + 1""",
-            "args": [chat_id, user_id],
-        },
-        {
-            "sql": """INSERT INTO messages_day (chat_id, user_id, day, count)
-                      VALUES (?, ?, ?, 1)
-                      ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
-                        count = count + 1""",
-            "args": [chat_id, user_id, day],
-        },
-    ]
-    return await _exec_batch(stmts)
+    """Два отдельных запроса вместо batch.
+
+    libsql-client 0.3.1 через HTTP отдаёт 400 на формат batch,
+    который мы использовали. Последовательные _exec надёжнее.
+    Возвращает True, если оба запроса выполнились без ошибок БД.
+    """
+    rs1 = await _exec(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, 1)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + 1""",
+        [chat_id, user_id],
+    )
+    if getattr(rs1, "error", False):
+        logger.error("inc_message: ошибка БД (chat=%s user=%s)", chat_id, user_id)
+        return False
+
+    rs2 = await _exec(
+        """INSERT INTO messages_day (chat_id, user_id, day, count)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             count = count + 1""",
+        [chat_id, user_id, day],
+    )
+    if getattr(rs2, "error", False):
+        logger.error("inc_message_day: ошибка БД (chat=%s user=%s day=%s)",
+                     chat_id, user_id, day)
+        return False
+    return True
 
 
 async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
@@ -640,8 +610,7 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
     а поиск детерминирован по client_token.
 
     Возвращает 0 при ошибке БД или если у кого-то из участников уже есть
-    активный брак в этом чате (INSERT ... SELECT ... WHERE NOT EXISTS
-    вставит 0 строк).
+    активный брак в этом чате.
     """
     token = _new_client_token()
 
@@ -672,12 +641,9 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
     )
     if getattr(rs2, "error", False):
         logger.error("create_proposal: ошибка SELECT по token (chat=%s)", chat_id)
-        # cleanup, чтобы не оставить «сироту» без id
         await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
         return 0
     if not rs2.rows:
-        # INSERT не вставил строку (у участников уже есть активный брак)
-        # либо SELECT не увидел запись — в обоих случаях чистим по токену.
         logger.info(
             "create_proposal: запись не вставлена/не найдена (chat=%s, "
             "возможно, уже есть активный брак)", chat_id,
@@ -741,8 +707,6 @@ async def get_marriage(marriage_id: int) -> Optional[dict]:
 
 
 async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
-    # ORDER BY id DESC — детерминированный выбор последнего активного брака
-    # (на случай, если в БД когда-либо окажется несколько активных).
     rs = await _exec(
         """SELECT id, chat_id, user1_id, user2_id, created_at, married_at,
                   active, forced
@@ -765,11 +729,7 @@ async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
 
 async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
                              event: str, by_user_id: Optional[int] = None) -> bool:
-    """Пишет событие в историю. Возвращает True при успехе.
-
-    Вызывающий код должен проверять результат: если False, событие
-    не записано и статистика (например, count_divorces) будет неверной.
-    """
+    """Пишет событие в историю. Возвращает True при успехе."""
     rs = await _exec(
         """INSERT INTO marriage_history (chat_id, user1_id, user2_id, event, by_user_id)
            VALUES (?, ?, ?, ?, ?)""",
