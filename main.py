@@ -1,7 +1,10 @@
 """Точка входа: webhook-версия для Render Web Service (Free).
 
-P1: track_message использует один batch (см. top.py + db.inc_message_and_day).
-P3: delete_webhook в shutdown убран — не создаём окно недоставки.
+- set_webhook вызывается только внутри run_webhook (в post_init убран),
+  чтобы не было Flood control exceeded.
+- track_message использует два отдельных _exec вместо batch
+  (libsql-client 0.3.1 через HTTP отдаёт 400 на batch).
+- delete_webhook в shutdown убран — не создаём окно недоставки.
 """
 import os
 import logging
@@ -97,12 +100,9 @@ async def post_init(app: Application) -> None:
     await sss.restore_sss_members()
     await resolver.start_client()
 
-    full_url = f"{WEBHOOK_URL}/{WEBHOOK_PATH}"
-    await app.bot.set_webhook(
-        url=full_url, drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
-    logger.info("Webhook set to %s", full_url)
+    # set_webhook здесь НЕ вызываем: run_webhook сам выставит webhook
+    # с нужным url_path и drop_pending_updates. Двойной вызов даёт
+    # "Flood control exceeded".
 
     if app.job_queue:
         app.job_queue.run_daily(
@@ -116,7 +116,6 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
-    # P3: delete_webhook убран — не создаём окно недоставки апдейтов.
     await resolver.stop_client()
     await db.close_db()
     logger.info("Bot stopped")
