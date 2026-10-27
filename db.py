@@ -167,6 +167,31 @@ async def _create_tables() -> None:
             by_user_id  INTEGER
         )
     """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            issued_by   INTEGER NOT NULL,
+            reason      TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT NOT NULL,
+            active      INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS complaints (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            target_id     INTEGER NOT NULL,
+            reporter_id   INTEGER NOT NULL,
+            message_id    INTEGER,
+            created_at    TEXT DEFAULT (datetime('now')),
+            status        TEXT NOT NULL DEFAULT 'pending',
+            resolved_by   INTEGER,
+            resolved_at   TEXT
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -208,6 +233,12 @@ async def _migrate_tables() -> None:
         "ON marriages(client_token) WHERE client_token IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_marriage_history_chat_users "
         "ON marriage_history(chat_id, user1_id, user2_id)",
+        "CREATE INDEX IF NOT EXISTS idx_warnings_user_active "
+        "ON warnings(chat_id, user_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_warnings_expires "
+        "ON warnings(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_complaints_status "
+        "ON complaints(chat_id, status)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -297,9 +328,8 @@ async def list_sss_members() -> List[int]:
 async def add_balance(user_id: int, delta: int) -> bool:
     """Меняет баланс. Возвращает True при успехе.
 
-    Если строки нет — создаёт с корректным стартовым значением 10 + delta
-    (для delta < 0 — COALESCE(balance, 10) + delta, что соответствует
-    «стартовые 10»). При ошибке БД — False.
+    Если строки нет — создаёт с корректным стартовым значением 10 + delta.
+    При ошибке БД — False.
     """
     rs = await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
@@ -309,7 +339,6 @@ async def add_balance(user_id: int, delta: int) -> bool:
         logger.error("add_balance: ошибка UPDATE (user=%s delta=%s)", user_id, delta)
         return False
     if (getattr(rs, "rows_affected", 0) or 0) == 0:
-        # Строки нет — создаём со стартовым балансом 10 + delta.
         rs2 = await _exec(
             """INSERT INTO users (user_id, balance)
                VALUES (?, 10 + ?)""",
@@ -781,3 +810,121 @@ async def count_divorces(chat_id: int, user_id: int) -> int:
     if not rs.rows:
         return 0
     return rs.rows[0][0] or 0
+
+
+# ---------- warnings ----------
+
+async def add_warning(chat_id: int, user_id: int, issued_by: int,
+                      reason: Optional[str], expires_at: str) -> int:
+    """Создаёт предупреждение. Возвращает id записи или 0 при ошибке."""
+    rs = await _exec(
+        """INSERT INTO warnings (chat_id, user_id, issued_by, reason, expires_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user_id, issued_by, reason, expires_at],
+    )
+    if getattr(rs, "error", False):
+        logger.error("add_warning: ошибка INSERT (user=%s)", user_id)
+        return 0
+    # id берём по последней записи этого юзера/выдавшего — last_insert_rowid()
+    # на Turso HTTP ненадёжен.
+    rs2 = await _exec(
+        """SELECT id FROM warnings
+           WHERE chat_id = ? AND user_id = ? AND issued_by = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, issued_by],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def count_active_warnings(chat_id: int, user_id: int) -> int:
+    """Сколько активных (не истёкших) предупреждений у юзера в чате."""
+    rs = await _exec(
+        """SELECT COUNT(*) FROM warnings
+           WHERE chat_id = ? AND user_id = ? AND active = 1
+             AND expires_at > datetime('now')""",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def list_active_warnings(chat_id: int, user_id: int) -> List[dict]:
+    rs = await _exec(
+        """SELECT id, issued_by, reason, created_at, expires_at
+           FROM warnings
+           WHERE chat_id = ? AND user_id = ? AND active = 1
+             AND expires_at > datetime('now')
+           ORDER BY id""",
+        [chat_id, user_id],
+    )
+    return [
+        {"id": r[0], "issued_by": r[1], "reason": r[2],
+         "created_at": r[3], "expires_at": r[4]}
+        for r in rs.rows
+    ]
+
+
+async def deactivate_warnings(chat_id: int, user_id: int) -> int:
+    """Деактивирует все активные предупреждения юзера в чате (после бана)."""
+    rs = await _exec(
+        """UPDATE warnings SET active = 0
+           WHERE chat_id = ? AND user_id = ? AND active = 1""",
+        [chat_id, user_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+# ---------- complaints ----------
+
+async def add_complaint(chat_id: int, target_id: int, reporter_id: int,
+                        message_id: Optional[int]) -> int:
+    """Создаёт жалобу. Возвращает id или 0 при ошибке."""
+    rs = await _exec(
+        """INSERT INTO complaints (chat_id, target_id, reporter_id, message_id)
+           VALUES (?, ?, ?, ?)""",
+        [chat_id, target_id, reporter_id, message_id],
+    )
+    if getattr(rs, "error", False):
+        logger.error("add_complaint: ошибка INSERT (target=%s)", target_id)
+        return 0
+    rs2 = await _exec(
+        """SELECT id FROM complaints
+           WHERE chat_id = ? AND target_id = ? AND reporter_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, target_id, reporter_id],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def get_complaint(complaint_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, chat_id, target_id, reporter_id, message_id,
+                  created_at, status
+           FROM complaints WHERE id = ?""",
+        [complaint_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "target_id": r[2],
+        "reporter_id": r[3], "message_id": r[4],
+        "created_at": r[5], "status": r[6],
+    }
+
+
+async def resolve_complaint(complaint_id: int, status: str,
+                            resolved_by: int) -> int:
+    """status: 'banned' | 'warned' | 'rejected'. Возвращает rows_affected."""
+    rs = await _exec(
+        """UPDATE complaints
+           SET status = ?, resolved_by = ?, resolved_at = datetime('now')
+           WHERE id = ? AND status = 'pending'""",
+        [status, resolved_by, complaint_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
