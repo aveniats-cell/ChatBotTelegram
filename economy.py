@@ -6,6 +6,8 @@ P0: +Кредит — один атомарный UPDATE с проверкой �
     выдачу при параллельных вызовах.
 P0: -Кредит — один атомарный UPDATE (repay_credit_atomic) с проверкой
     credit >= amount, чтобы долг не ушёл в минус.
+P1: -Кредит при нехватке монет гасит максимум возможного
+    (min(amount, credit, balance)), а не отказывает целиком.
 P2: CREDIT_DAILY_LIMIT проверяется через users.credit_taken_day внутри
     атомарного UPDATE, а не отдельным чтением.
 +Монеты: add_balance возвращает bool; при ошибке БД показываем ошибку,
@@ -139,7 +141,11 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Кредит N — погасить часть долга (списывает с баланса)."""
+    """-Кредит N — погасить часть долга (списывает с баланса).
+
+    Если запрошено больше, чем есть долга или монет — гасим максимум
+    возможного (min(amount, credit, balance)), а не отказываем целиком.
+    """
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -165,17 +171,17 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if credit <= 0:
         await msg.reply_text("✅ У вас нет долга.")
         return
-
-    # Сначала ограничиваем сумму долгом, потом проверяем баланс —
-    # иначе отказ при balance < amount, хотя amount > credit.
-    if amount > credit:
-        amount = credit
-    if balance < amount:
+    if balance <= 0:
         await msg.reply_text(
-            f"⛔ Недостаточно монет. Баланс: <b>{balance}</b>, "
-            f"погашение: <b>{amount}</b>.",
+            f"⛔ Недостаточно монет для погашения. Баланс: <b>{balance}</b>.",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    # Ограничиваем сумму долгом и балансом — гасим максимум возможного.
+    amount = min(amount, credit, balance)
+    if amount <= 0:
+        await msg.reply_text("⛔ Нечего погашать.")
         return
 
     ok = await db.repay_credit_atomic(user.id, amount)
@@ -188,9 +194,11 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     new_row = await db.get_user(user.id)
     new_credit = (new_row or {}).get("credit") or 0
+    new_balance = (new_row or {}).get("balance") or 0
     await msg.reply_text(
         f"✅ Погашено <b>{amount}</b>.\n"
-        f"Остаток долга: <b>{new_credit}</b>.",
+        f"Остаток долга: <b>{new_credit}</b>.\n"
+        f"Баланс: <b>{new_balance}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
