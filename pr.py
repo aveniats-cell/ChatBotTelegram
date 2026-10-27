@@ -1,4 +1,9 @@
-"""Логика PR-бота: проверка подписки, удаление сообщений, приглашение."""
+"""Логика PR-бота: проверка подписки, удаление сообщений, приглашение.
+
+P1: _looks_like_admin_command проверяет по списку известных команд
+(полное совпадение первого слова), а не по префиксу. «Профиль мой»
+больше не считается админ-командой.
+"""
 import os
 import logging
 from html import escape
@@ -22,22 +27,23 @@ CANAL_ID = int(os.getenv("CANAL_ID", "0") or "0")
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
 
-# Админские команды — их нельзя удалять и проверять на подписку.
-_ADMIN_PREFIXES = ("+", "-", "–", "−")
-_ADMIN_WORDS = (
+_ADMIN_WORDS = {
     "топ", "шип", "сделать", "профиль", "мой", "мое",
     "список", "поймать", "хо",
-)
+    "статы", "stats", "start", "ping", "check",
+}
 
 
 def _looks_like_admin_command(text: str) -> bool:
     if not text:
         return False
     stripped = text.lstrip()
-    if stripped.startswith(_ADMIN_PREFIXES):
+    if not stripped:
+        return False
+    if stripped[0] in "+-–−":
         return True
-    low = stripped.lower()
-    return any(low.startswith(w) for w in _ADMIN_WORDS)
+    first = stripped.split(maxsplit=1)[0].casefold().strip(".,!?:;")
+    return first in _ADMIN_WORDS
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
