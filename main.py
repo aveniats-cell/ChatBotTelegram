@@ -6,7 +6,8 @@
   (libsql-client 0.3.1 через HTTP отдаёт 400 на batch).
 - delete_webhook в shutdown убран — не создаём окно недоставки.
 - cleanup_job запускается с tzinfo=UTC (единообразно с economy).
-- Добавлены +Жалоба (всем) и +Предупреждение (шериф/комиссар/админ).
+- Добавлены +Жалоба / +жб / +жал (всем) и
+  +Предупреждение / +пред / +варн (шериф/комиссар/админ).
 - Модуль предупреждений называется warns (а не warnings), чтобы не
   перекрывать стандартный модуль Python и не ломать pip/virtualenv/poetry
   на этапе сборки.
@@ -99,8 +100,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Монеты 100 @user (админ)\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
-        "• +Жалоба @user (всем)\n"
-        "• +Предупреждение @user (шериф/комиссар/админ)"
+        "• +Жалоба / +жб @user (всем)\n"
+        "• +Предупреждение / +пред @user (шериф/комиссар/админ)"
     )
 
 
@@ -199,13 +200,17 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # Жалобы и предупреждения
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Жалоба(\s|$)"),
-                                   complaints.cmd_complaint))
+    # Жалобы и предупреждения (полная и короткая формы)
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
+        complaints.cmd_complaint,
+    ))
     app.add_handler(CallbackQueryHandler(complaints.complaint_callback,
                                          pattern=r"^compl:"))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Предупреждение(\s|$)"),
-                                   warns.cmd_warn))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+(Предупреждение|Пред|Варн)(\s|$)"),
+        warns.cmd_warn,
+    ))
 
     # Счётчик сообщений
     app.add_handler(
