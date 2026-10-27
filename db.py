@@ -17,8 +17,6 @@ _client: Optional[Any] = None
 
 
 class _EmptyResult:
-    """Заглушка результата. error=True — запрос упал (сеть/БД)."""
-
     def __init__(self, error: bool = False) -> None:
         self.rows: list = []
         self.rows_affected: int = 0
@@ -46,7 +44,6 @@ async def _exec(
     params: Optional[list] = None,
     retries: int = 2,
 ) -> _EmptyResult:
-    """Ретраи только для read-only. При ошибке — _EmptyResult(error=True)."""
     if _client is None:
         logger.error("db: _client не инициализирован (sql: %.80s)", sql)
         return _EmptyResult(error=True)
@@ -141,8 +138,6 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, day)
         )
     """)
-    # marriages: AUTOINCREMENT остаётся за SQLite, поиск вставленной записи
-    # идёт по client_token (last_insert_rowid() на Turso HTTP ненадёжен).
     await _exec("""
         CREATE TABLE IF NOT EXISTS marriages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +196,17 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS awards (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            title       TEXT NOT NULL,
+            stars       INTEGER NOT NULL,
+            issued_by   INTEGER NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -215,9 +221,6 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
-        # married_at уже есть в CREATE TABLE для новых БД, но для старых
-        # таблиц (созданных до этой схемы) колонки может не быть —
-        # ALTER TABLE ADD COLUMN идемпотентен и безопасен.
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
     ]
@@ -232,7 +235,6 @@ async def _migrate_tables() -> None:
             continue
         await _exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
-    # Индексы.
     idx_stmts = [
         "CREATE INDEX IF NOT EXISTS idx_marriages_chat_active "
         "ON marriages(chat_id, active)",
@@ -254,6 +256,8 @@ async def _migrate_tables() -> None:
         "ON complaints(chat_id, target_id)",
         "CREATE INDEX IF NOT EXISTS idx_aura_chat_value "
         "ON aura(chat_id, value DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_awards_user "
+        "ON awards(chat_id, user_id, id DESC)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -324,7 +328,6 @@ async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
 
 
 async def set_sss(user_id: int, is_member: bool) -> bool:
-    """Устанавливает флаг ССС. Возвращает True при успехе записи в БД."""
     rs = await _exec(
         "UPDATE users SET sss_member = ? WHERE user_id = ?",
         [1 if is_member else 0, user_id],
@@ -341,11 +344,6 @@ async def list_sss_members() -> List[int]:
 
 
 async def add_balance(user_id: int, delta: int) -> bool:
-    """Меняет баланс. Возвращает True при успехе.
-
-    Если строки нет — создаёт с корректным стартовым значением 10 + delta.
-    При ошибке БД — False.
-    """
     rs = await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
         [delta, user_id],
@@ -367,11 +365,6 @@ async def add_balance(user_id: int, delta: int) -> bool:
 
 
 async def take_balance_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно списывает amount, если balance >= amount. True при успехе.
-
-    Используется в эскроу игр (крестики-нолики), чтобы исключить уход
-    баланса в минус при параллельных списаниях.
-    """
     if amount <= 0:
         return False
     rs = await _exec(
@@ -401,10 +394,7 @@ async def set_credit_taken_day(user_id: int, day: str) -> None:
     )
 
 
-# ---------- атомарные экономические операции ----------
-
 async def take_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: +credit и +balance одним UPDATE. True при успехе."""
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) + ?,
@@ -418,12 +408,8 @@ async def take_credit_atomic(user_id: int, amount: int) -> bool:
 
 
 async def take_credit_daily_atomic(
-    user_id: int,
-    amount: int,
-    today: str,
-    balance_floor: int = 0,
+    user_id: int, amount: int, today: str, balance_floor: int = 0,
 ) -> bool:
-    """Атомарно выдаёт кредит с проверкой всех условий в одном UPDATE."""
     rs = await _exec(
         """UPDATE users
            SET credit           = COALESCE(credit, 0) + ?,
@@ -445,7 +431,6 @@ async def take_credit_daily_atomic(
 
 
 async def repay_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: -credit и -balance одним UPDATE. True при успехе."""
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) - ?,
@@ -569,12 +554,6 @@ async def inc_message(chat_id: int, user_id: int) -> None:
 
 
 async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
-    """Два отдельных запроса вместо batch.
-
-    libsql-client 0.3.1 через HTTP отдаёт 400 на формат batch,
-    который мы использовали. Последовательные _exec надёжнее.
-    Возвращает True, если оба запроса выполнились без ошибок БД.
-    """
     rs1 = await _exec(
         """INSERT INTO messages (chat_id, user_id, count)
            VALUES (?, ?, 1)
@@ -671,20 +650,7 @@ def _new_client_token() -> str:
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
-    """Вставляет предложение (active=0) и возвращает его id.
-
-    Принудительный брак (forced=True) тоже создаётся как предложение
-    (active=0, forced=1) и «заключается» вызовом accept_marriage —
-    это проходит ту же защиту от двойного брака, что и обычное принятие.
-
-    Не полагаемся на last_insert_rowid(): id назначает SQLite (AUTOINCREMENT),
-    а поиск детерминирован по client_token.
-
-    Возвращает 0 при ошибке БД или если у кого-то из участников уже есть
-    активный брак в этом чате.
-    """
     token = _new_client_token()
-
     rs = await _exec(
         """INSERT INTO marriages
              (chat_id, user1_id, user2_id, active, forced, client_token)
@@ -701,35 +667,24 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
         [chat_id, user1_id, user2_id, 1 if forced else 0, token,
          chat_id, user1_id, user2_id, user1_id, user2_id],
     )
-
     if getattr(rs, "error", False):
         logger.error("create_proposal: ошибка INSERT (chat=%s)", chat_id)
         return 0
-
     rs2 = await _exec(
-        "SELECT id FROM marriages WHERE client_token = ? LIMIT 1",
-        [token],
+        "SELECT id FROM marriages WHERE client_token = ? LIMIT 1", [token],
     )
     if getattr(rs2, "error", False):
         logger.error("create_proposal: ошибка SELECT по token (chat=%s)", chat_id)
         await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
         return 0
     if not rs2.rows:
-        logger.info(
-            "create_proposal: запись не вставлена/не найдена (chat=%s, "
-            "возможно, уже есть активный брак)", chat_id,
-        )
+        logger.info("create_proposal: не вставлено (chat=%s)", chat_id)
         await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
         return 0
     return rs2.rows[0][0]
 
 
 async def accept_marriage(marriage_id: int) -> int:
-    """Активирует предложение. Возвращает rows_affected (1 при успехе, 0 иначе).
-
-    Вызывающий код ОБЯЗАН проверить результат: 0 означает, что предложение
-    не существует/уже активно/у кого-то из участников уже есть активный брак.
-    """
     rs = await _exec(
         """UPDATE marriages SET active = 1, married_at = datetime('now')
            WHERE id = ?
@@ -784,8 +739,7 @@ async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
            FROM marriages
            WHERE chat_id = ? AND active = 1
              AND (user1_id = ? OR user2_id = ?)
-           ORDER BY id DESC
-           LIMIT 1""",
+           ORDER BY id DESC LIMIT 1""",
         [chat_id, user_id, user_id],
     )
     if not rs.rows:
@@ -800,7 +754,6 @@ async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
 
 async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
                              event: str, by_user_id: Optional[int] = None) -> bool:
-    """Пишет событие в историю. Возвращает True при успехе."""
     rs = await _exec(
         """INSERT INTO marriage_history (chat_id, user1_id, user2_id, event, by_user_id)
            VALUES (?, ?, ?, ?, ?)""",
@@ -831,7 +784,6 @@ async def count_divorces(chat_id: int, user_id: int) -> int:
 
 async def add_warning(chat_id: int, user_id: int, issued_by: int,
                       reason: Optional[str], expires_at: str) -> int:
-    """Создаёт предупреждение. Возвращает id записи или 0 при ошибке."""
     rs = await _exec(
         """INSERT INTO warnings (chat_id, user_id, issued_by, reason, expires_at)
            VALUES (?, ?, ?, ?, ?)""",
@@ -852,7 +804,6 @@ async def add_warning(chat_id: int, user_id: int, issued_by: int,
 
 
 async def count_active_warnings(chat_id: int, user_id: int) -> int:
-    """Сколько активных (не истёкших) предупреждений у юзера в чате."""
     rs = await _exec(
         """SELECT COUNT(*) FROM warnings
            WHERE chat_id = ? AND user_id = ? AND active = 1
@@ -864,34 +815,7 @@ async def count_active_warnings(chat_id: int, user_id: int) -> int:
     return rs.rows[0][0] or 0
 
 
-async def list_active_warnings(chat_id: int, user_id: int) -> List[dict]:
-    rs = await _exec(
-        """SELECT id, issued_by, reason, created_at, expires_at
-           FROM warnings
-           WHERE chat_id = ? AND user_id = ? AND active = 1
-             AND expires_at > datetime('now')
-           ORDER BY id""",
-        [chat_id, user_id],
-    )
-    return [
-        {"id": r[0], "issued_by": r[1], "reason": r[2],
-         "created_at": r[3], "expires_at": r[4]}
-        for r in rs.rows
-    ]
-
-
-async def deactivate_warnings(chat_id: int, user_id: int) -> int:
-    """Деактивирует все активные предупреждения юзера в чате (после бана)."""
-    rs = await _exec(
-        """UPDATE warnings SET active = 0
-           WHERE chat_id = ? AND user_id = ? AND active = 1""",
-        [chat_id, user_id],
-    )
-    return getattr(rs, "rows_affected", 0) or 0
-
-
 async def count_warnings_total(chat_id: int, user_id: int) -> int:
-    """Сколько всего предупреждений было выдано юзеру (включая истёкшие)."""
     rs = await _exec(
         "SELECT COUNT(*) FROM warnings WHERE chat_id = ? AND user_id = ?",
         [chat_id, user_id],
@@ -901,11 +825,37 @@ async def count_warnings_total(chat_id: int, user_id: int) -> int:
     return rs.rows[0][0] or 0
 
 
+async def remove_last_active_warning(chat_id: int, user_id: int) -> int:
+    """Снимает (деактивирует) последнее активное предупреждение. Возвращает rows_affected."""
+    rs = await _exec(
+        """UPDATE warnings SET active = 0
+           WHERE id = (
+               SELECT id FROM warnings
+               WHERE chat_id = ? AND user_id = ? AND active = 1
+                 AND expires_at > datetime('now')
+               ORDER BY id DESC LIMIT 1
+           )""",
+        [chat_id, user_id],
+    )
+    if getattr(rs, "error", False):
+        logger.error("remove_last_active_warning: ошибка БД (user=%s)", user_id)
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def deactivate_warnings(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """UPDATE warnings SET active = 0
+           WHERE chat_id = ? AND user_id = ? AND active = 1""",
+        [chat_id, user_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
 # ---------- complaints ----------
 
 async def add_complaint(chat_id: int, target_id: int, reporter_id: int,
                         message_id: Optional[int]) -> int:
-    """Создаёт жалобу. Возвращает id или 0 при ошибке."""
     rs = await _exec(
         """INSERT INTO complaints (chat_id, target_id, reporter_id, message_id)
            VALUES (?, ?, ?, ?)""",
@@ -944,7 +894,6 @@ async def get_complaint(complaint_id: int) -> Optional[dict]:
 
 async def resolve_complaint(complaint_id: int, status: str,
                             resolved_by: int) -> int:
-    """status: 'banned' | 'warned' | 'rejected'. Возвращает rows_affected."""
     rs = await _exec(
         """UPDATE complaints
            SET status = ?, resolved_by = ?, resolved_at = datetime('now')
@@ -955,7 +904,6 @@ async def resolve_complaint(complaint_id: int, status: str,
 
 
 async def count_complaints_by(chat_id: int, reporter_id: int) -> int:
-    """Сколько жалоб подал пользователь в этом чате (все статусы)."""
     rs = await _exec(
         "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND reporter_id = ?",
         [chat_id, reporter_id],
@@ -966,7 +914,6 @@ async def count_complaints_by(chat_id: int, reporter_id: int) -> int:
 
 
 async def count_complaints_against(chat_id: int, target_id: int) -> int:
-    """Сколько жалоб подано НА пользователя в этом чате (все статусы)."""
     rs = await _exec(
         "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND target_id = ?",
         [chat_id, target_id],
@@ -979,11 +926,6 @@ async def count_complaints_against(chat_id: int, target_id: int) -> int:
 # ---------- aura ----------
 
 async def aura_droch(chat_id: int, user_id: int) -> bool:
-    """Раз в час +1 аура. Атомарно: условие проверяется в UPDATE.
-
-    True — начислено, False — ещё рано (или ошибка БД).
-    Строка создаётся при первом вызове.
-    """
     await _exec(
         """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
            VALUES (?, ?, 0, NULL)
@@ -1006,7 +948,6 @@ async def aura_droch(chat_id: int, user_id: int) -> bool:
 
 
 async def aura_get(chat_id: int, user_id: int) -> Optional[dict]:
-    """Возвращает {'value': int, 'last_droch_at': str|None} или None."""
     rs = await _exec(
         """SELECT value, last_droch_at FROM aura
            WHERE chat_id = ? AND user_id = ?""",
@@ -1019,7 +960,6 @@ async def aura_get(chat_id: int, user_id: int) -> Optional[dict]:
 
 
 async def aura_top(chat_id: int, limit: int = 10) -> List[tuple]:
-    """[(user_id, value), ...] по убыванию ауры."""
     rs = await _exec(
         """SELECT user_id, value FROM aura
            WHERE chat_id = ? AND value > 0
@@ -1031,7 +971,6 @@ async def aura_top(chat_id: int, limit: int = 10) -> List[tuple]:
 
 
 async def aura_rank(chat_id: int, user_id: int) -> Optional[tuple]:
-    """(value, rank, total) или None, если у юзера нет ауры."""
     rs = await _exec(
         "SELECT value FROM aura WHERE chat_id = ? AND user_id = ?",
         [chat_id, user_id],
@@ -1043,15 +982,89 @@ async def aura_rank(chat_id: int, user_id: int) -> Optional[tuple]:
         return None
 
     rs2 = await _exec(
-        """SELECT COUNT(*) FROM aura
-           WHERE chat_id = ? AND value > ?""",
+        """SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > ?""",
         [chat_id, value],
     )
     rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
 
     rs3 = await _exec(
-        "SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > 0",
-        [chat_id],
+        "SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > 0", [chat_id],
     )
     total = (rs3.rows[0][0] if rs3.rows else 0) or 0
     return value, rank, total
+
+
+# ---------- awards ----------
+
+async def add_award(chat_id: int, user_id: int, title: str, stars: int,
+                    issued_by: int) -> int:
+    rs = await _exec(
+        """INSERT INTO awards (chat_id, user_id, title, stars, issued_by)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user_id, title, stars, issued_by],
+    )
+    if getattr(rs, "error", False):
+        logger.error("add_award: ошибка INSERT (user=%s)", user_id)
+        return 0
+    rs2 = await _exec(
+        """SELECT id FROM awards
+           WHERE chat_id = ? AND user_id = ? AND title = ? AND issued_by = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, title, issued_by],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def remove_award_by_title(chat_id: int, user_id: int, title: str) -> int:
+    """Удаляет одну самую свежую награду с таким названием. Возвращает rows_affected."""
+    rs = await _exec(
+        """DELETE FROM awards
+           WHERE id = (
+               SELECT id FROM awards
+               WHERE chat_id = ? AND user_id = ? AND title = ?
+               ORDER BY id DESC LIMIT 1
+           )""",
+        [chat_id, user_id, title],
+    )
+    if getattr(rs, "error", False):
+        logger.error("remove_award_by_title: ошибка БД (user=%s)", user_id)
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def list_awards(chat_id: int, user_id: int) -> List[dict]:
+    rs = await _exec(
+        """SELECT id, title, stars, issued_by, created_at
+           FROM awards
+           WHERE chat_id = ? AND user_id = ?
+           ORDER BY id DESC""",
+        [chat_id, user_id],
+    )
+    return [
+        {"id": r[0], "title": r[1], "stars": r[2],
+         "issued_by": r[3], "created_at": r[4]}
+        for r in rs.rows
+    ]
+
+
+async def award_total_stars(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(SUM(stars), 0) FROM awards "
+        "WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def count_awards(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM awards WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
