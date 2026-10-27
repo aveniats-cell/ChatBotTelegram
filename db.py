@@ -17,13 +17,7 @@ _client: Optional[Any] = None
 
 
 class _EmptyResult:
-    """Заглушка результата. error=True — запрос упал (сеть/БД).
-
-    Вызывающий код может отличить «нет строк» (error=False, rows=[]) от
-    «запрос не выполнился» (error=True). Для критичных операций (свадьбы,
-    экономика) это важно: нельзя писать «не найдено», если на самом деле
-    Turso моргнул.
-    """
+    """Заглушка результата. error=True — запрос упал (сеть/БД)."""
 
     def __init__(self, error: bool = False) -> None:
         self.rows: list = []
@@ -43,7 +37,6 @@ def _url_with_token(url: str, token: str) -> str:
 
 
 def _is_read_only(sql: str) -> bool:
-    """True, если запрос можно безопасно повторять (SELECT/PRAGMA)."""
     s = sql.lstrip().upper()
     return s.startswith("SELECT") or s.startswith("PRAGMA")
 
@@ -53,12 +46,7 @@ async def _exec(
     params: Optional[list] = None,
     retries: int = 2,
 ) -> _EmptyResult:
-    """Обёртка над _client.execute с ретраями.
-
-    - Ретраи только для read-only (SELECT/PRAGMA), чтобы не дублировать
-      INSERT/UPDATE/DELETE.
-    - При ошибке возвращает _EmptyResult(error=True), а не «пусто».
-    """
+    """Ретраи только для read-only. При ошибке — _EmptyResult(error=True)."""
     if _client is None:
         logger.error("db: _client не инициализирован (sql: %.80s)", sql)
         return _EmptyResult(error=True)
@@ -81,14 +69,35 @@ async def _exec(
                 await asyncio.sleep(0.2 * (attempt + 1))
             continue
         except Exception as e:
-            # Прочие ошибки (SQL, IntegrityError и т.п.) — не ретраим,
-            # но логируем как exception, чтобы не терять стек.
             logger.exception("db exec error (sql: %.80s): %s", sql, e)
             return _EmptyResult(error=True)
 
     if last_exc is not None:
         logger.error("db exec failed (sql: %.80s): %s", sql, last_exc)
     return _EmptyResult(error=True)
+
+
+async def _exec_batch(statements: list) -> bool:
+    """Выполняет несколько стейтментов одним вызовом (libsql-client batch)."""
+    if _client is None:
+        logger.error("db: _client не инициализирован (batch)")
+        return False
+    try:
+        batch = getattr(_client, "batch", None)
+        if batch is not None:
+            await batch(statements)
+            return True
+    except Exception as e:
+        logger.exception("db batch error: %s", e)
+        return False
+    ok = True
+    for st in statements:
+        sql = st.get("sql") if isinstance(st, dict) else st[0]
+        params = st.get("args") if isinstance(st, dict) else st[1]
+        rs = await _exec(sql, params, retries=0)
+        if getattr(rs, "error", False):
+            ok = False
+    return ok
 
 
 async def init_db() -> None:
@@ -155,8 +164,6 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, day)
         )
     """)
-    # marriages: id без AUTOINCREMENT — генерируем в Python (uuid),
-    # чтобы не зависеть от last_insert_rowid() на Turso HTTP.
     await _exec("""
         CREATE TABLE IF NOT EXISTS marriages (
             id           INTEGER PRIMARY KEY,
@@ -193,7 +200,7 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_wins", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
-        # миграция marriages: добавляем married_at, если таблица старая
+        ("users", "credit_taken_day", "TEXT"),
         ("marriages", "married_at", "TEXT"),
     ]
 
@@ -233,7 +240,8 @@ async def get_user(user_id: int) -> Optional[dict]:
         """SELECT user_id, username, first_name, created_at,
                   balance, credit, sss_member,
                   mutes_issued, reports_made, courts_held,
-                  tictactoe_wins, tictactoe_losses, tictactoe_draws
+                  tictactoe_wins, tictactoe_losses, tictactoe_draws,
+                  credit_taken_day
            FROM users WHERE user_id = ?""",
         [user_id],
     )
@@ -243,7 +251,8 @@ async def get_user(user_id: int) -> Optional[dict]:
     keys = ["user_id", "username", "first_name", "created_at",
             "balance", "credit", "sss_member",
             "mutes_issued", "reports_made", "courts_held",
-            "tictactoe_wins", "tictactoe_losses", "tictactoe_draws"]
+            "tictactoe_wins", "tictactoe_losses", "tictactoe_draws",
+            "credit_taken_day"]
     return dict(zip(keys, r))
 
 
@@ -292,6 +301,43 @@ async def add_credit(user_id: int, delta: int) -> None:
         "UPDATE users SET credit = COALESCE(credit, 0) + ? WHERE user_id = ?",
         [delta, user_id],
     )
+
+
+async def set_credit_taken_day(user_id: int, day: str) -> None:
+    await _exec(
+        "UPDATE users SET credit_taken_day = ? WHERE user_id = ?",
+        [day, user_id],
+    )
+
+
+# ---------- атомарные экономические операции ----------
+
+async def take_credit_atomic(user_id: int, amount: int) -> bool:
+    """Атомарно: +credit и +balance одним UPDATE. True при успехе."""
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) + ?,
+               balance = COALESCE(balance, 10) + ?
+           WHERE user_id = ?""",
+        [amount, amount, user_id],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def repay_credit_atomic(user_id: int, amount: int) -> bool:
+    """Атомарно: -credit и -balance одним UPDATE. True при успехе."""
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) - ?,
+               balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ? AND COALESCE(balance, 0) >= ?""",
+        [amount, amount, user_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def apply_credit_interest(percent: float) -> int:
@@ -402,6 +448,27 @@ async def inc_message(chat_id: int, user_id: int) -> None:
     )
 
 
+async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
+    """Один batch: инкремент messages и messages_day. True при успехе."""
+    stmts = [
+        {
+            "sql": """INSERT INTO messages (chat_id, user_id, count)
+                      VALUES (?, ?, 1)
+                      ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                        count = count + 1""",
+            "args": [chat_id, user_id],
+        },
+        {
+            "sql": """INSERT INTO messages_day (chat_id, user_id, day, count)
+                      VALUES (?, ?, ?, 1)
+                      ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+                        count = count + 1""",
+            "args": [chat_id, user_id, day],
+        },
+    ]
+    return await _exec_batch(stmts)
+
+
 async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
     rs = await _exec(
         """SELECT user_id, count FROM messages
@@ -466,32 +533,18 @@ async def cleanup_old_days(keep_days: int = 0) -> int:
 
 
 # ---------- marriages ----------
-#
-# Ключевые изменения:
-# 1. id генерируется в Python (uuid), а не через last_insert_rowid() —
-#    на Turso HTTP last_insert_rowid() не привязан к «этому» INSERT.
-# 2. accept_marriage атомарно проверяет, что proposal ещё active=0 и что
-#    ни у одного из участников нет другого активного брака.
-# 3. delete_marriage возвращает rows_affected — чтобы отличать «удалил»
-#    от «уже удалён».
-# 4. married_at фиксируется в момент accept; _marriage_level считает от него.
 
 def _new_marriage_id() -> int:
-    """62-битный положительный int — влезает в SQLite INTEGER (64-bit)."""
     return uuid.uuid4().int & ((1 << 62) - 1)
 
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
-    """Создаёт запись брака. Обычный proposal: active=0. Принудительный: active=1.
-
-    Возвращает id созданной записи или 0 при ошибке БД.
-    """
+    """id генерируется в Python. Обычный proposal: active=0."""
     new_id = _new_marriage_id()
     active = 1 if forced else 0
     forced_flag = 1 if forced else 0
 
-    # Для принудительного брака сразу ставим married_at.
     if forced:
         rs = await _exec(
             """INSERT INTO marriages
@@ -514,11 +567,6 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
 
 
 async def accept_marriage(marriage_id: int) -> int:
-    """Активирует proposal. Возвращает rows_affected (1 — успех, 0 — нельзя).
-
-    Условия: запись active=0 и ни у одного из участников нет другого
-    активного брака в этом чате.
-    """
     rs = await _exec(
         """UPDATE marriages SET active = 1, married_at = datetime('now')
            WHERE id = ?
@@ -539,7 +587,6 @@ async def accept_marriage(marriage_id: int) -> int:
 
 
 async def delete_marriage(marriage_id: int) -> int:
-    """Удаляет запись. Возвращает rows_affected (0 — уже удалена)."""
     rs = await _exec("DELETE FROM marriages WHERE id = ?", [marriage_id])
     return getattr(rs, "rows_affected", 0) or 0
 
@@ -552,8 +599,6 @@ async def get_marriage(marriage_id: int) -> Optional[dict]:
         [marriage_id],
     )
     if getattr(rs, "error", False):
-        # Не маскируем ошибку БД под «не найдено» — пусть вызывающий
-        # решит, что показать. Возвращаем None, но логируем.
         logger.error("get_marriage(%s): ошибка БД", marriage_id)
         return None
     if not rs.rows:
