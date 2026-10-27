@@ -1,10 +1,15 @@
 """Экономика: кредит (+Кредит / -Кредит), выдача монет админом (+Монеты),
 ежедневное начисление процентов на остаток долга.
 
-P0: +Кредит / -Кредит — один атомарный UPDATE (db.take_credit_atomic /
-db.repay_credit_atomic), проверка rows_affected.
-P2: CREDIT_DAILY_LIMIT проверяет «сегодня» через users.credit_taken_day.
-_resolve_target вынесен в utils.resolve_target.
+P0: +Кредит — один атомарный UPDATE с проверкой лимита/долга/баланса
+    внутри самого запроса (take_credit_daily_atomic). Исключает двойную
+    выдачу при параллельных вызовах.
+P0: -Кредит — один атомарный UPDATE (repay_credit_atomic) с проверкой
+    credit >= amount, чтобы долг не ушёл в минус.
+P2: CREDIT_DAILY_LIMIT проверяется через users.credit_taken_day внутри
+    атомарного UPDATE, а не отдельным чтением.
++Монеты: add_balance возвращает bool; при ошибке БД показываем ошибку,
+а не «успех». После изменения баланс перечитывается из БД.
 """
 import os
 import re
@@ -30,13 +35,21 @@ AMOUNT_RE = re.compile(r"\b(\d+)\b")
 CREDIT_DAILY_LIMIT = 100
 CREDIT_PERCENT_PER_DAY = 10
 
+# Таймзона учёта «сегодня» и запуска ежедневного job — одна и та же (UTC).
+TZ = timezone.utc
+
 
 def _today_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
 async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Кредит N — взять кредит (1..100). Нельзя, если уже в минусе/есть долг."""
+    """+Кредит N — взять кредит (1..100). Нельзя, если уже в минусе/есть долг/брали сегодня.
+
+    Все проверки (баланс >= 0, credit = 0, credit_taken_day != сегодня)
+    выполняются ВНУТРИ одного атомарного UPDATE в db.take_credit_daily_atomic.
+    Если rows_affected == 0 — кредит не выдан (условия не выполнены).
+    """
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -55,6 +68,7 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"⛔ Сумма кредита: от 1 до {CREDIT_DAILY_LIMIT}.")
         return
 
+    # Гарантируем, что строка пользователя существует (нужна для UPDATE).
     row = await db.get_user(user.id)
     if not row:
         await db.upsert_user(user.id, user.username, user.first_name)
@@ -63,6 +77,8 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text("⚠️ Не удалось получить профиль.")
         return
 
+    # Предварительная диагностика — чтобы дать пользователю понятный ответ,
+    # почему кредит не выдан. Финальное решение — за атомарным UPDATE ниже.
     balance = row.get("balance") or 0
     credit = row.get("credit") or 0
     taken_day = row.get("credit_taken_day")
@@ -87,11 +103,29 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    ok = await db.take_credit_atomic(user.id, amount)
+    ok = await db.take_credit_daily_atomic(
+        user.id, amount, _today_utc(), balance_floor=0,
+    )
     if not ok:
-        await msg.reply_text("⚠️ Не удалось выдать кредит (ошибка БД). Попробуйте позже.")
+        # Между проверкой и UPDATE состояние могло измениться (параллельный
+        # вызов). Не показываем «успех» — перечитываем и объясняем.
+        fresh = await db.get_user(user.id)
+        f_balance = (fresh or {}).get("balance") or 0
+        f_credit = (fresh or {}).get("credit") or 0
+        f_day = (fresh or {}).get("credit_taken_day")
+        if f_credit > 0:
+            reason = f"У вас уже есть долг <b>{f_credit}</b>."
+        elif f_day == _today_utc():
+            reason = "Вы уже брали кредит сегодня."
+        elif f_balance < 0:
+            reason = "У вас отрицательный баланс."
+        else:
+            reason = "Не удалось выдать кредит (ошибка БД). Попробуйте позже."
+        await msg.reply_text(
+            f"⛔ Кредит не выдан. {reason}",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    await db.set_credit_taken_day(user.id, _today_utc())
 
     new_row = await db.get_user(user.id)
     new_credit = (new_row or {}).get("credit") or (credit + amount)
@@ -131,6 +165,11 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if credit <= 0:
         await msg.reply_text("✅ У вас нет долга.")
         return
+
+    # Сначала ограничиваем сумму долгом, потом проверяем баланс —
+    # иначе отказ при balance < amount, хотя amount > credit.
+    if amount > credit:
+        amount = credit
     if balance < amount:
         await msg.reply_text(
             f"⛔ Недостаточно монет. Баланс: <b>{balance}</b>, "
@@ -138,8 +177,6 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.HTML,
         )
         return
-    if amount > credit:
-        amount = credit
 
     ok = await db.repay_credit_atomic(user.id, amount)
     if not ok:
@@ -159,7 +196,12 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Монеты N @user — админ начисляет/списывает монеты (без лимита)."""
+    """+Монеты N @user — админ начисляет/списывает монеты (без лимита).
+
+    add_balance возвращает bool; при ошибке БД не показываем «успех».
+    Баланс после изменения перечитывается из БД — показываем реальное
+    значение, а не вычисленное.
+    """
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -178,6 +220,9 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     amount = int(m.group(1))
+    if amount == 0:
+        await msg.reply_text("⛔ Сумма не может быть нулевой.")
+        return
 
     clean = re.sub(r"\+Монеты\s+-?\d+", "", text, flags=re.IGNORECASE)
     target = await utils.resolve_target(update, context, clean)
@@ -186,18 +231,24 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     uid, name = target
 
-    row = await db.get_user(uid)
-    if not row:
-        await db.upsert_user(uid, None, name)
-        row = await db.get_user(uid)
+    ok = await db.add_balance(uid, amount)
+    if not ok:
+        await msg.reply_text(
+            "⚠️ Не удалось изменить баланс (ошибка БД). Попробуйте ещё раз."
+        )
+        return
 
-    await db.add_balance(uid, amount)
     new_row = await db.get_user(uid)
-    new_balance = (new_row or {}).get("balance", 0)
+    if not new_row:
+        await msg.reply_text(
+            "⚠️ Баланс изменён, но профиль не читается. Проверьте «Профиль»."
+        )
+        return
+    new_balance = new_row.get("balance") or 0
 
     sign = "+" if amount >= 0 else ""
     await msg.reply_text(
-        f"💰 {escape(name)}: <b>{sign}{amount}</b>\n"
+        f"💰 {escape(str(name))}: <b>{sign}{amount}</b>\n"
         f"Баланс: <b>{new_balance}</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -216,6 +267,7 @@ def register_jobs(app) -> None:
         logger.warning("economy: job_queue нет, проценты по кредиту не будут начисляться")
         return
     app.job_queue.run_daily(
-        daily_interest_job, time=dtime(hour=0, minute=10, tzinfo=None),
+        daily_interest_job,
+        time=dtime(hour=0, minute=10, tzinfo=TZ),
     )
-    logger.info("economy: ежедневное начисление %% на кредит запланировано")
+    logger.info("economy: ежедневное начисление %% на кредит запланировано (UTC)")
