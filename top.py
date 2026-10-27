@@ -1,7 +1,8 @@
 """2.3 Топ чата: счётчик сообщений, Топ день / Топ все, Моё место.
 
-P1: track_message использует один batch (db.inc_message_and_day) вместо
-трёх HTTP-запросов на каждое сообщение.
+P1: track_message не делает upsert_user на каждое сообщение — кэширует
+(username, first_name) в памяти и пишет в БД только при изменении.
+Экономит 1 HTTP-запрос к Turso на каждое сообщение в активном чате.
 """
 import logging
 from html import escape
@@ -16,6 +17,10 @@ import db
 
 logger = logging.getLogger(__name__)
 
+# user_id -> (username, first_name). Сбрасывается при рестарте — не страшно:
+# первый же апдейт после рестарта запишет актуальные данные.
+_USER_CACHE: dict[int, tuple[str, str]] = {}
+
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -26,7 +31,10 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not chat:
         return
     try:
-        await db.upsert_user(user.id, user.username, user.first_name)
+        cur = (user.username or "", user.first_name or "")
+        if _USER_CACHE.get(user.id) != cur:
+            await db.upsert_user(user.id, user.username, user.first_name)
+            _USER_CACHE[user.id] = cur
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         ok = await db.inc_message_and_day(chat.id, user.id, day)
         if not ok:
