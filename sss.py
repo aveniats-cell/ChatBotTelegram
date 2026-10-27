@@ -4,6 +4,10 @@ P1: +Суд ССС теперь с таймаутом (10 мин). Если не
 финализируем по текущим голосам: любой «no» = оставить, иначе бан.
 
 P2: _resolve_target вынесен в utils.resolve_target.
+
+P1: cmd_sss_add / cmd_sss_remove сначала пишут в БД, и только при успехе
+обновляют in-memory SSS_MEMBERS — чтобы после рестарта состав не
+расходился с БД.
 """
 import os
 import re
@@ -100,8 +104,13 @@ async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("⛔ Мест в ССС больше нет.")
         return
 
+    # Сначала пишем в БД, только при успехе — в память.
+    if not await db.set_sss(uid, True):
+        await msg.reply_text(
+            "⚠️ Не удалось сохранить в БД. Попробуйте ещё раз."
+        )
+        return
     SSS_MEMBERS.add(uid)
-    await db.set_sss(uid, True)
     await msg.reply_text(
         f"🏛 {escape(name)} добавлен(а) в ССС. "
         f"Всего: <b>{len(_sss_all())}/{MAX_SSS}</b>",
@@ -129,8 +138,14 @@ async def cmd_sss_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if uid not in SSS_MEMBERS:
         await msg.reply_text(f"{escape(name)} не в ССС.")
         return
+
+    # Сначала БД, потом память — чтобы не потерять состав при рестарте.
+    if not await db.set_sss(uid, False):
+        await msg.reply_text(
+            "⚠️ Не удалось сохранить в БД. Попробуйте ещё раз."
+        )
+        return
     SSS_MEMBERS.discard(uid)
-    await db.set_sss(uid, False)
     await msg.reply_text(f"🏛 {escape(name)} исключён(а) из ССС.")
 
 
