@@ -1,6 +1,10 @@
 """+Жалоба: любой участник жалуется на нарушителя — жалоба уходит в ЛС админу.
 
 Админ получает кнопки: Забанить / Выдать предупреждение / Отклонить.
+
+Импортируется модуль warns (а не warnings), чтобы не перекрывать
+стандартный модуль Python warnings — иначе падают pip/virtualenv/poetry
+на этапе сборки.
 """
 import os
 import re
@@ -19,7 +23,7 @@ from telegram.ext import ContextTypes
 
 import db
 import utils
-import warnings as warnings_mod  # локальный модуль warnings.py
+import warns as warns_mod
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +204,7 @@ async def complaint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if action == "warn":
         expires_at = (
-            datetime.now(timezone.utc) + timedelta(days=warnings_mod.WARN_TTL_DAYS)
+            datetime.now(timezone.utc) + timedelta(days=warns_mod.WARN_TTL_DAYS)
         ).strftime("%Y-%m-%d %H:%M:%S")
         wid = await db.add_warning(chat_id, target_id, user.id,
                                    "по жалобе", expires_at)
@@ -215,7 +219,7 @@ async def complaint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await q.edit_message_text(
                 (q.message.text or "")
                 + f"\n\n⚠️ <b>Админ: предупреждение ({cnt}/"
-                  f"{warnings_mod.WARN_LIMIT}).</b>",
+                  f"{warns_mod.WARN_LIMIT}).</b>",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -224,14 +228,14 @@ async def complaint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(f"⚠️ {escape(name)} получил(а) предупреждение "
-                      f"({cnt}/{warnings_mod.WARN_LIMIT})."),
+                      f"({cnt}/{warns_mod.WARN_LIMIT})."),
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             pass
         # Автобан, если лимит достигнут.
-        if cnt >= warnings_mod.WARN_LIMIT:
-            await warnings_mod._check_and_ban_if_needed(
+        if cnt >= warns_mod.WARN_LIMIT:
+            await warns_mod._check_and_ban_if_needed(
                 context, chat_id, target_id, name,
             )
         return
