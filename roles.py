@@ -1,8 +1,9 @@
 """Роли (Шериф/Комиссар), муты, баны, «Поймать».
 
-P2: _require_role проверяет `not ADMIN_ID` — при ADMIN_ID=0 никто не админ.
-P2: unmute_user даёт явный набор прав, а не all_permissions().
-P2: _resolve_target вынесен в utils.resolve_target.
+- +Мут понимает короткие формы времени: 5с, 5м, 5ч, 5ч 3с, 1ч 30м.
+- +Мут принимает причину: `+Мут 5ч Богохульство` или `+Мут @user 5ч Богохульство`.
+- В БД (punishments) причина не пишется — таблица не имеет поля reason
+  (совместимость со схемой). Причина только в сообщении.
 """
 import os
 import re
@@ -32,10 +33,6 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
-TIME_RE = re.compile(r"(\d+)\s*([чhmsс])", re.IGNORECASE)
-TIME_UNITS = {"ч": 3600, "h": 3600, "m": 60, "м": 60, "s": 1, "с": 1}
-
-# Права «обычного участника» — для unmute (не даём админские).
 _UNMUTE_PERMS = ChatPermissions(
     can_send_messages=True,
     can_send_audios=True,
@@ -54,35 +51,10 @@ _UNMUTE_PERMS = ChatPermissions(
 )
 
 
-def parse_duration(text: str) -> Optional[int]:
-    total = 0
-    found = False
-    for amount, unit in TIME_RE.findall(text):
-        total += int(amount) * TIME_UNITS[unit.lower()]
-        found = True
-    return total if found else None
-
-
-def format_duration(seconds: int) -> str:
-    if seconds <= 0:
-        return "0с"
-    parts = []
-    for label, size in (("ч", 3600), ("м", 60), ("с", 1)):
-        if seconds >= size:
-            parts.append(f"{seconds // size}{label}")
-            seconds %= size
-    return " ".join(parts)
-
-
-def _strip_duration(text: str) -> str:
-    return TIME_RE.sub("", text or "").strip()
-
-
 async def _require_role(update: Update, roles: tuple[str, ...]) -> bool:
     user = update.effective_user
     if not user:
         return False
-    # P2: при ADMIN_ID=0 никто не админ.
     if ADMIN_ID and user.id == ADMIN_ID:
         return True
     try:
@@ -257,21 +229,41 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_role(update, ("commissar",)):
         await _deny(update, "⛔ Только комиссар или админ.")
         return
+
     raw = (update.message.text or "")
-    rest = raw.split(maxsplit=1)
-    rest = rest[1] if len(rest) > 1 else ""
-    duration = parse_duration(rest)
-    if not duration:
-        await update.message.reply_text("Не понял время. Пример: +Мут @user 1ч 30м")
+    parts = raw.split(maxsplit=1)
+    rest = parts[1] if len(parts) > 1 else ""
+
+    # Сначала отделяем @username, чтобы парсер времени не съел лишнее.
+    uname_m = USERNAME_RE.search(rest)
+    reason_part = rest
+    if uname_m:
+        # Всё после @username — причина (там времени уже быть не должно).
+        reason_part = rest[uname_m.end():].strip()
+        time_part = rest[:uname_m.start()].strip()
+    else:
+        # Реплай: время и причина в самом хвосте команды.
+        time_part = rest
+
+    seconds, time_rest = utils.parse_duration(time_part)
+    # Если после времени остался текст — это причина.
+    reason = (time_rest or reason_part).strip() or None
+
+    if not seconds or seconds <= 0:
+        await update.message.reply_text(
+            "Не понял время. Пример: <code>+Мут 1ч 30м</code>, "
+            "<code>+Мут @user 5ч Богохульство</code>.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    clean = _strip_duration(rest)
-    target = await utils.resolve_target(update, context, clean)
+    target = await utils.resolve_target(update, context, rest)
     if not target:
         await update.message.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
-    until = int(time.time()) + duration
+
+    until = int(time.time()) + seconds
     perms = ChatPermissions(can_send_messages=False)
     try:
         await context.bot.restrict_chat_member(
@@ -281,13 +273,18 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError as e:
         await update.message.reply_text(f"⚠️ Не удалось замутить: {e}")
         return
-    await db.add_punishment(uid, update.effective_chat.id, "mute", until, update.effective_user.id)
+    await db.add_punishment(uid, update.effective_chat.id, "mute", until,
+                            update.effective_user.id)
     try:
         await db.inc_user_counter(update.effective_user.id, "mutes_issued", 1)
     except Exception:
         pass
+
+    reason_line = f"\nПричина: {escape(reason)}" if reason else ""
     await update.message.reply_text(
-        f"🔇 {escape(name)} замучен на {format_duration(duration)}."
+        f"🔇 {escape(name)} замучен на {utils.fmt_duration(seconds)}."
+        f"{reason_line}",
+        parse_mode=ParseMode.HTML,
     )
 
 
