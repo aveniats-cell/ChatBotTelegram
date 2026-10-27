@@ -1,7 +1,8 @@
-"""ИИ-модуль: запросы к бесплатной модели gemini через Pollinations.
+"""ИИ-модуль: запросы к gemini через Pollinations.
 
-Rate limit: 1 запрос в 5 секунд на пользователя (in-memory).
-Модель "gemini" входит в Free Universe — не списывает Pollen.
+Использует AI_TOKEN и BASE_URL из переменных окружения.
+BASE_URL должен указывать на https://gen.pollinations.ai (актуальный gateway).
+Легаси-хост text.pollinations.ai отключён и возвращает 404.
 """
 import os
 import time
@@ -12,14 +13,11 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Ключ опционален для бесплатной модели gemini.
-# Если задан — используем gen.pollinations.ai (тоже бесплатно для gemini).
+# Оба параметра обязательны — берутся из Values на Render.
 AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
-
-# Если BASE_URL не задан — код выберет endpoint сам.
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
-MODEL = "gemini"
+MODEL = "gemini-flash-lite-3.1"  # бесплатная модель без ключа, но с ключом тоже работает
 
 COOLDOWN_SEC = 5.0
 
@@ -27,26 +25,35 @@ _last_request: dict[int, float] = {}
 
 
 def _api_url() -> str:
-    """Собирает полный URL к /v1/chat/completions или /openai."""
-    base = BASE_URL
-    if not base:
-        # Без ключа — старый бесплатный endpoint text.pollinations.ai
-        # С ключом — gen.pollinations.ai (тоже бесплатно для gemini)
-        base = "https://gen.pollinations.ai" if AI_TOKEN else "https://text.pollinations.ai"
+    """Собирает URL к OpenAI-совместимому endpoint.
 
-    if base.endswith("/v1/chat/completions") or base.endswith("/openai"):
+    BASE_URL из Values должен быть https://gen.pollinations.ai
+    (или с /v1 на конце). Легаси text.pollinations.ai больше не используется.
+    """
+    if not BASE_URL:
+        logger.error("ai: BASE_URL не задан в переменных окружения")
+        return ""
+
+    base = BASE_URL
+    # Уже полный путь
+    if base.endswith("/v1/chat/completions"):
         return base
+    # Уже с /v1 — добавляем только хвост
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
-    # text.pollinations.ai принимает /openai, gen.pollinations.ai — /v1/chat/completions
-    if "text.pollinations.ai" in base:
-        return f"{base}/openai"
+    # Голый хост — добавляем /v1/chat/completions
     return f"{base}/v1/chat/completions"
 
 
 async def ask_ai(prompt: str) -> Optional[str]:
     """Отправляет запрос в gemini. Возвращает текст или None."""
+    if not AI_TOKEN:
+        logger.error("ai: AI_TOKEN не задан в переменных окружения")
+        return None
+
     url = _api_url()
+    if not url:
+        return None
 
     payload = {
         "model": MODEL,
@@ -62,9 +69,10 @@ async def ask_ai(prompt: str) -> Optional[str]:
         ],
     }
 
-    headers = {"Content-Type": "application/json"}
-    if AI_TOKEN:
-        headers["Authorization"] = f"Bearer {AI_TOKEN}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AI_TOKEN}",
+    }
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -74,8 +82,11 @@ async def ask_ai(prompt: str) -> Optional[str]:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                if resp.status == 401:
+                    logger.error("ai: 401 Unauthorized — проверь AI_TOKEN")
+                    return None
                 if resp.status == 402:
-                    logger.error("ai: 402 Payment Required (модель платная?)")
+                    logger.error("ai: 402 Payment Required — закончились Pollen credits")
                     return None
                 if resp.status != 200:
                     body = await resp.text()
