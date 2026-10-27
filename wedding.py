@@ -74,7 +74,11 @@ async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
 def _marriage_level(created_at_str: str) -> int:
     try:
-        created = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        s = (created_at_str or "").replace("Z", "+00:00")
+        # SQLite datetime('now') отдаёт "2025-01-01 12:00:00" — нужен T
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T", 1)
+        created = datetime.fromisoformat(s)
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         delta = datetime.now(timezone.utc) - created
@@ -115,6 +119,10 @@ async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     mid = await db.create_proposal(chat.id, user.id, target_id)
+    if not mid:
+        logger.warning("cmd_propose: create_proposal вернул 0")
+        await msg.reply_text("⚠️ Не удалось создать предложение. Попробуйте ещё раз.")
+        return
 
     text = (
         f"💐 <b>Минуточку внимания!</b>\n\n"
@@ -145,9 +153,14 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer()
         return
     _, action, mid_s = parts
-    mid = int(mid_s)
+    try:
+        mid = int(mid_s)
+    except ValueError:
+        await q.answer("Некорректный id.", show_alert=True)
+        return
     m = await db.get_marriage(mid)
     if not m:
+        logger.warning("wedding_callback: mid=%s not found", mid)
         await q.answer("Предложение не найдено.", show_alert=True)
         return
 
@@ -169,10 +182,13 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         except TelegramError as e:
             logger.warning("send reject msg: %s", e)
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n❌ <b>Отклонено.</b>",
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await q.edit_message_text(
+                (q.message.text or "") + "\n\n❌ <b>Отклонено.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError as e:
+            logger.warning("edit reject msg: %s", e)
         return
 
     await db.accept_marriage(mid)
@@ -194,10 +210,13 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except TelegramError as e:
         logger.warning("send accept msg: %s", e)
-    await q.edit_message_text(
-        (q.message.text or "") + "\n\n✅ <b>Зарегистрировано!</b>",
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        await q.edit_message_text(
+            (q.message.text or "") + "\n\n✅ <b>Зарегистрировано!</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("edit accept msg: %s", e)
 
 
 # ---------- расторжение ----------
@@ -262,7 +281,11 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 by_user_id=user.id,
             )
 
-    await db.create_proposal(chat.id, id1, id2, forced=True)
+    mid = await db.create_proposal(chat.id, id1, id2, forced=True)
+    if not mid:
+        logger.warning("cmd_force_marriage: create_proposal вернул 0")
+        await msg.reply_text("⚠️ Не удалось создать брак. Попробуйте ещё раз.")
+        return
     await db.log_marriage_event(chat.id, id1, id2, "forced_married", by_user_id=user.id)
 
     await msg.reply_text(
