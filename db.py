@@ -164,16 +164,19 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, day)
         )
     """)
+    # marriages: AUTOINCREMENT остаётся за SQLite, поиск вставленной записи
+    # идёт по client_token (last_insert_rowid() на Turso HTTP ненадёжен).
     await _exec("""
         CREATE TABLE IF NOT EXISTS marriages (
-            id           INTEGER PRIMARY KEY,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id      INTEGER NOT NULL,
             user1_id     INTEGER NOT NULL,
             user2_id     INTEGER NOT NULL,
             created_at   TEXT DEFAULT (datetime('now')),
             married_at   TEXT,
             active       INTEGER NOT NULL DEFAULT 0,
-            forced       INTEGER NOT NULL DEFAULT 0
+            forced       INTEGER NOT NULL DEFAULT 0,
+            client_token TEXT
         )
     """)
     await _exec("""
@@ -201,7 +204,8 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
-        ("marriages", "married_at", "TEXT"),
+        # married_at уже есть в CREATE TABLE, миграция не нужна
+        ("marriages", "client_token", "TEXT"),
     ]
 
     existing: dict = {}
@@ -213,6 +217,24 @@ async def _migrate_tables() -> None:
         if col in existing[table]:
             continue
         await _exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+    # Индексы и уникальность client_token.
+    # UNIQUE-индекс не создастся, если в таблице уже есть дубли токенов
+    # (теоретически невозможно при UUID4, но на всякий случай — логируем).
+    idx_stmts = [
+        "CREATE INDEX IF NOT EXISTS idx_marriages_chat_active "
+        "ON marriages(chat_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_marriages_client_token "
+        "ON marriages(client_token)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_marriages_client_token "
+        "ON marriages(client_token) WHERE client_token IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_marriage_history_chat_users "
+        "ON marriage_history(chat_id, user1_id, user2_id)",
+    ]
+    for sql in idx_stmts:
+        rs = await _exec(sql)
+        if getattr(rs, "error", False):
+            logger.warning("migrate: не удалось выполнить: %s", sql)
 
 
 async def close_db() -> None:
@@ -289,11 +311,33 @@ async def list_sss_members() -> List[int]:
     return [row[0] for row in rs.rows]
 
 
-async def add_balance(user_id: int, delta: int) -> None:
-    await _exec(
+async def add_balance(user_id: int, delta: int) -> bool:
+    """Меняет баланс. Возвращает True при успехе.
+
+    Если строки нет — создаёт через upsert (не полагаемся на то, что
+    пользователь уже в БД). При ошибке БД — False, чтобы вызывающий
+    код не показывал «успех» впустую.
+    """
+    rs = await _exec(
         "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
         [delta, user_id],
     )
+    if getattr(rs, "error", False):
+        logger.error("add_balance: ошибка UPDATE (user=%s delta=%s)", user_id, delta)
+        return False
+    if (getattr(rs, "rows_affected", 0) or 0) == 0:
+        rs2 = await _exec(
+            """INSERT INTO users (user_id, balance)
+               VALUES (?, COALESCE(?, 10) + ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 balance = COALESCE(balance, 10) + ?""",
+            [user_id, delta, delta, delta],
+        )
+        if getattr(rs2, "error", False):
+            logger.error("add_balance: ошибка UPSERT (user=%s delta=%s)",
+                         user_id, delta)
+            return False
+    return True
 
 
 async def add_credit(user_id: int, delta: int) -> None:
@@ -534,39 +578,75 @@ async def cleanup_old_days(keep_days: int = 0) -> int:
 
 # ---------- marriages ----------
 
-def _new_marriage_id() -> int:
-    return uuid.uuid4().int & ((1 << 62) - 1)
+def _new_client_token() -> str:
+    return uuid.uuid4().hex
 
 
 async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
                           forced: bool = False) -> int:
-    """id генерируется в Python. Обычный proposal: active=0."""
-    new_id = _new_marriage_id()
-    active = 1 if forced else 0
-    forced_flag = 1 if forced else 0
+    """Вставляет предложение (active=0) и возвращает его id.
 
-    if forced:
-        rs = await _exec(
-            """INSERT INTO marriages
-                 (id, chat_id, user1_id, user2_id, active, forced, married_at)
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
-            [new_id, chat_id, user1_id, user2_id, active, forced_flag],
-        )
-    else:
-        rs = await _exec(
-            """INSERT INTO marriages
-                 (id, chat_id, user1_id, user2_id, active, forced)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [new_id, chat_id, user1_id, user2_id, active, forced_flag],
-        )
+    Принудительный брак (forced=True) тоже создаётся как предложение
+    (active=0, forced=1) и «заключается» вызовом accept_marriage —
+    это проходит ту же защиту от двойного брака, что и обычное принятие.
+
+    Не полагаемся на last_insert_rowid(): id назначает SQLite (AUTOINCREMENT),
+    а поиск детерминирован по client_token.
+
+    Возвращает 0 при ошибке БД или если у кого-то из участников уже есть
+    активный брак в этом чате (INSERT ... SELECT ... WHERE NOT EXISTS
+    вставит 0 строк).
+    """
+    token = _new_client_token()
+
+    rs = await _exec(
+        """INSERT INTO marriages
+             (chat_id, user1_id, user2_id, active, forced, client_token)
+           SELECT ?, ?, ?, 0, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM marriages m2
+               WHERE m2.chat_id = ?
+                 AND m2.active = 1
+                 AND (
+                     m2.user1_id IN (?, ?)
+                     OR m2.user2_id IN (?, ?)
+                 )
+           )""",
+        [chat_id, user1_id, user2_id, 1 if forced else 0, token,
+         chat_id, user1_id, user2_id, user1_id, user2_id],
+    )
 
     if getattr(rs, "error", False):
-        logger.error("create_proposal: ошибка БД (chat=%s)", chat_id)
+        logger.error("create_proposal: ошибка INSERT (chat=%s)", chat_id)
         return 0
-    return new_id
+
+    rs2 = await _exec(
+        "SELECT id FROM marriages WHERE client_token = ? LIMIT 1",
+        [token],
+    )
+    if getattr(rs2, "error", False):
+        logger.error("create_proposal: ошибка SELECT по token (chat=%s)", chat_id)
+        # cleanup, чтобы не оставить «сироту» без id
+        await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
+        return 0
+    if not rs2.rows:
+        # INSERT не вставил строку (у участников уже есть активный брак)
+        # либо SELECT не увидел запись — в обоих случаях чистим по токену.
+        logger.info(
+            "create_proposal: запись не вставлена/не найдена (chat=%s, "
+            "возможно, уже есть активный брак)", chat_id,
+        )
+        await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
+        return 0
+    return rs2.rows[0][0]
 
 
 async def accept_marriage(marriage_id: int) -> int:
+    """Активирует предложение. Возвращает rows_affected (1 при успехе, 0 иначе).
+
+    Вызывающий код ОБЯЗАН проверить результат: 0 означает, что предложение
+    не существует/уже активно/у кого-то из участников уже есть активный брак.
+    """
     rs = await _exec(
         """UPDATE marriages SET active = 1, married_at = datetime('now')
            WHERE id = ?
@@ -583,6 +663,9 @@ async def accept_marriage(marriage_id: int) -> int:
              )""",
         [marriage_id],
     )
+    if getattr(rs, "error", False):
+        logger.error("accept_marriage(%s): ошибка БД", marriage_id)
+        return 0
     return getattr(rs, "rows_affected", 0) or 0
 
 
@@ -612,12 +695,15 @@ async def get_marriage(marriage_id: int) -> Optional[dict]:
 
 
 async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
+    # ORDER BY id DESC — детерминированный выбор последнего активного брака
+    # (на случай, если в БД когда-либо окажется несколько активных).
     rs = await _exec(
         """SELECT id, chat_id, user1_id, user2_id, created_at, married_at,
                   active, forced
            FROM marriages
            WHERE chat_id = ? AND active = 1
              AND (user1_id = ? OR user2_id = ?)
+           ORDER BY id DESC
            LIMIT 1""",
         [chat_id, user_id, user_id],
     )
@@ -632,12 +718,24 @@ async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
 
 
 async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
-                             event: str, by_user_id: Optional[int] = None) -> None:
-    await _exec(
+                             event: str, by_user_id: Optional[int] = None) -> bool:
+    """Пишет событие в историю. Возвращает True при успехе.
+
+    Вызывающий код должен проверять результат: если False, событие
+    не записано и статистика (например, count_divorces) будет неверной.
+    """
+    rs = await _exec(
         """INSERT INTO marriage_history (chat_id, user1_id, user2_id, event, by_user_id)
            VALUES (?, ?, ?, ?, ?)""",
         [chat_id, user1_id, user2_id, event, by_user_id],
     )
+    if getattr(rs, "error", False):
+        logger.error(
+            "log_marriage_event: ошибка записи (chat=%s event=%s)",
+            chat_id, event,
+        )
+        return False
+    return True
 
 
 async def count_divorces(chat_id: int, user_id: int) -> int:
