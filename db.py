@@ -192,6 +192,15 @@ async def _create_tables() -> None:
             resolved_at   TEXT
         )
     """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS aura (
+            chat_id       INTEGER NOT NULL,
+            user_id       INTEGER NOT NULL,
+            value         INTEGER NOT NULL DEFAULT 0,
+            last_droch_at TEXT,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -239,6 +248,8 @@ async def _migrate_tables() -> None:
         "ON warnings(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_complaints_status "
         "ON complaints(chat_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_aura_chat_value "
+        "ON aura(chat_id, value DESC)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -825,8 +836,6 @@ async def add_warning(chat_id: int, user_id: int, issued_by: int,
     if getattr(rs, "error", False):
         logger.error("add_warning: ошибка INSERT (user=%s)", user_id)
         return 0
-    # id берём по последней записи этого юзера/выдавшего — last_insert_rowid()
-    # на Turso HTTP ненадёжен.
     rs2 = await _exec(
         """SELECT id FROM warnings
            WHERE chat_id = ? AND user_id = ? AND issued_by = ?
@@ -928,3 +937,84 @@ async def resolve_complaint(complaint_id: int, status: str,
         [status, resolved_by, complaint_id],
     )
     return getattr(rs, "rows_affected", 0) or 0
+
+
+# ---------- aura ----------
+
+async def aura_droch(chat_id: int, user_id: int) -> bool:
+    """Раз в час +1 аура. Атомарно: условие проверяется в UPDATE.
+
+    True — начислено, False — ещё рано (или ошибка БД).
+    Строка создаётся при первом вызове.
+    """
+    await _exec(
+        """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
+           VALUES (?, ?, 0, NULL)
+           ON CONFLICT(chat_id, user_id) DO NOTHING""",
+        [chat_id, user_id],
+    )
+    rs = await _exec(
+        """UPDATE aura
+           SET value = value + 1,
+               last_droch_at = datetime('now')
+           WHERE chat_id = ? AND user_id = ?
+             AND (last_droch_at IS NULL
+                  OR last_droch_at <= datetime('now', '-1 hour'))""",
+        [chat_id, user_id],
+    )
+    if getattr(rs, "error", False):
+        logger.error("aura_droch: ошибка БД (chat=%s user=%s)", chat_id, user_id)
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def aura_get(chat_id: int, user_id: int) -> Optional[dict]:
+    """Возвращает {'value': int, 'last_droch_at': str|None} или None."""
+    rs = await _exec(
+        """SELECT value, last_droch_at FROM aura
+           WHERE chat_id = ? AND user_id = ?""",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {"value": r[0] or 0, "last_droch_at": r[1]}
+
+
+async def aura_top(chat_id: int, limit: int = 10) -> List[tuple]:
+    """[(user_id, value), ...] по убыванию ауры."""
+    rs = await _exec(
+        """SELECT user_id, value FROM aura
+           WHERE chat_id = ? AND value > 0
+           ORDER BY value DESC, user_id ASC
+           LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def aura_rank(chat_id: int, user_id: int) -> Optional[tuple]:
+    """(value, rank, total) или None, если у юзера нет ауры."""
+    rs = await _exec(
+        "SELECT value FROM aura WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    value = rs.rows[0][0] or 0
+    if value <= 0:
+        return None
+
+    rs2 = await _exec(
+        """SELECT COUNT(*) FROM aura
+           WHERE chat_id = ? AND value > ?""",
+        [chat_id, value],
+    )
+    rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
+
+    rs3 = await _exec(
+        "SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > 0",
+        [chat_id],
+    )
+    total = (rs3.rows[0][0] if rs3.rows else 0) or 0
+    return value, rank, total
