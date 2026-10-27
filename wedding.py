@@ -1,4 +1,16 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение."""
+"""2.5 Свадьба: предложение, принятие/отклонение, расторжение.
+
+Исправления:
+- accept/reject проверяют, что proposal ещё active=0 (нет двойных «Свадьба!»).
+- accept атомарно проверяет отсутствие активного брака у обоих участников
+  (нет «двух браков одновременно»).
+- delete_marriage возвращает rows_affected — не спамим «отклонено» после
+  уже обработанного proposal.
+- кнопки проверяют, что callback пришёл из того же чата, где proposal.
+- _marriage_level считает от married_at (момент accept), а не created_at.
+- +Брак не женит ботов и админа.
+- При ошибке БД показываем «ошибка», а не «не найдено».
+"""
 import os
 import re
 import logging
@@ -19,7 +31,7 @@ import resolver
 
 logger = logging.getLogger(__name__)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
@@ -72,10 +84,10 @@ async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     return targets
 
 
-def _marriage_level(created_at_str: str) -> int:
+def _marriage_level(married_at_str: str) -> int:
+    """Уровень брака от момента accept (married_at), а не от proposal."""
     try:
-        s = (created_at_str or "").replace("Z", "+00:00")
-        # SQLite datetime('now') отдаёт "2025-01-01 12:00:00" — нужен T
+        s = (married_at_str or "").replace("Z", "+00:00")
         if " " in s and "T" not in s:
             s = s.replace(" ", "T", 1)
         created = datetime.fromisoformat(s)
@@ -85,6 +97,14 @@ def _marriage_level(created_at_str: str) -> int:
         return max(1, delta.days + 1)
     except Exception:
         return 1
+
+
+async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
+    try:
+        chat = await context.bot.get_chat(uid)
+        return bool(getattr(chat, "is_bot", False))
+    except TelegramError:
+        return False
 
 
 # ---------- предложение ----------
@@ -112,6 +132,9 @@ async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if target_id == user.id:
         await msg.reply_text("Себе предложение делать нельзя 🙂")
         return
+    if await _is_bot(context, target_id):
+        await msg.reply_text("Ботам предложение делать нельзя 🤖")
+        return
 
     other = await db.find_active_marriage(chat.id, target_id)
     if other:
@@ -123,6 +146,9 @@ async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.warning("cmd_propose: create_proposal вернул 0")
         await msg.reply_text("⚠️ Не удалось создать предложение. Попробуйте ещё раз.")
         return
+
+    logger.info("propose: chat=%s mid=%s user1=%s user2=%s",
+                chat.id, mid, user.id, target_id)
 
     text = (
         f"💐 <b>Минуточку внимания!</b>\n\n"
@@ -148,28 +174,50 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if not user:
         return
-    parts = q.data.split(":")
+
+    parts = (q.data or "").split(":")
     if len(parts) != 3 or parts[0] != "wed":
         await q.answer()
         return
+
     _, action, mid_s = parts
     try:
         mid = int(mid_s)
     except ValueError:
         await q.answer("Некорректный id.", show_alert=True)
         return
+
+    logger.info("wed callback: data=%r mid=%r user=%s", q.data, mid, user.id)
+
     m = await db.get_marriage(mid)
     if not m:
-        logger.warning("wedding_callback: mid=%s not found", mid)
-        await q.answer("Предложение не найдено.", show_alert=True)
+        await q.answer("Предложение не найдено или устарело.", show_alert=True)
+        return
+
+    # callback должен прийти из того же чата, где proposal
+    if q.message and q.message.chat and q.message.chat.id != m["chat_id"]:
+        await q.answer("Это предложение из другого чата.", show_alert=True)
         return
 
     if user.id != m["user2_id"]:
         await q.answer("Это предложение не вам.", show_alert=True)
         return
 
+    # уже обработано (accept/reject) — не спамим
+    if m["active"]:
+        await q.answer("Это предложение уже принято.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+
     if action == "reject":
-        await db.delete_marriage(mid)
+        affected = await db.delete_marriage(mid)
+        if affected == 0:
+            # гонка: кто-то уже удалил/принял
+            await q.answer("Это предложение уже обработано.", show_alert=True)
+            return
         await q.answer("Отклонено")
         try:
             await context.bot.send_message(
@@ -191,13 +239,36 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.warning("edit reject msg: %s", e)
         return
 
-    await db.accept_marriage(mid)
+    if action != "accept":
+        await q.answer()
+        return
+
+    affected = await db.accept_marriage(mid)
+    if affected == 0:
+        # либо уже принято, либо у кого-то из участников появился другой брак
+        m2 = await db.get_marriage(mid)
+        if m2 and m2["active"]:
+            await q.answer("Это предложение уже принято.", show_alert=True)
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+        else:
+            await q.answer(
+                "Нельзя: у одного из вас уже есть активный брак.",
+                show_alert=True,
+            )
+        return
+
     await db.log_marriage_event(
         m["chat_id"], m["user1_id"], m["user2_id"], "married",
         by_user_id=m["user2_id"],
     )
     await q.answer("Брак заключён!")
-    level = _marriage_level(m["created_at"])
+
+    m_after = await db.get_marriage(mid)
+    level = _marriage_level(m_after["married_at"] if m_after else m["created_at"])
+
     try:
         await context.bot.send_message(
             chat_id=m["chat_id"],
@@ -236,7 +307,10 @@ async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "🔒 Этот брак принудительный. Расторгнуть его может только админ."
         )
         return
-    await db.delete_marriage(m["id"])
+    affected = await db.delete_marriage(m["id"])
+    if affected == 0:
+        await msg.reply_text("Брак уже расторгнут.")
+        return
     await db.log_marriage_event(
         chat.id, m["user1_id"], m["user2_id"], "divorced", by_user_id=user.id,
     )
@@ -255,7 +329,7 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.effective_message
     if not user or not chat or not msg:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -271,15 +345,22 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if id1 == id2:
         await msg.reply_text("Это один и тот же человек 🙂")
         return
+    if id1 == ADMIN_ID or id2 == ADMIN_ID:
+        await msg.reply_text("Админа женить нельзя.")
+        return
+    if await _is_bot(context, id1) or await _is_bot(context, id2):
+        await msg.reply_text("Ботов женить нельзя 🤖")
+        return
 
     for uid in (id1, id2):
         m = await db.find_active_marriage(chat.id, uid)
         if m:
-            await db.delete_marriage(m["id"])
-            await db.log_marriage_event(
-                chat.id, m["user1_id"], m["user2_id"], "forced_divorced",
-                by_user_id=user.id,
-            )
+            affected = await db.delete_marriage(m["id"])
+            if affected:
+                await db.log_marriage_event(
+                    chat.id, m["user1_id"], m["user2_id"], "forced_divorced",
+                    by_user_id=user.id,
+                )
 
     mid = await db.create_proposal(chat.id, id1, id2, forced=True)
     if not mid:
@@ -304,7 +385,7 @@ async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
     if not user or not chat or not msg:
         return
-    if user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -317,7 +398,10 @@ async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not m:
         await msg.reply_text("Этот пользователь не в браке.")
         return
-    await db.delete_marriage(m["id"])
+    affected = await db.delete_marriage(m["id"])
+    if affected == 0:
+        await msg.reply_text("Брак уже расторгнут.")
+        return
     await db.log_marriage_event(
         chat.id, m["user1_id"], m["user2_id"], "forced_divorced",
         by_user_id=user.id,
@@ -337,7 +421,7 @@ async def cmd_force_divorce_or_self(
         return
     text = msg.text or ""
     has_target = bool(msg.reply_to_message or USERNAME_RE.search(text))
-    if user.id == ADMIN_ID and has_target:
+    if ADMIN_ID and user.id == ADMIN_ID and has_target:
         return await cmd_force_divorce(update, context)
     return await cmd_divorce(update, context)
 
@@ -361,11 +445,11 @@ async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         name = partner.first_name or partner.username or str(partner_id)
     except TelegramError:
         pass
-    level = _marriage_level(m["created_at"])
+    level = _marriage_level(m["married_at"] or m["created_at"])
     forced = " 🔒 (принудительный)" if m["forced"] else ""
     await msg.reply_text(
         f"💍 Ваш брак с <b>{escape(name)}</b>{forced}\n"
         f"Уровень: <b>{level}</b>\n"
-        f"Заключён: {escape(m['created_at'])}",
+        f"Заключён: {escape(m['married_at'] or m['created_at'])}",
         parse_mode=ParseMode.HTML,
     )
