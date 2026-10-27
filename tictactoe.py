@@ -1,11 +1,9 @@
 """Крестики-нолики 5×5 на монеты.
 
-Команда:  хо @user 50   /   хо (реплай) 50
-Поле 5×5, победа — 5 в ряд (по горизонтали/вертикали/диагонали).
-При идеальной игре — ничья, при ошибке — победа.
-Победитель получает свою ставку обратно + ставку противника.
-
-Состояние — in-memory dict. При рестарте Render активные партии пропадают.
+P0: эскроу ставок. При accept списываем bet у обоих; при finish:
+- ничья: каждому +bet (возврат своей ставки)
+- победа: победителю +2*bet (своя + чужая), проигравший уже потерял свою.
+Никакого надувания экономики.
 """
 import os
 import re
@@ -24,7 +22,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import resolver
+import utils
 
 logger = logging.getLogger(__name__)
 
@@ -86,29 +84,6 @@ def _is_full(board: list[list[str]]) -> bool:
     return all(all(cell for cell in row) for row in board)
 
 
-async def _resolve_opponent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    msg = update.effective_message
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        return u.id, u.first_name or u.username or str(u.id)
-    m = USERNAME_RE.search(text or "")
-    if not m:
-        return None
-    uname = m.group(1)
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid, uname
-    r = await resolver.resolve_username(uname)
-    if r:
-        return r
-    try:
-        c = await context.bot.get_chat(f"@{uname}")
-        return c.id, c.first_name or uname
-    except TelegramError as e:
-        logger.warning("get_chat @%s: %s", uname, e)
-    return None
-
-
 async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
@@ -133,7 +108,7 @@ async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     clean = text[:bet_match.start()] + text[bet_match.end():]
 
-    opponent = await _resolve_opponent(update, context, clean)
+    opponent = await utils.resolve_target(update, context, clean)
     if not opponent:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
@@ -178,6 +153,7 @@ async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "turn": user.id,
         "symbols": {user.id: "❌", opp_id: "⭕"},
         "state": "pending",
+        "escrow_taken": False,
     }
 
     kb = InlineKeyboardMarkup([[
@@ -204,20 +180,21 @@ async def _finish_game(context: ContextTypes.DEFAULT_TYPE, game_id: str,
     bet = g["bet"]
     p1, p2 = g["p1_id"], g["p2_id"]
 
+    if not g.get("escrow_taken"):
+        logger.warning("finish_game: escrow не списан для %s", game_id)
+
     if winner_id is None:
         await db.add_balance(p1, bet)
         await db.add_balance(p2, bet)
         text = f"🤝 Ничья! Ставки возвращены по <b>{bet}</b>."
     elif winner_id == p1:
         await db.add_balance(p1, bet * 2)
-        await db.add_balance(p2, -bet)
         text = (
             f"🏆 Победил <b>{escape(g['p1_name'])}</b>!\n"
             f"Забрано: <b>{bet * 2}</b> (своя + чужая ставка)."
         )
     else:
         await db.add_balance(p2, bet * 2)
-        await db.add_balance(p1, -bet)
         text = (
             f"🏆 Победил <b>{escape(g['p2_name'])}</b>!\n"
             f"Забрано: <b>{bet * 2}</b> (своя + чужая ставка)."
@@ -233,8 +210,8 @@ async def _finish_game(context: ContextTypes.DEFAULT_TYPE, game_id: str,
         else:
             await db.inc_user_counter(p1, "tictactoe_draws", 1)
             await db.inc_user_counter(p2, "tictactoe_draws", 1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("finish_game counters: %s", e)
 
     try:
         await context.bot.send_message(
@@ -293,20 +270,44 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
             return
 
+        # ACCEPT: эскроу — списываем ставку у обоих
+        bet = g["bet"]
+        p1, p2 = g["p1_id"], g["p2_id"]
+
+        r1 = await db.get_user(p1)
+        r2 = await db.get_user(p2)
+        b1 = (r1 or {}).get("balance") or 0
+        b2 = (r2 or {}).get("balance") or 0
+        if b1 < bet or b2 < bet:
+            g["state"] = "declined"
+            GAMES.pop(game_id, None)
+            await q.answer("У кого-то не хватает монет.", show_alert=True)
+            try:
+                await q.edit_message_text(
+                    (q.message.text or "") + "\n\n⚠️ <b>Отменено: недостаточно монет.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
+        await db.add_balance(p1, -bet)
+        await db.add_balance(p2, -bet)
+        g["escrow_taken"] = True
         g["state"] = "active"
-        await q.answer("Поехали!")
+
+        await q.answer("Поехали! Ставки списаны.")
         kb = _board_keyboard(game_id, g["board"])
         text = (
             f"🎮 <b>Крестики-нолики 5×5</b>\n"
             f"{escape(g['p1_name'])} {g['symbols'][g['p1_id']]} vs "
             f"{escape(g['p2_name'])} {g['symbols'][g['p2_id']]}\n"
-            f"Ставка: <b>{g['bet']}</b> | Собрать 5 в ряд.\n"
+            f"Ставка: <b>{bet}</b> | Собрать 5 в ряд.\n"
             f"Ход: {escape(g['p1_name'])}"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
-    # ход: ttt:GAMEID:R:C
     if len(parts) == 4:
         game_id, r_s, c_s = parts[1], parts[2], parts[3]
         try:
