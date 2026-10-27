@@ -7,6 +7,9 @@
 - delete_webhook в shutdown убран — не создаём окно недоставки.
 - cleanup_job запускается с tzinfo=UTC (единообразно с economy).
 - Добавлены +Жалоба (всем) и +Предупреждение (шериф/комиссар/админ).
+- Модуль предупреждений называется warns (а не warnings), чтобы не
+  перекрывать стандартный модуль Python и не ломать pip/virtualenv/poetry
+  на этапе сборки.
 """
 import os
 import logging
@@ -34,7 +37,7 @@ import economy
 import tictactoe
 import sss
 import complaints
-import warnings as warnings_mod
+import warns
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -202,7 +205,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(complaints.complaint_callback,
                                          pattern=r"^compl:"))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Предупреждение(\s|$)"),
-                                   warnings_mod.cmd_warn))
+                                   warns.cmd_warn))
 
     # Счётчик сообщений
     app.add_handler(
