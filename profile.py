@@ -1,4 +1,4 @@
-"""Профиль: имя, смс, брак, монеты, кредит, ССС, роль, статистика."""
+"""Профиль: имя, смс, брак, монеты, кредит, ССС, роль, статистика, аура."""
 import os
 import re
 import logging
@@ -132,6 +132,26 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
     credit = user_row.get("credit") or 0
     sss_label = "да" if sss_member else "нет"
 
+    # Аура
+    aura_value = 0
+    aura_line = "0"
+    try:
+        aura_row = await db.aura_get(chat.id, target_uid)
+        if aura_row:
+            aura_value = aura_row.get("value") or 0
+        if aura_value > 0:
+            r = await db.aura_rank(chat.id, target_uid)
+            if r:
+                _, arank, atotal = r
+                aura_line = f"{aura_value} (место {arank}/{atotal})"
+            else:
+                aura_line = str(aura_value)
+        else:
+            aura_line = "0"
+    except Exception as e:
+        logger.warning("profile aura: %s", e)
+        aura_line = str(aura_value)
+
     wins = user_row.get("tictactoe_wins") or 0
     losses = user_row.get("tictactoe_losses") or 0
     draws = user_row.get("tictactoe_draws") or 0
@@ -148,6 +168,7 @@ async def _cmd_profile_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Брак: {marriage_line}\n"
         f"Монеты: <b>{balance}</b>\n"
         f"Кредит: <b>{credit}</b>\n"
+        f"Аура: <b>{aura_line}</b>\n"
         f"ССС: <b>{sss_label}</b>\n"
         f"Роль: <b>{role_str}</b>\n\n"
         f"🎮 Крестики-нолики:\n"
