@@ -1,5 +1,6 @@
 """Точка входа: webhook-версия для Render Web Service (Free)."""
 import os
+import re
 import logging
 from datetime import time as dtime, timezone
 
@@ -31,6 +32,8 @@ import aura
 import awards
 import actions
 import ai
+import help_menu
+import casino
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,6 +50,10 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
 
+_AI_WORD = re.compile(
+    r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"
+)
+
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception", exc_info=context.error)
@@ -58,9 +65,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.upsert_user(u.id, u.username, u.first_name)
     await update.message.reply_text(
         "Привет! Я PR-бот.\n"
+        "/help — список команд по ролям\n"
         "/check — подписка\n"
         "/ping — жив?\n"
-        "Профиль — посмотреть профиль"
+        "/restart — сбросить контекст ИИ\n"
+        "Профиль — посмотреть профиль\n"
+        "Казино — мини-казино на монеты"
     )
 
 
@@ -68,40 +78,26 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong 🏓")
 
 
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик Brainy/Браини/Мозг — запрос к gemini через Pollinations."""
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return
+    ai.reset_history(user.id)
+    await msg.reply_text("🔄 Контекст ИИ сброшен.")
 
-    text = (msg.text or "").strip()
-    parts = text.split(maxsplit=1)
-    prompt = parts[1].strip() if len(parts) > 1 else ""
-    if not prompt:
-        await msg.reply_text(
-            "Формат: <code>Браини Привет</code> — напиши запрос после команды.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
-    # try_acquire атомарно проверяет и занимает cooldown.
-    # Возвращает 0.0, если можно выполнять запрос, иначе — оставшиеся секунды.
+async def _run_ai(user, msg, prompt: str) -> None:
     remain = ai.try_acquire(user.id)
     if remain > 0:
-        await msg.reply_text(
-            f"⏳ Подожди {remain:.1f} сек. перед следующим запросом."
-        )
+        await msg.reply_text(f"⏳ Подожди {remain:.1f} сек. перед следующим запросом.")
         return
 
     thinking = await msg.reply_text("🤔 Думаю…")
-
-    answer = await ai.ask_ai(prompt)
+    answer = await ai.ask_ai(prompt, user_id=user.id)
     if not answer:
         try:
-            await thinking.edit_text(
-                "⚠️ ИИ не ответил. Попробуй позже."
-            )
+            await thinking.edit_text("⚠️ ИИ не ответил. Попробуй позже.")
         except Exception:
             pass
         return
@@ -116,6 +112,41 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(answer)
         except Exception:
             pass
+
+
+async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ИИ / Браини / Мозг / Brainy <запрос> ИЛИ реплай на сообщение бота."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    text = (msg.text or "").strip()
+
+    # Реплай на сообщение бота — prompt = текст (без триггера, если он есть).
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if msg.reply_to_message.from_user.id == context.bot.id:
+            prompt = _AI_WORD.sub("", text).strip()
+            if not prompt:
+                await msg.reply_text(
+                    "Напиши вопрос — сообщением или реплаем на моё сообщение."
+                )
+                return
+            await _run_ai(user, msg, prompt)
+            return
+
+    m = _AI_WORD.match(text)
+    if not m:
+        return
+    prompt = text[m.end():].strip()
+    if not prompt:
+        await msg.reply_text(
+            "Формат: <code>ИИ Привет</code> — вопрос после триггера, "
+            "или реплай на сообщение бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await _run_ai(user, msg, prompt)
 
 
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -147,7 +178,10 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
         "• дроч / Аура / Топ аура — аурометр\n"
-        "• Браини / Мозг / Brainy <запрос> — ИИ"
+        "• Казино монетка 50 / Казино кубик 4 50 / Казино слоты 50\n"
+        "• ИИ / Браини / Мозг / Brainy <запрос> — ИИ (или реплай)\n"
+        "• /restart — сбросить контекст ИИ\n"
+        "• /help — справка по ролям"
     )
 
 
@@ -169,6 +203,7 @@ async def post_init(app: Application) -> None:
 
 async def post_shutdown(app: Application) -> None:
     await resolver.stop_client()
+    await ai.close_session()
     await db.close_db()
     logger.info("Bot stopped")
 
@@ -187,6 +222,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
     app.add_handler(CommandHandler("check", pr.recheck_subscription))
+    app.add_handler(CommandHandler("help", help_menu.cmd_help))
+    app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("casino", casino.cmd_casino))
 
     # Роли
     app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
@@ -209,6 +247,14 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
 
+    # Казино
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^казино(\s|$)"), casino.cmd_casino,
+    ))
+    app.add_handler(CallbackQueryHandler(
+        casino.casino_help_callback, pattern=r"^cas:help:",
+    ))
+
     # Топ
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
@@ -224,7 +270,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # Профиль (базовый + кнопки разделов)
+    # Профиль
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
                                    profile.cmd_profile))
     app.add_handler(CallbackQueryHandler(profile.profile_callback,
@@ -234,7 +280,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
     app.add_handler(CallbackQueryHandler(tictactoe.ttt_callback, pattern=r"^ttt:"))
 
-    # ССС и суды — порядок ВАЖЕН
+    # ССС и суды
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ССС(\s|$)"), sss.cmd_sss_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]ССС(\s|$)"), sss.cmd_sss_remove))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+ССС(\s|$)"), sss.cmd_sss_list))
@@ -288,9 +334,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
 
-    # ИИ (gemini через Pollinations)
+    # ИИ: триггер словом
+    app.add_handler(MessageHandler(_AI_WORD, cmd_ai))
+    # ИИ: реплай на сообщение бота (без триггера)
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^(б|Браин|Мозг|Браини|Brainy|Brain)(\s|$)"),
+        filters.REPLY & filters.Chat(chat_id=CHAT_ID),
         cmd_ai,
     ))
 
