@@ -357,7 +357,11 @@ async def set_credit_taken_day(user_id: int, day: str) -> None:
 # ---------- атомарные экономические операции ----------
 
 async def take_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: +credit и +balance одним UPDATE. True при успехе."""
+    """Атомарно: +credit и +balance одним UPDATE. True при успехе.
+
+    ВНИМАНИЕ: не проверяет лимит «раз в день» и отсутствие текущего долга.
+    Для команды +Кредит используйте take_credit_daily_atomic.
+    """
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) + ?,
@@ -370,14 +374,56 @@ async def take_credit_atomic(user_id: int, amount: int) -> bool:
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
+async def take_credit_daily_atomic(
+    user_id: int,
+    amount: int,
+    today: str,
+    balance_floor: int = 0,
+) -> bool:
+    """Атомарно выдаёт кредит с проверкой всех условий в одном UPDATE.
+
+    Условия (все внутри WHERE):
+      - balance >= balance_floor (обычно 0),
+      - credit = 0 (нет текущего долга),
+      - credit_taken_day IS NULL OR != today (не брали сегодня).
+
+    При успехе: credit += amount, balance += amount,
+    credit_taken_day = today. Возвращает True при rows_affected > 0.
+    """
+    rs = await _exec(
+        """UPDATE users
+           SET credit           = COALESCE(credit, 0) + ?,
+               balance          = COALESCE(balance, 10) + ?,
+               credit_taken_day = ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 10) >= ?
+             AND COALESCE(credit, 0) = 0
+             AND (credit_taken_day IS NULL OR credit_taken_day != ?)""",
+        [amount, amount, today, user_id, balance_floor, today],
+    )
+    if getattr(rs, "error", False):
+        logger.error(
+            "take_credit_daily_atomic: ошибка UPDATE (user=%s amount=%s)",
+            user_id, amount,
+        )
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
 async def repay_credit_atomic(user_id: int, amount: int) -> bool:
-    """Атомарно: -credit и -balance одним UPDATE. True при успехе."""
+    """Атомарно: -credit и -balance одним UPDATE. True при успехе.
+
+    Дополнительно проверяет credit >= amount, чтобы долг не ушёл
+    в минус при параллельных погашениях.
+    """
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) - ?,
                balance = COALESCE(balance, 10) - ?
-           WHERE user_id = ? AND COALESCE(balance, 0) >= ?""",
-        [amount, amount, user_id, amount],
+           WHERE user_id = ?
+             AND COALESCE(balance, 0) >= ?
+             AND COALESCE(credit, 0) >= ?""",
+        [amount, amount, user_id, amount, amount],
     )
     if getattr(rs, "error", False):
         return False
