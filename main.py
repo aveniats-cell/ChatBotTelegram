@@ -330,11 +330,13 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # --- правила чата ---
-    app.add_handler(MessageHandler(rules.RULES_RE, rules.cmd_rules))
+    # --- правила чата (фильтр — filters.Regex, не re.Pattern) ---
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^правила(\s+чата)?\s*[.!?]*\s*$"),
+        rules.cmd_rules,
+    ))
 
     # --- опросы ---
-    # ВАЖНО: Опрос ССС должен быть раньше Опрос (иначе Опрос перехватит)
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^Опрос\s+ССС(\s|/)"),
         polls.cmd_poll_sss,
