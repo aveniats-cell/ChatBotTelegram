@@ -565,12 +565,6 @@ async def treasury_trim(chat_id: int, keep: int) -> int:
 
 
 async def treasury_default_collect(chat_id: int) -> int:
-    """Обнуляет глобальные балансы всех юзеров (balance > 0).
-
-    ВНИМАНИЕ: баланс в таблице users глобальный, а не по чатам.
-    Поэтому дефолт в одном чате обнулит балансы во всех чатах.
-    Возвращает реально списанное.
-    """
     rs = await _exec(
         "SELECT COALESCE(SUM(balance), 0) FROM users WHERE balance > 0",
     )
@@ -768,6 +762,7 @@ async def add_salary_frac_atomic(
 async def pay_salary_from_treasury(
     chat_id: int, user_id: int, day: str, frac_delta: int,
 ) -> Optional[int]:
+    logger.info("salary: chat=%s user=%s frac=%s", chat_id, user_id, frac_delta)
     if frac_delta <= 0:
         return 0
     coins = frac_delta // 100
@@ -775,13 +770,21 @@ async def pay_salary_from_treasury(
 
     if coins > 0:
         cur = await treasury_get(chat_id)
+        logger.info("salary: treasury_before=%s coins=%s", cur, coins)
         if cur <= 0:
+            logger.info("salary: казна пуста, зарплата не платится")
             return None
         take = min(coins, cur)
         ok = await treasury_withdraw(chat_id, take)
+        logger.info("salary: withdraw ok=%s take=%s", ok, take)
         if not ok:
             return None
         coins = take
+        if coins < frac_delta // 100:
+            logger.warning(
+                "salary: казна кончилась, выдано %s из %s",
+                coins, frac_delta // 100,
+            )
 
     rs = await _exec(
         """UPDATE users
@@ -833,12 +836,17 @@ async def get_salary_frac(user_id: int, day: str) -> int:
 async def take_credit_from_treasury(
     chat_id: int, user_id: int, amount: int, today: str,
 ) -> bool:
+    logger.info("credit_from_treasury: chat=%s user=%s amount=%s",
+                chat_id, user_id, amount)
     if amount <= 0:
         return False
     cur = await treasury_get(chat_id)
+    logger.info("credit_from_treasury: treasury_before=%s", cur)
     if cur < amount:
+        logger.info("credit_from_treasury: казна меньше нужного")
         return False
     ok = await treasury_withdraw(chat_id, amount)
+    logger.info("credit_from_treasury: withdraw ok=%s", ok)
     if not ok:
         return False
     rs = await _exec(
@@ -853,8 +861,13 @@ async def take_credit_from_treasury(
         [amount, amount, today, user_id, today],
     )
     if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        logger.warning(
+            "credit_from_treasury: UPDATE users failed, возврат в казну",
+        )
         await treasury_add(chat_id, amount)
         return False
+    logger.info("credit_from_treasury: успешно, казна=%s",
+                await treasury_get(chat_id))
     return True
 
 
