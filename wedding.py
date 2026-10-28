@@ -96,20 +96,6 @@ async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
         return False
 
 
-def _safe_edit_text(q, suffix: str) -> None:
-    """Редактирует текст callback-сообщения, не падая на None."""
-    if not q or not q.message:
-        return
-    base = q.message.text or ""
-    try:
-        import asyncio
-        asyncio.create_task(q.edit_message_text(
-            base + suffix, parse_mode=ParseMode.HTML,
-        ))
-    except Exception:
-        pass
-
-
 async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -193,7 +179,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer("Предложение не найдено или устарело.", show_alert=True)
         return
 
-    # callback должен прийти из того же чата, где proposal.
     if q.message is None or not q.message.chat:
         await q.answer("Сообщение устарело.", show_alert=True)
         return
@@ -386,7 +371,8 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user    chat = update.effective_chat
+    user = update.effective_user
+    chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg:
         return
