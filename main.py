@@ -35,6 +35,7 @@ import ai
 import help_menu
 import casino
 import polls
+import rules
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -166,7 +167,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• -Награда Название @user\n"
         "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
         "• Засос / Расстрел / По шапке / Выстрел / Расцеловать / Сделать 18+\n"
-        "• Станцевать / Обнять всех / Погладить всех / Лещей всем / Тыкнуть / Защекотать\n"
+        "• Пожать руку / Станцевать / Обнять всех / Погладить всех / Лещей всем / Тыкнуть / Защекотать\n"
         "• Опрос / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
         "• Опрос ССС / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
         "• Топ все / Топ день / Топ богачи / Мое место\n"
@@ -185,6 +186,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• дроч / Аура / Топ аура\n"
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
+        "• Правила — текст правил чата\n"
         "• /Defloult220099 — экстремальный дефолт (обнуление всех)\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
@@ -192,7 +194,6 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _cleanup_polls_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Страховка: удаляет просроченные опросы из памяти."""
     try:
         n = polls.cleanup_expired_polls()
         if n:
@@ -329,6 +330,9 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
+    # --- правила чата ---
+    app.add_handler(MessageHandler(rules.RULES_RE, rules.cmd_rules))
+
     # --- опросы ---
     # ВАЖНО: Опрос ССС должен быть раньше Опрос (иначе Опрос перехватит)
     app.add_handler(MessageHandler(
@@ -409,6 +413,8 @@ def build_app() -> Application:
                                    actions.cmd_poke))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Защекотать(\s|$)"),
                                    actions.cmd_tickle))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
+                                   actions.cmd_handshake))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
