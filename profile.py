@@ -1,9 +1,4 @@
-"""Профиль: базовый экран + разделы на inline-кнопках.
-
-- Кнопки: Жалобы/Муты/Предупреждения, Игры, Аура, Награды, Счётчики, Назад.
-- callback_data: prof:<section>:<target_uid>
-  section: base | safety | games | aura | awards | counters
-"""
+"""Профиль: базовый экран + разделы на inline-кнопках."""
 import os
 import re
 import logging
@@ -105,7 +100,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
         marriage_line = f"разведён(а) ({divorces} раз)" if divorces > 0 else "нет"
 
     role = await db.get_role(target_uid)
-    sss_member = bool(user_row.get("sss_member")) or (target_uid in sss._sss_all())
+    sss_member = bool(user_row.get("sss_member")) or sss.is_sss_member(target_uid)
 
     if target_uid == ADMIN_ID:
         role_str = "Создатель"
@@ -237,6 +232,7 @@ async def _render_awards(context, chat_id: int, target_uid: int) -> str:
     ]
     for a in items:
         stars = int(a.get("stars") or 0)
+        stars = max(0, min(stars, 10))
         star_str = "★" * stars + "☆" * (10 - stars)
         lines.append(
             f"• {escape(str(a.get('title') or '—'))} — "
