@@ -164,6 +164,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Награда Название / 5 @user\n"
         "• -Награда Название @user\n"
         "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
+        "• Засос / Расстрел / По шапке / Выстрел / Расцеловать / Сделать 18+\n"
+        "• Станцевать / Обнять всех / Погладить всех / Лещей всем / Тыкнуть / Защекотать\n"
         "• Топ все / Топ день / Топ богачи / Мое место\n"
         "• Шип @u1 @u2 (с ИИ)\n"
         "• Сделать предложение / +Брак / -Брак / Мой брак\n"
@@ -336,6 +338,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
                                    awards.cmd_unaward))
 
+    # --- старые действия ---
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
                                    actions.cmd_slap))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"),
@@ -348,6 +351,32 @@ def build_app() -> Application:
                                    actions.cmd_piss))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
+
+    # --- новые действия ---
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Засос(\s|$)"),
+                                   actions.cmd_kiss_deep))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расстрел(\s|$)"),
+                                   actions.cmd_shoot))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+по\s+шапке(\s|$)"),
+                                   actions.cmd_bonk))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Выстрел(\s|$)"),
+                                   actions.cmd_gunshot))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расцеловать(\s|$)"),
+                                   actions.cmd_kiss_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+18\+?(\s|$)"),
+                                   actions.cmd_make18))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Станцевать(\s|$)"),
+                                   actions.cmd_dance))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять\s+всех(\s|$)"),
+                                   actions.cmd_hug_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить\s+всех(\s|$)"),
+                                   actions.cmd_pat_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Лещей\s+всем(\s|$)"),
+                                   actions.cmd_slap_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Тыкнуть(\s|$)"),
+                                   actions.cmd_poke))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Защекотать(\s|$)"),
+                                   actions.cmd_tickle))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
