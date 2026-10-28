@@ -1,18 +1,5 @@
-"""Экономика: кредит (+Кредит / -Кредит), выдача монет админом (+Монеты),
-ежедневное начисление процентов на остаток долга.
-
-P0: +Кредит — один атомарный UPDATE с проверкой лимита/долга/баланса
-    внутри самого запроса (take_credit_daily_atomic). Исключает двойную
-    выдачу при параллельных вызовах.
-P0: -Кредит — один атомарный UPDATE (repay_credit_atomic) с проверкой
-    credit >= amount, чтобы долг не ушёл в минус.
-P1: -Кредит при нехватке монет гасит максимум возможного
-    (min(amount, credit, balance)), а не отказывает целиком.
-P2: CREDIT_DAILY_LIMIT проверяется через users.credit_taken_day внутри
-    атомарного UPDATE, а не отдельным чтением.
-+Монеты: add_balance возвращает bool; при ошибке БД показываем ошибку,
-а не «успех». После изменения баланс перечитывается из БД.
-"""
+"""Экономика: кредит (+Кредит / -Кредит), выдача/списание монет админом,
+перевод с комиссией, казна, ежедневное начисление процентов на долг."""
 import os
 import re
 import logging
@@ -37,7 +24,10 @@ AMOUNT_RE = re.compile(r"\b(\d+)\b")
 CREDIT_DAILY_LIMIT = 100
 CREDIT_PERCENT_PER_DAY = 10
 
-# Таймзона учёта «сегодня» и запуска ежедневного job — одна и та же (UTC).
+TRANSFER_FEE_PCT = 3
+TRANSFER_MIN = 5
+TRANSFER_FEE_MIN = 1
+
 TZ = timezone.utc
 
 
@@ -45,13 +35,9 @@ def _today_utc() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Кредит N — взять кредит (1..100). Нельзя, если уже в минусе/есть долг/брали сегодня.
+# ---------- +Кредит / -Кредит ----------
 
-    Все проверки (баланс >= 0, credit = 0, credit_taken_day != сегодня)
-    выполняются ВНУТРИ одного атомарного UPDATE в db.take_credit_daily_atomic.
-    Если rows_affected == 0 — кредит не выдан (условия не выполнены).
-    """
+async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -70,7 +56,6 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"⛔ Сумма кредита: от 1 до {CREDIT_DAILY_LIMIT}.")
         return
 
-    # Гарантируем, что строка пользователя существует (нужна для UPDATE).
     row = await db.get_user(user.id)
     if not row:
         await db.upsert_user(user.id, user.username, user.first_name)
@@ -79,8 +64,6 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text("⚠️ Не удалось получить профиль.")
         return
 
-    # Предварительная диагностика — чтобы дать пользователю понятный ответ,
-    # почему кредит не выдан. Финальное решение — за атомарным UPDATE ниже.
     balance = row.get("balance") or 0
     credit = row.get("credit") or 0
     taken_day = row.get("credit_taken_day")
@@ -109,8 +92,6 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user.id, amount, _today_utc(), balance_floor=0,
     )
     if not ok:
-        # Между проверкой и UPDATE состояние могло измениться (параллельный
-        # вызов). Не показываем «успех» — перечитываем и объясняем.
         fresh = await db.get_user(user.id)
         f_balance = (fresh or {}).get("balance") or 0
         f_credit = (fresh or {}).get("credit") or 0
@@ -141,11 +122,6 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Кредит N — погасить часть долга (списывает с баланса).
-
-    Если запрошено больше, чем есть долга или монет — гасим максимум
-    возможного (min(amount, credit, balance)), а не отказываем целиком.
-    """
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -178,7 +154,6 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # Ограничиваем сумму долгом и балансом — гасим максимум возможного.
     amount = min(amount, credit, balance)
     if amount <= 0:
         await msg.reply_text("⛔ Нечего погашать.")
@@ -203,13 +178,10 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Монеты N @user — админ начисляет/списывает монеты (без лимита).
+# ---------- +Монеты / -Монеты (админ) ----------
 
-    add_balance возвращает bool; при ошибке БД не показываем «успех».
-    Баланс после изменения перечитывается из БД — показываем реальное
-    значение, а не вычисленное.
-    """
+async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """+Монеты N @user — админ начисляет монеты (без лимита)."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -261,6 +233,162 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode=ParseMode.HTML,
     )
 
+
+async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """-Монеты N @user — админ списывает монеты. Списание уходит в казну."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+
+    text = msg.text or ""
+    m = re.search(r"[-–−]Монеты\s+(\d+)", text, re.IGNORECASE)
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>-Монеты 100 @user</code> или реплай + "
+            "<code>-Монеты 100</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+
+    clean = re.sub(r"[-–−]Монеты\s+\d+", "", text, flags=re.IGNORECASE)
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажите @username или сделайте реплай.")
+        return
+    uid, name = target
+
+    taken = await db.take_balance_any(uid, amount)
+    if taken == 0:
+        await msg.reply_text(
+            f"⚠️ У {escape(str(name))} нечего списывать (баланс 0 или меньше).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    chat = update.effective_chat
+    if chat:
+        try:
+            await db.treasury_add(chat.id, taken)
+        except Exception as e:
+            logger.warning("cmd_admin_coins_minus treasury: %s", e)
+
+    new_row = await db.get_user(uid)
+    new_balance = (new_row or {}).get("balance") or 0
+    note = ""
+    if taken < amount:
+        note = f"\n<i>Списано меньше запрошенного: было только {taken}.</i>"
+    await msg.reply_text(
+        f"💸 {escape(str(name))}: <b>-{taken}</b>\n"
+        f"Баланс: <b>{new_balance}</b>{note}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- Перевод ----------
+
+async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перевод N @user — перевод монет с комиссией 3% (мин. 1)."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    text = msg.text or ""
+    m = re.search(r"(?i)^Перевод\s+(\d+)", text)
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>Перевод 100 @user</code> или реплай + "
+            "<code>Перевод 100</code>.\n"
+            f"Комиссия: {TRANSFER_FEE_PCT}% (мин. {TRANSFER_FEE_MIN}), "
+            f"минимум перевода — {TRANSFER_MIN}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    if amount < TRANSFER_MIN:
+        await msg.reply_text(f"⛔ Минимум перевода — {TRANSFER_MIN} монет.")
+        return
+
+    clean = re.sub(r"(?i)^Перевод\s+\d+", "", text)
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажите @username или сделайте реплай.")
+        return
+    uid, name = target
+    if uid == user.id:
+        await msg.reply_text("Себе переводить нельзя 🙂")
+        return
+
+    row = await db.get_user(uid)
+    if not row:
+        await db.upsert_user(uid, None, name)
+
+    fee = max(TRANSFER_FEE_MIN, int(amount * TRANSFER_FEE_PCT / 100))
+    if fee >= amount:
+        await msg.reply_text("⛔ Сумма слишком мала для комиссии.")
+        return
+
+    ok = await db.transfer_atomic(user.id, uid, amount, fee)
+    if not ok:
+        me_row = await db.get_user(user.id)
+        bal = (me_row or {}).get("balance") or 0
+        await msg.reply_text(
+            f"⛔ Недостаточно монет. Баланс: <b>{bal}</b>, нужно: <b>{amount}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await db.treasury_add(chat.id, fee)
+    except Exception as e:
+        logger.warning("cmd_transfer treasury: %s", e)
+
+    me_row = await db.get_user(user.id)
+    new_bal = (me_row or {}).get("balance") or 0
+    net = amount - fee
+    await msg.reply_text(
+        f"💸 <b>Перевод</b>\n"
+        f"Кому: {escape(str(name))}\n"
+        f"Сумма: <b>{amount}</b> · комиссия <b>{fee}</b> "
+        f"({TRANSFER_FEE_PCT}%, мин. {TRANSFER_FEE_MIN})\n"
+        f"Получатель получил: <b>{net}</b>\n"
+        f"Ваш баланс: <b>{new_bal}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- Казна ----------
+
+async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Казна — админ смотрит накопления комиссий в чате."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    bal = await db.treasury_get(chat.id)
+    await msg.reply_text(
+        f"🏦 <b>Казна чата</b>\n"
+        f"Накоплено: <b>{bal}</b> монет\n\n"
+        f"<i>Сюда идут комиссии казино, крестиков-ноликов, переводов "
+        f"и списаний через -Монеты.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- Ежедневные проценты ----------
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
