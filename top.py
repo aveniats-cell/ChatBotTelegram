@@ -4,7 +4,9 @@
   - дробная зарплата копится в персистентной таблице pending_salary (в БД),
     а не только в памяти — переживает рестарты Render;
   - _flush больше не теряет батчи при рестарте;
-  - flush_job сначала флашит, потом проверяет казну на дефолт;
+  - flush_job БОЛЬШЕ НЕ ВЫЗЫВАЕТ дефолт (дефолт — только в
+    economy.default_watchdog_job раз в час и в _check_default_after
+    после +Кредит / -Утил казна) — это убирает лавину дефолтов каждые 15 сек;
   - добавлен cleanup_job для pending_salary (старше 2 дней).
 """
 import asyncio
@@ -156,8 +158,6 @@ async def _pay_pending_salary(chat_id: int, user_id: int, day: str) -> None:
     if frac <= 0:
         return
 
-    # Снимаем не всё сразу, а только то, что реально выплатим, — берём
-    # frac, но pay_salary_from_treasury сам ограничит по казне.
     taken = await db.take_pending_salary(chat_id, user_id, day, frac)
     if taken <= 0:
         return
@@ -194,15 +194,11 @@ async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.warning("flush_job catch-up: %s", e)
 
-    try:
-        import economy
-        chat_id = int(os.getenv("CHAT_ID", "0") or "0")
-        if chat_id:
-            bal = await db.treasury_get(chat_id)
-            if bal <= 0:
-                await economy._run_default(context, chat_id)
-    except Exception as e:
-        logger.warning("flush_job default: %s", e)
+    # ВАЖНО: дефолт здесь НЕ вызываем.
+    # Дефолт запускается из economy.default_watchdog_job (раз в час)
+    # и из economy._check_default_after (после +Кредит / -Утил казна).
+    # Дублирование дефолта каждые 15 сек = лишние запросы к Turso
+    # и риск лавины дефолтов при рестарте Render.
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
