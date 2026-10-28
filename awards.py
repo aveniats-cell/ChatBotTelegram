@@ -1,9 +1,4 @@
-"""+Награда / -Награда: админ (1–10★) и комиссар (1–6★).
-
-Формат:
-    +Награда Название / 5 (реплай или @user)
-    -Награда Название (реплай или @user)
-"""
+"""+Награда / -Награда: админ (1–10★) и комиссар (1–6★)."""
 import os
 import re
 import logging
@@ -11,7 +6,6 @@ from html import escape
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
@@ -23,7 +17,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
-# +Награда <название> / <звёзды>  — звёзды в конце через слэш.
 _AWARD_RE = re.compile(r"(?i)^\s*\+Награда\s+(.+?)\s*/\s*(\d+)\s*$")
 _UNAWARD_RE = re.compile(r"(?i)^\s*-Награда\s+(.+?)\s*$")
 
@@ -37,7 +30,6 @@ async def _is_commissar(user_id: int) -> bool:
 
 
 def _clean_title(raw: str) -> str:
-    """Убирает @username из названия награды."""
     t = USERNAME_RE.sub("", raw or "").strip(" ,;:-")
     return t[:100]
 
@@ -67,6 +59,14 @@ async def cmd_award(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw_title = m.group(1)
     stars = int(m.group(2))
 
+    # Резолвим цель по всему тексту команды, чтобы @user можно было
+    # ставить и перед названием, и в названии.
+    target = await utils.resolve_target(update, context, msg.text or "")
+    if not target:
+        await msg.reply_text("Укажите @username или сделайте реплай.")
+        return
+    uid, name = target
+
     title = _clean_title(raw_title)
     if not title:
         await msg.reply_text("Не понял название награды.")
@@ -75,15 +75,10 @@ async def cmd_award(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     max_stars = 10 if is_admin else 6
     if stars < 1 or stars > max_stars:
         await msg.reply_text(
-            f"⛔ Звёзды: от 1 до {max_stars} (для {'админа' if is_admin else 'комиссара'})."
+            f"⛔ Звёзды: от 1 до {max_stars} "
+            f"(для {'админа' if is_admin else 'комиссара'})."
         )
         return
-
-    target = await utils.resolve_target(update, context, raw_title)
-    if not target:
-        await msg.reply_text("Укажите @username или сделайте реплай.")
-        return
-    uid, name = target
 
     if ADMIN_ID and uid == ADMIN_ID:
         await msg.reply_text("Админу награды не выдаются.")
@@ -126,16 +121,16 @@ async def cmd_unaward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    title = _clean_title(m.group(1))
-    if not title:
-        await msg.reply_text("Не понял название награды.")
-        return
-
     target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
+
+    title = _clean_title(m.group(1))
+    if not title:
+        await msg.reply_text("Не понял название награды.")
+        return
 
     removed = await db.remove_award_by_title(chat.id, uid, title)
     if removed == 0:
