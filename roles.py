@@ -1,23 +1,15 @@
-"""Роли (Шериф/Комиссар), муты, баны, «Поймать».
-
-- +Мут понимает короткие формы времени: 5с, 5м, 5ч, 5ч 3с, 1ч 30м.
-- +Мут принимает причину: `+Мут 5ч Богохульство` или `+Мут @user 5ч Богохульство`.
-- В БД (punishments) причина не пишется — таблица не имеет поля reason
-  (совместимость со схемой). Причина только в сообщении.
-"""
+"""Роли (Шериф/Комиссар), муты, баны, «Поймать»."""
 import os
 import re
 import time
 import logging
 from html import escape
-from typing import Optional
 
 from telegram import (
     Update,
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -196,11 +188,15 @@ async def catch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.answer("Только админ.", show_alert=True)
         return
     await q.answer()
-    parts = q.data.split(":")
+    parts = (q.data or "").split(":")
     if len(parts) != 4 or parts[0] != "catch":
         return
     _, action, uid_s, chat_s = parts
-    uid, chat_id = int(uid_s), int(chat_s)
+    try:
+        uid, chat_id = int(uid_s), int(chat_s)
+    except ValueError:
+        await q.answer("Некорректные данные.", show_alert=True)
+        return
 
     if action == "reject":
         await q.edit_message_text(
@@ -234,20 +230,20 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = raw.split(maxsplit=1)
     rest = parts[1] if len(parts) > 1 else ""
 
-    # Сначала отделяем @username, чтобы парсер времени не съел лишнее.
+    # Отделяем @username, но время может быть и до, и после него.
     uname_m = USERNAME_RE.search(rest)
-    reason_part = rest
     if uname_m:
-        # Всё после @username — причина (там времени уже быть не должно).
-        reason_part = rest[uname_m.end():].strip()
-        time_part = rest[:uname_m.start()].strip()
+        before = rest[:uname_m.start()].strip()
+        after = rest[uname_m.end():].strip()
+        # Сначала пробуем время из after, потом из before.
+        seconds, time_rest = utils.parse_duration(after)
+        reason = (time_rest or "").strip() or None
+        if not seconds:
+            seconds, time_rest2 = utils.parse_duration(before)
+            reason = (time_rest2 or after or "").strip() or None
     else:
-        # Реплай: время и причина в самом хвосте команды.
-        time_part = rest
-
-    seconds, time_rest = utils.parse_duration(time_part)
-    # Если после времени остался текст — это причина.
-    reason = (time_rest or reason_part).strip() or None
+        seconds, time_rest = utils.parse_duration(rest)
+        reason = (time_rest or "").strip() or None
 
     if not seconds or seconds <= 0:
         await update.message.reply_text(
