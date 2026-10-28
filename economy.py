@@ -1,6 +1,6 @@
 """Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
 проценты в казну, дефолт (органический — процент, искусственный — всё),
-топ богачи."""
+топ богачи, раздача всем."""
 import os
 import re
 import logging
@@ -31,11 +31,9 @@ TAX_MIN_BALANCE = 50
 TAX_ACTIVE_DAYS = 1
 TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
-# Органический дефолт: раз в N часов, когда казна пуста, забирает PCT% балансов.
 DEFAULT_COOLDOWN_HOURS = 6
 DEFAULT_PCT = 40
 
-# Искусственный дефолт по команде админа забирает 100% балансов.
 FORCE_DEFAULT_CMD = "Defloult220099"
 
 TZ = timezone.utc
@@ -608,14 +606,9 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-# ---------- Сбор балансов (общая функция) ----------
+# ---------- Сбор балансов ----------
 
 async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
-    """Списывает pct% от баланса каждого юзера (balance > 0) в казну.
-
-    pct=100 → экстремальный дефолт (обнуляет всех).
-    Возвращает (собрано_всего, затронуто_юзеров).
-    """
     if pct <= 0:
         return 0, 0
     if pct > 100:
@@ -633,7 +626,6 @@ async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
         return 0, 0
 
     if pct == 100:
-        # Экстремальный: обнуляем всё.
         rs2 = await db._exec(
             "UPDATE users SET balance = 0 WHERE balance > 0",
         )
@@ -669,13 +661,6 @@ async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
 # ---------- Дефолт ----------
 
 async def _run_default(context, chat_id: int, force: bool = False) -> bool:
-    """Запускает дефолт.
-
-    force=False — органический: только если казна пуста и cooldown прошёл,
-                  забирает DEFAULT_PCT% балансов.
-    force=True  — искусственный: игнорирует cooldown и пустоту казны,
-                  забирает 100% балансов.
-    """
     if chat_id in _default_in_progress:
         logger.info("default: уже выполняется для chat=%s, skip", chat_id)
         return False
@@ -761,13 +746,9 @@ async def default_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _run_default(context, chat_id, force=False)
 
 
-# ---------- Искусственный дефолт по команде админа ----------
+# ---------- Искусственный дефолт ----------
 
 async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/Defloult220099` — админ запускает экстремальный дефолт.
-
-    Бот удаляет команду из чата и обнуляет все балансы.
-    """
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -794,6 +775,100 @@ async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         except TelegramError:
             pass
+
+
+# ---------- /ALLMONEY — раздача всем ----------
+
+async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/ALLMONEY 100` — начисляет ВСЕМ юзерам в БД по 100 монет.
+
+    Не списывается из казны (mint). Бот удаляет команду из чата.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+
+    text = msg.text or ""
+    m = re.search(r"(?i)^/?ALLMONEY\s+(\d+)\s*$", text.strip())
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>/ALLMONEY 100</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+    if amount > 1_000_000:
+        await msg.reply_text("⛔ Слишком большая сумма (макс. 1 000 000).")
+        return
+
+    try:
+        await msg.delete()
+    except TelegramError as e:
+        logger.info("cmd_all_money: не удалось удалить команду: %s", e)
+
+    try:
+        rs = await db._exec(
+            "SELECT COUNT(*) FROM users",
+        )
+        total_users = (rs.rows[0][0] if rs.rows else 0) or 0
+    except Exception as e:
+        logger.warning("cmd_all_money count: %s", e)
+        total_users = 0
+
+    if total_users == 0:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⚠️ В БД нет ни одного юзера — раздавать некому.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        rs2 = await db._exec(
+            "UPDATE users SET balance = COALESCE(balance, 10) + ?",
+            [amount],
+        )
+    except Exception as e:
+        logger.exception("cmd_all_money update: %s", e)
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⚠️ Не удалось начислить монеты. Ошибка БД.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if getattr(rs2, "error", False):
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⚠️ Не удалось начислить монеты. Ошибка БД.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_minted = amount * total_users
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "⚠️ <b>ВНИМАНИЕ — РАЗДАЧА</b> ⚠️\n\n"
+                "💰 <b>ВСЕМ НАЧИСЛЕНО</b>\n"
+                f"По <b>{amount}</b> монет каждому юзеру в БД.\n"
+                f"Затронуто: <b>{total_users}</b> юзеров.\n"
+                f"Всего начислено: <b>{total_minted}</b> монет."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("cmd_all_money send: %s", e)
 
 
 # ---------- Налог ----------
@@ -841,7 +916,7 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("tax_job send: %s", e)
 
 
-# ---------- Проценты по кредиту — в казну ----------
+# ---------- Проценты по кредиту ----------
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(os.getenv("CHAT_ID", "0") or "0")
