@@ -40,6 +40,14 @@ async def _is_staff(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     return role in ("sheriff", "commissar")
 
 
+async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
+    try:
+        chat = await context.bot.get_chat(uid)
+        return bool(getattr(chat, "is_bot", False))
+    except TelegramError:
+        return False
+
+
 async def _check_and_ban_if_needed(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, name: str,
 ) -> bool:
@@ -49,7 +57,7 @@ async def _check_and_ban_if_needed(
     try:
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
     except TelegramError as e:
-        logger.warning("auto-ban after warnings: %s", e)
+        logger.error("auto-ban after warnings failed: %s", e)
         return False
     await db.add_punishment(user_id, chat_id, "ban", None, ADMIN_ID)
     await db.deactivate_warnings(chat_id, user_id)
@@ -94,6 +102,9 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if await _is_staff(context, uid):
         await msg.reply_text("Нельзя выдать предупреждение сотруднику.")
+        return
+    if await _is_bot(context, uid):
+        await msg.reply_text("Ботам предупреждение выдать нельзя 🤖")
         return
 
     raw = (msg.text or "").strip()
