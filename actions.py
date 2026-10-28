@@ -3,13 +3,13 @@
 Все команды доступны всем участникам, работают по @username или реплаю.
 """
 import logging
+import random
 from html import escape
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-import db
 import utils
 
 logger = logging.getLogger(__name__)
@@ -53,9 +53,7 @@ async def _do_action(
 
     target = await utils.resolve_target(update, context, msg.text or "")
     if not target:
-        await msg.reply_text(
-            "Укажите @username или сделайте реплай.",
-        )
+        await msg.reply_text("Укажите @username или сделайте реплай.")
         return
     uid, name = target
 
@@ -64,7 +62,7 @@ async def _do_action(
         return
 
     a = user.first_name or user.username or str(user.id)
-    template = _TEMPLATES[kind][0]
+    template = random.choice(_TEMPLATES[kind])
     text = template.format(a=escape(a), b=escape(name))
 
     await msg.reply_text(text, parse_mode=ParseMode.HTML)
