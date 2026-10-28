@@ -1,5 +1,5 @@
 """Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
-проценты в казну, дефолт, топ богачи."""
+проценты в казну, дефолт (обнуление всех балансов), топ богачи."""
 import os
 import re
 import logging
@@ -33,8 +33,6 @@ TAX_MIN_BALANCE = 50
 TAX_ACTIVE_DAYS = 1
 TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
-DEFAULT_MIN_BALANCE = 100
-DEFAULT_PCT = 10
 DEFAULT_COOLDOWN_HOURS = 24
 
 TZ = timezone.utc
@@ -604,19 +602,22 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------- Дефолт ----------
 
 async def _run_default(context, chat_id: int) -> bool:
+    logger.info("default: start chat=%s", chat_id)
     last = await db.get_last_default(chat_id)
+    logger.info("default: last=%s", last)
     if last:
         try:
             last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
             if (datetime.now(TZ) - last_dt) < timedelta(hours=DEFAULT_COOLDOWN_HOURS):
+                logger.info("default: cooldown, skip")
                 return False
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("default: parse last: %s", e)
 
-    total = await db.treasury_default_collect(
-        chat_id, DEFAULT_MIN_BALANCE, DEFAULT_PCT,
-    )
+    total = await db.treasury_default_collect(chat_id)
+    logger.info("default: collected=%s", total)
     if total <= 0:
+        logger.info("default: собирать нечего")
         return False
 
     await db.treasury_add(chat_id, total)
@@ -627,8 +628,8 @@ async def _run_default(context, chat_id: int) -> bool:
             chat_id=chat_id,
             text=(
                 f"🏦 <b>ДЕФОЛТ</b>\n"
-                f"Казна пуста. Собираем <b>{DEFAULT_PCT}%</b> с баланса > {DEFAULT_MIN_BALANCE}.\n"
-                f"Собрано: <b>{total}</b> монет в казну.\n"
+                f"Казна пуста. Все балансы обнулены.\n"
+                f"Собрано в казну: <b>{total}</b> монет.\n"
                 f"<i>Зарплата и кредиты возобновятся, когда казна пополнится.</i>"
             ),
             parse_mode=ParseMode.HTML,
@@ -645,6 +646,7 @@ async def _check_default_after(context, chat_id: int) -> None:
     except Exception as e:
         logger.warning("_check_default_after: %s", e)
         return
+    logger.info("_check_default_after: bal=%s", bal)
     if bal > 0:
         return
     await _run_default(context, chat_id)
