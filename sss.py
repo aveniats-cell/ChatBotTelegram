@@ -1,4 +1,11 @@
-"""ССС и суды."""
+"""ССС и суды.
+
+Исправления:
+  - при финализации суда исходное сообщение редактируется (кнопки убираются);
+  - callback на завершённый суд отвечает «Этот суд уже завершён», а не «не найден»;
+  - нельзя запустить второй активный суд против того же человека в том же чате;
+  - поддержка причины: "+Суд ССС @user / Причина" и "+Суд @user / Причина".
+"""
 import os
 import re
 import uuid
@@ -45,6 +52,35 @@ def _sss_all() -> set[int]:
 
 def is_sss_member(user_id: int) -> bool:
     return user_id in _sss_all()
+
+
+def _split_reason(text: str, triggers: str) -> tuple[str, Optional[str]]:
+    """Разделяет "команда @user / причина" на (часть_с_целью, причина).
+
+    triggers — regexp триггеров команды (например, r"\\+Суд\\s+ССС|\\+Суд").
+    Возвращает (target_part, reason|None).
+    """
+    s = (text or "").strip()
+    # отрезаем саму команду
+    s = re.sub(rf"(?i)^(?:{triggers})\s*", "", s).strip()
+    # причина после "/"
+    reason: Optional[str] = None
+    if "/" in s:
+        head, tail = s.split("/", 1)
+        s = head.strip()
+        reason = tail.strip() or None
+    return s, reason
+
+
+def _active_trial_for(chat_id: int, target_id: int) -> Optional[dict]:
+    """Ищет активный суд (ССС или публичный) против target_id в chat_id."""
+    for t in SSS_TRIALS.values():
+        if t["chat_id"] == chat_id and t["target_id"] == target_id:
+            return t
+    for t in PUBLIC_TRIALS.values():
+        if t["chat_id"] == chat_id and t["target_id"] == target_id and not t.get("finalized"):
+            return t
+    return None
 
 
 async def restore_sss_members() -> None:
@@ -165,42 +201,55 @@ async def cmd_sss_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("⛔ Только участники ССС.")
         return
 
-    target = await utils.resolve_target(update, context, msg.text or "")
+    target_part, reason = _split_reason(msg.text or "", r"\+Суд\s+ССС")
+    # resolve_target берёт из реплая, если target_part пуст
+    target = await utils.resolve_target(update, context, target_part)
     if not target:
-        await msg.reply_text("Укажите @username или сделайте реплай.")
+        await msg.reply_text(
+            "Укажите @username или сделайте реплай.\n"
+            "Причину можно добавить через <code>/</code>:\n"
+            "<code>+Суд ССС @user / Причина</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     uid, name = target
     if uid == ADMIN_ID:
         await msg.reply_text("Админа судить нельзя.")
         return
 
+    if _active_trial_for(chat.id, uid) is not None:
+        await msg.reply_text(
+            f"⚠️ Против {escape(name)} уже идёт суд. "
+            f"Дождитесь его итога или начните позже.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     trial_id = uuid.uuid4().hex[:10]
+    sent = await msg.reply_text(
+        _format_sss_trial_message(
+            user_name=user.first_name or user.username or str(user.id),
+            target_name=name,
+            target_id=uid,
+            reason=reason,
+            members_count=len(_sss_all()),
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_sss_trial_kb(trial_id),
+    )
+
     SSS_TRIALS[trial_id] = {
         "chat_id": chat.id,
         "target_id": uid,
         "target_name": name,
+        "reason": reason,
         "votes": {},
         "voters": set(),
         "by_user_id": user.id,
         "by_name": user.first_name or user.username or str(user.id),
+        "message_id": sent.message_id,
+        "finalized": False,
     }
-
-    members = _sss_all()
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Забанить", callback_data=f"ssstrial:yes:{trial_id}"),
-        InlineKeyboardButton("❌ Оставить", callback_data=f"ssstrial:no:{trial_id}"),
-    ]])
-    await msg.reply_text(
-        f"⚖️ <b>Суд ССС</b>\n"
-        f"Инициатор: {escape(user.first_name or str(user.id))}\n"
-        f"Подсудимый: {escape(name)} (id <code>{uid}</code>)\n\n"
-        f"Голосуют <b>только участники ССС</b>.\n"
-        f"Если хоть один против — бан не выдаётся.\n"
-        f"Участников: <b>{len(members)}</b>\n"
-        f"<i>Таймаут: {SSS_TRIAL_TIMEOUT_SEC // 60} мин.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
 
     if context.job_queue:
         context.job_queue.run_once(
@@ -210,46 +259,80 @@ async def cmd_sss_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+def _sss_trial_kb(trial_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Забанить", callback_data=f"ssstrial:yes:{trial_id}"),
+        InlineKeyboardButton("❌ Оставить", callback_data=f"ssstrial:no:{trial_id}"),
+    ]])
+
+
+def _format_sss_trial_message(
+    user_name: str, target_name: str, target_id: int,
+    reason: Optional[str], members_count: int,
+) -> str:
+    reason_line = f"\nПричина: {escape(reason)}" if reason else ""
+    return (
+        f"⚖️ <b>Суд ССС</b>\n"
+        f"Инициатор: {escape(user_name)}\n"
+        f"Подсудимый: {escape(target_name)} (id <code>{target_id}</code>)"
+        f"{reason_line}\n\n"
+        f"Голосуют <b>только участники ССС</b>.\n"
+        f"Если хоть один против — бан не выдаётся.\n"
+        f"Участников: <b>{members_count}</b>\n"
+        f"<i>Таймаут: {SSS_TRIAL_TIMEOUT_SEC // 60} мин.</i>"
+    )
+
+
+async def _edit_trial_message(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int],
+    text: str, remove_kb: bool = True,
+) -> None:
+    if not message_id:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=None if remove_kb else None,
+        )
+    except TelegramError as e:
+        logger.warning("edit trial message: %s", e)
+
+
 async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str,
                               force: bool = False) -> None:
     t = SSS_TRIALS.get(trial_id)
-    if not t:
+    if not t or t.get("finalized"):
         return
     members = _sss_all()
     if not force and not members.issubset(t["voters"]):
         return
 
+    t["finalized"] = True
     any_no = any(v == "no" for v in t["votes"].values())
-    SSS_TRIALS.pop(trial_id, None)
+    reason_line = f"\nПричина: {escape(t['reason'])}" if t.get("reason") else ""
 
+    # финализация: убираем кнопки у исходного сообщения
     if any_no:
-        try:
-            await context.bot.send_message(
-                chat_id=t["chat_id"],
-                text=(
-                    f"⚖️ <b>Суд ССС завершён</b>\n"
-                    f"Подсудимый: {escape(t['target_name'])}\n"
-                    f"Решение: ❌ <b>Оставить</b> (кто-то проголосовал против)."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e:
-            logger.warning("sss trial finalize: %s", e)
+        final_text = (
+            f"⚖️ <b>Суд ССС завершён</b>\n"
+            f"Подсудимый: {escape(t['target_name'])}{reason_line}\n"
+            f"Решение: ❌ <b>Оставить</b> (кто-то проголосовал против)."
+        )
+        await _edit_trial_message(context, t["chat_id"], t.get("message_id"), final_text)
+        SSS_TRIALS.pop(trial_id, None)
         return
 
     if force and not any(v == "yes" for v in t["votes"].values()):
-        try:
-            await context.bot.send_message(
-                chat_id=t["chat_id"],
-                text=(
-                    f"⚖️ <b>Суд ССС завершён</b>\n"
-                    f"Подсудимый: {escape(t['target_name'])}\n"
-                    f"Решение: ⏳ <b>Недостаточно голосов</b> — оставить."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e:
-            logger.warning("sss trial timeout: %s", e)
+        final_text = (
+            f"⚖️ <b>Суд ССС завершён</b>\n"
+            f"Подсудимый: {escape(t['target_name'])}{reason_line}\n"
+            f"Решение: ⏳ <b>Недостаточно голосов</b> — оставить."
+        )
+        await _edit_trial_message(context, t["chat_id"], t.get("message_id"), final_text)
+        SSS_TRIALS.pop(trial_id, None)
         return
 
     try:
@@ -261,29 +344,23 @@ async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str,
         )
     except TelegramError as e:
         logger.warning("sss ban: %s", e)
-        try:
-            await context.bot.send_message(
-                chat_id=t["chat_id"],
-                text=f"⚠️ Суд решил забанить, но Telegram не дал: {escape(str(e))}",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
+        final_text = (
+            f"⚖️ <b>Суд ССС завершён</b>\n"
+            f"Подсудимый: {escape(t['target_name'])}{reason_line}\n"
+            f"Решение: ✅ <b>Забанить</b>, но Telegram не дал: {escape(str(e))}"
+        )
+        await _edit_trial_message(context, t["chat_id"], t.get("message_id"), final_text)
+        SSS_TRIALS.pop(trial_id, None)
         return
 
-    try:
-        await context.bot.send_message(
-            chat_id=t["chat_id"],
-            text=(
-                f"⚖️ <b>Суд ССС завершён</b>\n"
-                f"Подсудимый: {escape(t['target_name'])}\n"
-                f"Решение: ✅ <b>Забанен</b>"
-                f"{'' if not force else ' (по таймауту)'}."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError as e:
-        logger.warning("sss trial finalize msg: %s", e)
+    final_text = (
+        f"⚖️ <b>Суд ССС завершён</b>\n"
+        f"Подсудимый: {escape(t['target_name'])}{reason_line}\n"
+        f"Решение: ✅ <b>Забанен</b>"
+        f"{'' if not force else ' (по таймауту)'}."
+    )
+    await _edit_trial_message(context, t["chat_id"], t.get("message_id"), final_text)
+    SSS_TRIALS.pop(trial_id, None)
 
 
 async def sss_trial_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,13 +383,16 @@ async def sss_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _, vote, trial_id = parts
     t = SSS_TRIALS.get(trial_id)
     if not t:
-        await q.answer("Суд не найден.", show_alert=True)
+        await q.answer("Этот суд уже завершён.", show_alert=True)
+        return
+    if t.get("finalized"):
+        await q.answer("Голосование уже закрыто.", show_alert=True)
         return
     if user.id not in _sss_all():
         await q.answer("Только ССС.", show_alert=True)
         return
     if user.id in t["voters"]:
-        await q.answer("Вы уже голосовали.", show_alert=True)
+        await q.answer("Вы уже голосовали в этом суде.", show_alert=True)
         return
 
     t["voters"].add(user.id)
@@ -328,41 +408,55 @@ async def cmd_public_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user or not msg or not chat:
         return
 
-    target = await utils.resolve_target(update, context, msg.text or "")
+    target_part, reason = _split_reason(msg.text or "", r"\+Суд")
+    target = await utils.resolve_target(update, context, target_part)
     if not target:
-        await msg.reply_text("Укажите @username или сделайте реплай.")
+        await msg.reply_text(
+            "Укажите @username или сделайте реплай.\n"
+            "Причину можно добавить через <code>/</code>:\n"
+            "<code>+Суд @user / Причина</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     uid, name = target
     if uid == ADMIN_ID:
         await msg.reply_text("Админа судить нельзя.")
         return
 
+    if _active_trial_for(chat.id, uid) is not None:
+        await msg.reply_text(
+            f"⚠️ Против {escape(name)} уже идёт суд. "
+            f"Дождитесь его итога или начните позже.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     trial_id = uuid.uuid4().hex[:10]
+    sent = await msg.reply_text(
+        _format_public_trial_message(
+            user_name=user.first_name or user.username or str(user.id),
+            target_name=name,
+            target_id=uid,
+            reason=reason,
+            yes=0, no=0,
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_public_trial_kb(trial_id),
+    )
+
     PUBLIC_TRIALS[trial_id] = {
         "chat_id": chat.id,
         "target_id": uid,
         "target_name": name,
+        "reason": reason,
         "yes": 0,
         "no": 0,
         "voters": set(),
         "by_user_id": user.id,
         "by_name": user.first_name or user.username or str(user.id),
         "finalized": False,
+        "message_id": sent.message_id,
     }
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Забанить", callback_data=f"pubtrial:yes:{trial_id}"),
-        InlineKeyboardButton("❌ Оставить", callback_data=f"pubtrial:no:{trial_id}"),
-    ]])
-    await msg.reply_text(
-        f"⚖️ <b>Суд</b>\n"
-        f"Инициатор: {escape(user.first_name or str(user.id))}\n"
-        f"Подсудимый: {escape(name)} (id <code>{uid}</code>)\n\n"
-        f"Голосовать может любой. Итог — большинством.\n"
-        f"<i>Решение уйдёт на утверждение админу.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
 
     if context.job_queue:
         context.job_queue.run_once(
@@ -370,6 +464,28 @@ async def cmd_public_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             when=PUBLIC_TRIAL_TIMEOUT_SEC,
             data=trial_id,
         )
+
+
+def _public_trial_kb(trial_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Забанить", callback_data=f"pubtrial:yes:{trial_id}"),
+        InlineKeyboardButton("❌ Оставить", callback_data=f"pubtrial:no:{trial_id}"),
+    ]])
+
+
+def _format_public_trial_message(
+    user_name: str, target_name: str, target_id: int,
+    reason: Optional[str], yes: int, no: int,
+) -> str:
+    reason_line = f"\nПричина: {escape(reason)}" if reason else ""
+    return (
+        f"⚖️ <b>Суд</b>\n"
+        f"Инициатор: {escape(user_name)}\n"
+        f"Подсудимый: {escape(target_name)} (id <code>{target_id}</code>)"
+        f"{reason_line}\n\n"
+        f"✅ За: <b>{yes}</b> | ❌ Против: <b>{no}</b>\n"
+        f"Голосов: <b>{yes + no}</b>"
+    )
 
 
 async def public_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -384,7 +500,7 @@ async def public_trial_callback(update: Update, context: ContextTypes.DEFAULT_TY
     _, vote, trial_id = parts
     t = PUBLIC_TRIALS.get(trial_id)
     if not t:
-        await q.answer("Суд не найден.", show_alert=True)
+        await q.answer("Этот суд уже завершён.", show_alert=True)
         return
     if t.get("finalized"):
         await q.answer("Голосование уже закрыто.", show_alert=True)
@@ -393,7 +509,7 @@ async def public_trial_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await q.answer("Подсудимый не голосует.", show_alert=True)
         return
     if user.id in t["voters"]:
-        await q.answer("Вы уже голосовали.", show_alert=True)
+        await q.answer("Вы уже голосовали в этом суде.", show_alert=True)
         return
 
     t["voters"].add(user.id)
@@ -406,10 +522,13 @@ async def public_trial_callback(update: Update, context: ContextTypes.DEFAULT_TY
     yes, no = t["yes"], t["no"]
     try:
         await q.edit_message_text(
-            f"⚖️ <b>Суд</b>\n"
-            f"Подсудимый: {escape(t['target_name'])} (id <code>{t['target_id']}</code>)\n\n"
-            f"✅ За: <b>{yes}</b> | ❌ Против: <b>{no}</b>\n"
-            f"Голосов: <b>{yes + no}</b>",
+            _format_public_trial_message(
+                user_name=t["by_name"],
+                target_name=t["target_name"],
+                target_id=t["target_id"],
+                reason=t.get("reason"),
+                yes=yes, no=no,
+            ),
             parse_mode=ParseMode.HTML,
             reply_markup=q.message.reply_markup,
         )
@@ -436,12 +555,23 @@ async def _send_public_trial_to_admin(
         return
     t["finalized"] = True
 
+    # редактируем исходное сообщение — убираем кнопки голосования
+    final_text = (
+        f"⚖️ <b>Суд завершён</b>\n"
+        f"Подсудимый: {escape(t['target_name'])} (id <code>{t['target_id']}</code>)"
+        + (f"\nПричина: {escape(t['reason'])}" if t.get('reason') else "")
+        + f"\nГолоса: ✅ {t['yes']} / ❌ {t['no']}\n"
+        f"<i>Итог ушёл на утверждение админу.</i>"
+    )
+    await _edit_trial_message(context, t["chat_id"], t.get("message_id"), final_text)
+
     verdict_ban = t["yes"] > t["no"]
     text = (
         f"⚖️ <b>Итог суда</b>\n"
         f"Чат: <code>{t['chat_id']}</code>\n"
         f"Подсудимый: {escape(t['target_name'])} (id <code>{t['target_id']}</code>)\n"
-        f"Голоса: ✅ {t['yes']} / ❌ {t['no']}\n"
+        + (f"Причина: {escape(t['reason'])}\n" if t.get('reason') else "")
+        + f"Голоса: ✅ {t['yes']} / ❌ {t['no']}\n"
         f"Инициатор: {escape(t['by_name'])}\n\n"
         f"Решение большинства: <b>{'ЗАБАНИТЬ' if verdict_ban else 'ОСТАВИТЬ'}</b>"
     )
