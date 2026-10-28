@@ -115,7 +115,6 @@ async def _run_ai(user, msg, prompt: str) -> None:
 
 
 async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ИИ / Браини / Мозг / Brainy <запрос> ИЛИ реплай на сообщение бота."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -176,6 +175,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Монеты 100 @user / -Монеты 100 @user (админ)\n"
         "• Перевод 50 @user — комиссия 3%\n"
         "• Казна — баланс казны чата (админ)\n"
+        "• +ВКассу 500 — пополнить казну (админ)\n"
+        "• Зарплата — сколько начислено за сегодня\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
         "• дроч / Аура / Топ аура — аурометр\n"
@@ -263,6 +264,8 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Монеты(\s|$)"), economy.cmd_admin_coins_minus))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Перевод(\s|$)"), economy.cmd_transfer))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Казна(\s|$)"), economy.cmd_treasury))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ВКассу(\s|$)"), economy.cmd_treasury_add))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Зарплата(\s|$)"), economy.cmd_salary))
 
     # Казино
     app.add_handler(MessageHandler(
