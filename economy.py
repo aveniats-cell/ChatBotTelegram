@@ -30,7 +30,7 @@ TAX_MIN_BALANCE = 50
 TAX_ACTIVE_DAYS = 1
 TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
-DEFAULT_COOLDOWN_HOURS = 24
+DEFAULT_COOLDOWN_HOURS = 6
 
 TZ = timezone.utc
 
@@ -128,7 +128,6 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     amount = _num_after(msg.text or "", "-Кредит")
     if amount is None:
-        # Для «-Кредит» с дефисом regex может не сработать, пробуем вручную.
         m = re.search(r"(?i)Кредит\s+(\d+)", msg.text or "")
         amount = int(m.group(1)) if m else None
     if amount is None:
@@ -743,5 +742,6 @@ def register_jobs(app) -> None:
         default_watchdog_job, interval=3600, first=60,
     )
     logger.info(
-        "economy: проценты (00:10), налог (00:40), дефолт-watchdog (раз в час) запланированы"
+        "economy: проценты (00:10), налог (00:40), дефолт-watchdog (раз в час), "
+        "cooldown дефолта %sч запланированы", DEFAULT_COOLDOWN_HOURS,
     )
