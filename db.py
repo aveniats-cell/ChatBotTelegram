@@ -374,7 +374,9 @@ async def add_balance(user_id: int, delta: int) -> bool:
     if (getattr(rs, "rows_affected", 0) or 0) == 0:
         rs2 = await _exec(
             """INSERT INTO users (user_id, balance)
-               VALUES (?, 10 + ?)""",
+               VALUES (?, 10 + ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 balance = COALESCE(users.balance, 10) + excluded.balance - 10""",
             [user_id, delta],
         )
         if getattr(rs2, "error", False):
@@ -562,16 +564,13 @@ async def treasury_trim(chat_id: int, keep: int) -> int:
     return burned
 
 
-async def treasury_default_collect(
-    chat_id: int, min_balance: int = 0, pct: int = 100,
-) -> int:
-    """Дефолт: обнуляет балансы у ВСЕХ юзеров (balance > 0), возвращает
-    реально списанное (а не насчитанное).
+async def treasury_default_collect(chat_id: int) -> int:
+    """Обнуляет глобальные балансы всех юзеров (balance > 0).
 
-    Параметры min_balance/pct оставлены для совместимости с вызовом,
-    но игнорируются: списывается весь баланс.
+    ВНИМАНИЕ: баланс в таблице users глобальный, а не по чатам.
+    Поэтому дефолт в одном чате обнулит балансы во всех чатах.
+    Возвращает реально списанное.
     """
-    # 1) Считаем, сколько всего денег у юзеров
     rs = await _exec(
         "SELECT COALESCE(SUM(balance), 0) FROM users WHERE balance > 0",
     )
@@ -579,17 +578,13 @@ async def treasury_default_collect(
     if total_before <= 0:
         return 0
 
-    # 2) Обнуляем
-    rs2 = await _exec(
-        "UPDATE users SET balance = 0 WHERE balance > 0",
-    )
+    rs2 = await _exec("UPDATE users SET balance = 0 WHERE balance > 0")
     if getattr(rs2, "error", False):
         logger.error(
             "treasury_default_collect: UPDATE failed, казна не пополнена",
         )
         return 0
 
-    # 3) Сверяем, что реально обнулилось
     rs3 = await _exec(
         "SELECT COALESCE(SUM(balance), 0) FROM users WHERE balance > 0",
     )
@@ -1576,7 +1571,7 @@ async def count_awards(chat_id: int, user_id: int) -> int:
     return rs.rows[0][0] or 0
 
 
-# ---------- avatar (функции остаются, но main.py их не вызывает) ----------
+# ---------- avatar ----------
 
 async def set_avatar(user_id: int, file_id: Optional[str]) -> bool:
     rs = await _exec(
