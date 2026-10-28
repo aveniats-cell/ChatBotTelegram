@@ -70,7 +70,7 @@ async def _exec(
             return _EmptyResult(error=True)
 
     if last_exc is not None:
-        logger.error("db exec failed (sql: %.80s): %s", sql, last_exc)
+        logger.warning("db exec failed (sql: %.80s): %s", sql, last_exc)
     return _EmptyResult(error=True)
 
 
@@ -136,6 +136,12 @@ async def _create_tables() -> None:
             day       TEXT NOT NULL,
             count     INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (chat_id, user_id, day)
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS messages_idempotency (
+            key        TEXT PRIMARY KEY,
+            applied_at TEXT DEFAULT (datetime('now'))
         )
     """)
     await _exec("""
@@ -553,6 +559,93 @@ async def inc_message(chat_id: int, user_id: int) -> None:
     )
 
 
+async def inc_message_by(chat_id: int, user_id: int, delta: int) -> None:
+    if delta <= 0:
+        return
+    await _exec(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, delta],
+    )
+
+
+async def inc_message_day_by(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta <= 0:
+        return
+    await _exec(
+        """INSERT INTO messages_day (chat_id, user_id, day, count)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, day, delta],
+    )
+
+
+async def inc_message_batch_idempotent(
+    chat_id: int, user_id: int, day: str, delta: int, key: str,
+) -> bool:
+    """Идемпотентный батч-инкремент для messages + messages_day.
+
+    Сначала вставляет ключ идемпотентности. Если ключ уже есть — ничего
+    не делает (значит, батч уже применён, повторный вызов безопасен).
+    Затем инкрементит обе таблицы.
+    Возвращает True, если всё применилось (или уже было применено),
+    False — при сетевой/БД ошибке (тогда можно безопасно ретраить,
+    так как ключ идемпотентности защитит от двойного применения).
+    """
+    if delta <= 0:
+        return True
+
+    # 1) Застолбить ключ. INSERT OR IGNORE — если ключ уже есть, ничего.
+    rs = await _exec(
+        "INSERT OR IGNORE INTO messages_idempotency (key) VALUES (?)",
+        [key],
+    )
+    if getattr(rs, "error", False):
+        return False
+
+    # 2) Проверить, был ли ключ вставлен именно сейчас.
+    #    rows_affected == 0 → уже был (значит, инкремент уже применён ранее).
+    inserted_now = (getattr(rs, "rows_affected", 0) or 0) > 0
+    if not inserted_now:
+        return True
+
+    # 3) Инкремент messages
+    rs1 = await _exec(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, delta],
+    )
+    if getattr(rs1, "error", False):
+        # ключ вставлен, но инкремент не прошёл.
+        # Удаляем ключ, чтобы можно было безопасно ретраить.
+        await _exec("DELETE FROM messages_idempotency WHERE key = ?", [key])
+        return False
+
+    # 4) Инкремент messages_day
+    rs2 = await _exec(
+        """INSERT INTO messages_day (chat_id, user_id, day, count)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, day, delta],
+    )
+    if getattr(rs2, "error", False):
+        # messages уже инкрементнут, а day — нет. Это рассинхрон,
+        # но он маловероятен. Ключ оставляем, чтобы messages не удвоить.
+        # Счётчик дня потеряет delta — лучше, чем двойной счёт messages.
+        logger.warning(
+            "inc_message_batch_idempotent: messages_day failed (key=%s)", key,
+        )
+        return False
+
+    return True
+
+
 async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
     rs1 = await _exec(
         """INSERT INTO messages (chat_id, user_id, count)
@@ -826,7 +919,6 @@ async def count_warnings_total(chat_id: int, user_id: int) -> int:
 
 
 async def remove_last_active_warning(chat_id: int, user_id: int) -> int:
-    """Снимает (деактивирует) последнее активное предупреждение. Возвращает rows_affected."""
     rs = await _exec(
         """UPDATE warnings SET active = 0
            WHERE id = (
@@ -1018,7 +1110,6 @@ async def add_award(chat_id: int, user_id: int, title: str, stars: int,
 
 
 async def remove_award_by_title(chat_id: int, user_id: int, title: str) -> int:
-    """Удаляет одну самую свежую награду с таким названием. Возвращает rows_affected."""
     rs = await _exec(
         """DELETE FROM awards
            WHERE id = (
