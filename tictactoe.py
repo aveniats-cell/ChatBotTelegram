@@ -1,10 +1,4 @@
-"""Крестики-нолики 5×5 на монеты с комиссией 5% с банка.
-
-Эскроу: при accept атомарно списываем bet у обоих.
-Финал:
-- ничья: возврат по bet каждому (без комиссии);
-- победа: победитель получает bank - fee, fee = 5% от bank уходит в казну.
-"""
+"""Крестики-нолики 5×5 на монеты с комиссией 5% с банка."""
 import os
 import re
 import uuid
@@ -183,7 +177,9 @@ async def _finish_game(context: ContextTypes.DEFAULT_TYPE, game_id: str,
     p1, p2 = g["p1_id"], g["p2_id"]
 
     if not g.get("escrow_taken"):
-        logger.warning("finish_game: escrow не списан для %s", game_id)
+        logger.warning("finish_game: escrow не списан для %s — выплат не будет", game_id)
+        GAMES.pop(game_id, None)
+        return
 
     if winner_id is None:
         await db.add_balance(p1, bet)
@@ -335,6 +331,9 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             r, c = int(r_s), int(c_s)
         except ValueError:
             await q.answer()
+            return
+        if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+            await q.answer("Неверная клетка.", show_alert=True)
             return
         g = GAMES.get(game_id)
         if not g:
