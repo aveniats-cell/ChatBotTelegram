@@ -30,7 +30,12 @@ def _unit_to_sec(unit: str) -> int:
 
 
 def parse_duration(text: str) -> tuple[int, str]:
-    """'5с' -> (5,''), '5ч 3с' -> (18003,''), '5ч Богохульство' -> (18000,'Богохульство')."""
+    """'5с' -> (5,''), '5ч 3с' -> (18003,''), '5ч Богохульство' -> (18000,'Богохульство').
+
+    ВНИМАНИЕ: если в причине есть число + единица времени (например
+    «оскорблял 5 минут»), оно попадёт в длительность. Это осознанный
+    компромисс — иначе нельзя отличить «5ч» от «5 часов в причине».
+    """
     if not text:
         return 0, text
 
@@ -68,6 +73,16 @@ def fmt_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
+async def _name_for_uid(uid: int, fallback: str) -> str:
+    try:
+        row = await db.get_user(uid)
+        if row and row.get("first_name"):
+            return row["first_name"]
+    except Exception:
+        pass
+    return fallback
+
+
 async def resolve_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -88,7 +103,8 @@ async def resolve_target(
     try:
         uid = await db.get_user_by_username(uname)
         if uid:
-            return uid, uname
+            name = await _name_for_uid(uid, uname)
+            return uid, name
     except Exception as e:
         logger.warning("get_user_by_username(%s): %s", uname, e)
 
@@ -121,7 +137,8 @@ async def resolve_two(
         try:
             uid = await db.get_user_by_username(uname)
             if uid:
-                targets.append((uid, uname))
+                name = await _name_for_uid(uid, uname)
+                targets.append((uid, name))
                 continue
         except Exception as e:
             logger.warning("get_user_by_username(%s): %s", uname, e)
