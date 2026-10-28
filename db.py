@@ -145,6 +145,12 @@ async def _create_tables() -> None:
         )
     """)
     await _exec("""
+        CREATE TABLE IF NOT EXISTS treasury (
+            chat_id  INTEGER PRIMARY KEY,
+            balance  INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    await _exec("""
         CREATE TABLE IF NOT EXISTS marriages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id      INTEGER NOT NULL,
@@ -386,6 +392,31 @@ async def take_balance_atomic(user_id: int, amount: int) -> bool:
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
+async def take_balance_any(user_id: int, amount: int) -> int:
+    """Списывает до amount, но не больше баланса. Возвращает списанное."""
+    if amount <= 0:
+        return 0
+    rs = await _exec(
+        "SELECT COALESCE(balance, 10) FROM users WHERE user_id = ?", [user_id],
+    )
+    if not rs.rows:
+        return 0
+    bal = rs.rows[0][0] or 0
+    if bal <= 0:
+        return 0
+    take = min(amount, bal)
+    rs2 = await _exec(
+        """UPDATE users SET balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+        [take, user_id, take],
+    )
+    if getattr(rs2, "error", False):
+        return 0
+    if (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        return 0
+    return take
+
+
 async def add_credit(user_id: int, delta: int) -> None:
     await _exec(
         "UPDATE users SET credit = COALESCE(credit, 0) + ? WHERE user_id = ?",
@@ -458,6 +489,73 @@ async def apply_credit_interest(percent: float) -> int:
         [percent],
     )
     return getattr(rs, "rows_affected", 0) or 0
+
+
+# ---------- treasury ----------
+
+async def treasury_add(chat_id: int, amount: int) -> bool:
+    if amount == 0:
+        return True
+    rs = await _exec(
+        """INSERT INTO treasury (chat_id, balance)
+           VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET
+             balance = balance + excluded.balance""",
+        [chat_id, amount],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def treasury_get(chat_id: int) -> int:
+    rs = await _exec("SELECT balance FROM treasury WHERE chat_id = ?", [chat_id])
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def treasury_reset(chat_id: int) -> int:
+    rs = await _exec(
+        "UPDATE treasury SET balance = 0 WHERE chat_id = ?", [chat_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+# ---------- transfers ----------
+
+async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bool:
+    """Атомарный перевод: списать amount с from_id, начислить (amount-fee) to_id.
+
+    Комиссию fee вызывающий код кладёт в казну через treasury_add.
+    """
+    if amount <= 0 or to_id <= 0 or from_id == to_id:
+        return False
+    if fee < 0 or fee >= amount:
+        return False
+    net = amount - fee
+    rs1 = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+        [amount, from_id, amount],
+    )
+    if getattr(rs1, "error", False):
+        return False
+    if (getattr(rs1, "rows_affected", 0) or 0) == 0:
+        return False
+    rs2 = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) + ?
+           WHERE user_id = ?""",
+        [net, to_id],
+    )
+    if getattr(rs2, "error", False) or (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        await _exec(
+            """UPDATE users SET balance = COALESCE(balance, 10) + ?
+               WHERE user_id = ?""",
+            [amount, from_id],
+        )
+        return False
+    return True
 
 
 # ---------- subscriptions ----------
@@ -586,19 +684,9 @@ async def inc_message_day_by(chat_id: int, user_id: int, day: str, delta: int) -
 async def inc_message_batch_idempotent(
     chat_id: int, user_id: int, day: str, delta: int, key: str,
 ) -> bool:
-    """Идемпотентный батч-инкремент для messages + messages_day.
-
-    Сначала вставляет ключ идемпотентности. Если ключ уже есть — ничего
-    не делает (значит, батч уже применён, повторный вызов безопасен).
-    Затем инкрементит обе таблицы.
-    Возвращает True, если всё применилось (или уже было применено),
-    False — при сетевой/БД ошибке (тогда можно безопасно ретраить,
-    так как ключ идемпотентности защитит от двойного применения).
-    """
     if delta <= 0:
         return True
 
-    # 1) Застолбить ключ. INSERT OR IGNORE — если ключ уже есть, ничего.
     rs = await _exec(
         "INSERT OR IGNORE INTO messages_idempotency (key) VALUES (?)",
         [key],
@@ -606,13 +694,10 @@ async def inc_message_batch_idempotent(
     if getattr(rs, "error", False):
         return False
 
-    # 2) Проверить, был ли ключ вставлен именно сейчас.
-    #    rows_affected == 0 → уже был (значит, инкремент уже применён ранее).
     inserted_now = (getattr(rs, "rows_affected", 0) or 0) > 0
     if not inserted_now:
         return True
 
-    # 3) Инкремент messages
     rs1 = await _exec(
         """INSERT INTO messages (chat_id, user_id, count)
            VALUES (?, ?, ?)
@@ -621,12 +706,9 @@ async def inc_message_batch_idempotent(
         [chat_id, user_id, delta],
     )
     if getattr(rs1, "error", False):
-        # ключ вставлен, но инкремент не прошёл.
-        # Удаляем ключ, чтобы можно было безопасно ретраить.
         await _exec("DELETE FROM messages_idempotency WHERE key = ?", [key])
         return False
 
-    # 4) Инкремент messages_day
     rs2 = await _exec(
         """INSERT INTO messages_day (chat_id, user_id, day, count)
            VALUES (?, ?, ?, ?)
@@ -635,9 +717,6 @@ async def inc_message_batch_idempotent(
         [chat_id, user_id, day, delta],
     )
     if getattr(rs2, "error", False):
-        # messages уже инкрементнут, а day — нет. Это рассинхрон,
-        # но он маловероятен. Ключ оставляем, чтобы messages не удвоить.
-        # Счётчик дня потеряет delta — лучше, чем двойной счёт messages.
         logger.warning(
             "inc_message_batch_idempotent: messages_day failed (key=%s)", key,
         )
