@@ -1,6 +1,6 @@
 """Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
 проценты в казну, дефолт (органический — процент, искусственный — всё),
-топ богачи, раздача всем."""
+топ богачи, раздача всем (из казны)."""
 import os
 import re
 import logging
@@ -99,6 +99,8 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     treasury = await db.treasury_get(chat.id)
+    logger.info("credit_take: chat.id=%s env_CHAT_ID=%s before=%s amount=%s",
+                chat.id, os.getenv("CHAT_ID"), treasury, amount)
     if treasury < amount:
         await msg.reply_text(
             f"🏦 Банк пуст: в казне <b>{treasury}</b>, нужно <b>{amount}</b>.\n"
@@ -115,6 +117,7 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     new_row = await db.get_user(user.id)
     new_credit = (new_row or {}).get("credit") or amount
     new_treasury = await db.treasury_get(chat.id)
+    logger.info("credit_take: after=%s", new_treasury)
     await msg.reply_text(
         f"💳 Взят кредит из казны: <b>{amount}</b>\n"
         f"Долг: <b>{new_credit}</b>\n"
@@ -368,9 +371,12 @@ async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("⛔ Только админ.")
         return
     bal = await db.treasury_get(chat.id)
+    logger.info("cmd_treasury: chat.id=%s env_CHAT_ID=%s bal=%s",
+                chat.id, os.getenv("CHAT_ID"), bal)
     await msg.reply_text(
         f"🏦 <b>Казна чата</b>\n"
-        f"Накоплено: <b>{bal}</b> монет",
+        f"Накоплено: <b>{bal}</b> монет\n"
+        f"<i>chat_id: {chat.id}</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -777,13 +783,9 @@ async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             pass
 
 
-# ---------- /ALLMONEY — раздача всем ----------
+# ---------- /ALLMONEY — раздача всем ИЗ КАЗНЫ ----------
 
 async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/ALLMONEY 100` — начисляет ВСЕМ юзерам в БД по 100 монет.
-
-    Не списывается из казны (mint). Бот удаляет команду из чата.
-    """
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -816,9 +818,7 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.info("cmd_all_money: не удалось удалить команду: %s", e)
 
     try:
-        rs = await db._exec(
-            "SELECT COUNT(*) FROM users",
-        )
+        rs = await db._exec("SELECT COUNT(*) FROM users")
         total_users = (rs.rows[0][0] if rs.rows else 0) or 0
     except Exception as e:
         logger.warning("cmd_all_money count: %s", e)
@@ -832,6 +832,31 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    total_minted = amount * total_users
+    treasury_before = await db.treasury_get(chat.id)
+    logger.info("all_money: chat.id=%s env_CHAT_ID=%s before=%s need=%s users=%s",
+                chat.id, os.getenv("CHAT_ID"), treasury_before, total_minted, total_users)
+    if treasury_before < total_minted:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"⚠️ В казне недостаточно монет.\n"
+                f"Нужно: <b>{total_minted}</b>, в казне: <b>{treasury_before}</b>.\n"
+                f"<i>Пополни казну через +ВКассу или +Утил казна.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    ok = await db.treasury_withdraw(chat.id, total_minted)
+    if not ok:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⚠️ Не удалось списать из казны. Ошибка БД.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     try:
         rs2 = await db._exec(
             "UPDATE users SET balance = COALESCE(balance, 10) + ?",
@@ -839,22 +864,26 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     except Exception as e:
         logger.exception("cmd_all_money update: %s", e)
+        await db.treasury_add(chat.id, total_minted)
         await context.bot.send_message(
             chat_id=chat.id,
-            text="⚠️ Не удалось начислить монеты. Ошибка БД.",
+            text="⚠️ Не удалось начислить монеты. Ошибка БД. Деньги возвращены в казну.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if getattr(rs2, "error", False):
+        await db.treasury_add(chat.id, total_minted)
         await context.bot.send_message(
             chat_id=chat.id,
-            text="⚠️ Не удалось начислить монеты. Ошибка БД.",
+            text="⚠️ Не удалось начислить монеты. Ошибка БД. Деньги возвращены в казну.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    total_minted = amount * total_users
+    treasury_after = await db.treasury_get(chat.id)
+    logger.info("all_money: after=%s", treasury_after)
+
     try:
         await context.bot.send_message(
             chat_id=chat.id,
@@ -863,7 +892,8 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "💰 <b>ВСЕМ НАЧИСЛЕНО</b>\n"
                 f"По <b>{amount}</b> монет каждому юзеру в БД.\n"
                 f"Затронуто: <b>{total_users}</b> юзеров.\n"
-                f"Всего начислено: <b>{total_minted}</b> монет."
+                f"Списано из казны: <b>{total_minted}</b> монет.\n"
+                f"Казна: <b>{treasury_after}</b>"
             ),
             parse_mode=ParseMode.HTML,
         )
