@@ -1,7 +1,11 @@
-"""Мини-казино на монеты: монетка (x1.9), кубик (x5), слоты (x10/x2).
+"""Мини-казино на монеты с положительным house edge.
 
-Ставка списывается атомарно (take_balance_atomic), выигрыш начисляется
-после результата (add_balance). В минус уйти нельзя.
+Выплаты:
+- Монетка: x1.92 (edge 4%)
+- Кубик: x5.5 (edge 8.3%)
+- Слоты: тройка x13, пара x1.4 (edge 5.6%)
+
+Ставка списывается атомарно. Проигрыш уходит в казну чата (treasury).
 """
 import re
 import secrets
@@ -17,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 MIN_BET = 1
 MAX_BET = 100
+
+COIN_MULT = 1.92
+DICE_MULT = 5.5
+SLOT_TRIPLE_MULT = 13
+SLOT_PAIR_MULT = 1.4
 
 _RE_COIN = re.compile(r"(?i)^казино\s+монетка\s+(\d+)\s*$")
 _RE_DICE = re.compile(r"(?i)^казино\s+кубик\s+([1-6])\s+(\d+)\s*$")
@@ -45,9 +54,9 @@ async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     low = text.casefold()
     if low == "казино" or low == "/casino":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪙 Монетка (x1.9)", callback_data="cas:help:coin")],
-            [InlineKeyboardButton("🎲 Кубик (x5)", callback_data="cas:help:dice")],
-            [InlineKeyboardButton("🎰 Слоты (x10/x2)", callback_data="cas:help:slots")],
+            [InlineKeyboardButton("🪙 Монетка (x1.92)", callback_data="cas:help:coin")],
+            [InlineKeyboardButton("🎲 Кубик (x5.5)", callback_data="cas:help:dice")],
+            [InlineKeyboardButton("🎰 Слоты (x13/x1.4)", callback_data="cas:help:slots")],
         ])
         await msg.reply_text(
             "🎰 <b>Казино</b>\n"
@@ -90,11 +99,11 @@ async def casino_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     kind = parts[2]
     if kind == "coin":
-        text = "🪙 <code>Казино монетка 50</code> — 50/50, выигрыш x1.9."
+        text = "🪙 <code>Казино монетка 50</code> — 50/50, выигрыш x1.92."
     elif kind == "dice":
-        text = "🎲 <code>Казино кубик 4 50</code> — ставка на число 1–6, выигрыш x5."
+        text = "🎲 <code>Казино кубик 4 50</code> — ставка на число 1–6, выигрыш x5.5."
     elif kind == "slots":
-        text = "🎰 <code>Казино слоты 50</code> — три одинаковых x10, пара x2."
+        text = "🎰 <code>Казино слоты 50</code> — три одинаковых x13, пара x1.4."
     else:
         await q.answer()
         return
@@ -116,9 +125,17 @@ async def _take_bet(user, msg, bet: int) -> bool:
     return True
 
 
-async def _finish(user, msg, bet: int, win: int, detail: str) -> None:
+async def _finish(user, msg, chat_id: int, bet: int, win: int, detail: str) -> None:
+    """Начисляет выигрыш, а не возвращённую ставку кладёт в казну."""
     if win > 0:
         await db.add_balance(user.id, win)
+    profit_for_house = bet - win
+    if profit_for_house > 0:
+        try:
+            await db.treasury_add(chat_id, profit_for_house)
+        except Exception as e:
+            logger.warning("casino treasury_add: %s", e)
+
     row = await db.get_user(user.id)
     bal = (row or {}).get("balance") or 0
     if win > bet:
@@ -142,10 +159,12 @@ async def _play_coin(user, msg, bet: int) -> None:
         return
     result = secrets.choice(["орёл", "решка"])
     if result == "орёл":
-        win = int(bet * 1.9)
-        await _finish(user, msg, bet, win, f"Монетка: <b>{result}</b>. Ты угадал!")
+        win = int(bet * COIN_MULT)
+        await _finish(user, msg, msg.chat_id, bet, win,
+                      f"Монетка: <b>{result}</b>. Ты угадал!")
     else:
-        await _finish(user, msg, bet, 0, f"Монетка: <b>{result}</b>. Не угадал.")
+        await _finish(user, msg, msg.chat_id, bet, 0,
+                      f"Монетка: <b>{result}</b>. Не угадал.")
 
 
 async def _play_dice(user, msg, number: int, bet: int) -> None:
@@ -156,15 +175,12 @@ async def _play_dice(user, msg, number: int, bet: int) -> None:
         return
     roll = secrets.randbelow(6) + 1
     if roll == number:
-        await _finish(
-            user, msg, bet, bet * 5,
-            f"Кубик: <b>{roll}</b>. Точное попадание! x5",
-        )
+        win = int(bet * DICE_MULT)
+        await _finish(user, msg, msg.chat_id, bet, win,
+                      f"Кубик: <b>{roll}</b>. Точное попадание! x{DICE_MULT}")
     else:
-        await _finish(
-            user, msg, bet, 0,
-            f"Кубик: <b>{roll}</b>. Мимо (ставил на {number}).",
-        )
+        await _finish(user, msg, msg.chat_id, bet, 0,
+                      f"Кубик: <b>{roll}</b>. Мимо (ставил на {number}).")
 
 
 async def _play_slots(user, msg, bet: int) -> None:
@@ -173,8 +189,13 @@ async def _play_slots(user, msg, bet: int) -> None:
     a, b, c = (secrets.choice(_SLOT) for _ in range(3))
     line = f"{a} {b} {c}"
     if a == b == c:
-        await _finish(user, msg, bet, bet * 10, f"Слоты: {line}. ДЖЕКПОТ! x10")
+        win = int(bet * SLOT_TRIPLE_MULT)
+        await _finish(user, msg, msg.chat_id, bet, win,
+                      f"Слоты: {line}. ДЖЕКПОТ! x{SLOT_TRIPLE_MULT}")
     elif a == b or b == c or a == c:
-        await _finish(user, msg, bet, bet * 2, f"Слоты: {line}. Пара! x2")
+        win = int(bet * SLOT_PAIR_MULT)
+        await _finish(user, msg, msg.chat_id, bet, win,
+                      f"Слоты: {line}. Пара! x{SLOT_PAIR_MULT}")
     else:
-        await _finish(user, msg, bet, 0, f"Слоты: {line}. Пусто.")
+        await _finish(user, msg, msg.chat_id, bet, 0,
+                      f"Слоты: {line}. Пусто.")
