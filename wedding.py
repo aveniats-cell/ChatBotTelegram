@@ -1,18 +1,4 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение.
-
-Исправления:
-- accept/reject проверяют, что proposal ещё active=0 (нет двойных «Свадьба!»).
-- accept атомарно проверяет отсутствие активного брака у обоих участников
-  (нет «двух браков одновременно»).
-- delete_marriage возвращает rows_affected — не спамим «отклонено» после
-  уже обработанного proposal.
-- кнопки проверяют, что callback пришёл из того же чата, где proposal.
-- _marriage_level считает от married_at (момент accept), а не created_at.
-- +Брак не женит ботов и админа. Принудительный брак создаётся как
-  предложение (forced=1, active=0) и АКТИВИРУЕТСЯ через accept_marriage —
-  иначе активного брака не будет (регрессия исправлена).
-- При ошибке БД показываем «ошибка», а не «не найдено».
-"""
+"""2.5 Свадьба: предложение, принятие/отклонение, расторжение."""
 import os
 import re
 import logging
@@ -86,10 +72,11 @@ async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     return targets
 
 
-def _marriage_level(married_at_str: str) -> int:
-    """Уровень брака от момента accept (married_at), а не от proposal."""
+def _marriage_level(married_at_str: str | None) -> int:
+    if not married_at_str:
+        return 1
     try:
-        s = (married_at_str or "").replace("Z", "+00:00")
+        s = str(married_at_str).replace("Z", "+00:00")
         if " " in s and "T" not in s:
             s = s.replace(" ", "T", 1)
         created = datetime.fromisoformat(s)
@@ -109,7 +96,19 @@ async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
         return False
 
 
-# ---------- предложение ----------
+def _safe_edit_text(q, suffix: str) -> None:
+    """Редактирует текст callback-сообщения, не падая на None."""
+    if not q or not q.message:
+        return
+    base = q.message.text or ""
+    try:
+        import asyncio
+        asyncio.create_task(q.edit_message_text(
+            base + suffix, parse_mode=ParseMode.HTML,
+        ))
+    except Exception:
+        pass
+
 
 async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -167,8 +166,6 @@ async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# ---------- callback кнопок ----------
-
 async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -196,8 +193,11 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer("Предложение не найдено или устарело.", show_alert=True)
         return
 
-    # callback должен прийти из того же чата, где proposal
-    if q.message and q.message.chat and q.message.chat.id != m["chat_id"]:
+    # callback должен прийти из того же чата, где proposal.
+    if q.message is None or not q.message.chat:
+        await q.answer("Сообщение устарело.", show_alert=True)
+        return
+    if q.message.chat.id != m["chat_id"]:
         await q.answer("Это предложение из другого чата.", show_alert=True)
         return
 
@@ -205,7 +205,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer("Это предложение не вам.", show_alert=True)
         return
 
-    # уже обработано (accept/reject) — не спамим
     if m["active"]:
         await q.answer("Это предложение уже принято.", show_alert=True)
         try:
@@ -217,7 +216,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action == "reject":
         affected = await db.delete_marriage(mid)
         if affected == 0:
-            # гонка: кто-то уже удалил/принял
             await q.answer("Это предложение уже обработано.", show_alert=True)
             return
         await q.answer("Отклонено")
@@ -247,7 +245,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     affected = await db.accept_marriage(mid)
     if affected == 0:
-        # либо уже принято, либо у кого-то из участников появился другой брак
         m2 = await db.get_marriage(mid)
         if m2 and m2["active"]:
             await q.answer("Это предложение уже принято.", show_alert=True)
@@ -269,7 +266,9 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await q.answer("Брак заключён!")
 
     m_after = await db.get_marriage(mid)
-    level = _marriage_level(m_after["married_at"] if m_after else m["created_at"])
+    level = _marriage_level(
+        (m_after or {}).get("married_at") or (m_after or {}).get("created_at")
+    )
 
     try:
         await context.bot.send_message(
@@ -291,8 +290,6 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except TelegramError as e:
         logger.warning("edit accept msg: %s", e)
 
-
-# ---------- расторжение ----------
 
 async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -322,8 +319,6 @@ async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode=ParseMode.HTML,
     )
 
-
-# ---------- принудительный брак ----------
 
 async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -370,9 +365,6 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("⚠️ Не удалось создать брак. Попробуйте ещё раз.")
         return
 
-    # ВАЖНО: create_proposal создаёт запись с active=0. Принудительный брак
-    # активируется тем же атомарным accept_marriage, что и обычный — иначе
-    # активного брака в БД не будет.
     affected = await db.accept_marriage(mid)
     if affected == 0:
         logger.warning("cmd_force_marriage: accept_marriage(%s) вернул 0", mid)
@@ -393,11 +385,8 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-# ---------- принудительный развод ----------
-
 async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
+    user = update.effective_user    chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg:
         return
@@ -442,8 +431,6 @@ async def cmd_force_divorce_or_self(
     return await cmd_divorce(update, context)
 
 
-# ---------- инфо ----------
-
 async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -461,11 +448,12 @@ async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         name = partner.first_name or partner.username or str(partner_id)
     except TelegramError:
         pass
-    level = _marriage_level(m["married_at"] or m["created_at"])
+    level = _marriage_level(m.get("married_at") or m.get("created_at"))
     forced = " 🔒 (принудительный)" if m["forced"] else ""
+    when = m.get("married_at") or m.get("created_at") or "—"
     await msg.reply_text(
         f"💍 Ваш брак с <b>{escape(name)}</b>{forced}\n"
         f"Уровень: <b>{level}</b>\n"
-        f"Заключён: {escape(m['married_at'] or m['created_at'])}",
+        f"Заключён: {escape(str(when))}",
         parse_mode=ParseMode.HTML,
     )
