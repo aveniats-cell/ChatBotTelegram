@@ -34,6 +34,7 @@ import actions
 import ai
 import help_menu
 import casino
+import polls
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -166,6 +167,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
         "• Засос / Расстрел / По шапке / Выстрел / Расцеловать / Сделать 18+\n"
         "• Станцевать / Обнять всех / Погладить всех / Лещей всем / Тыкнуть / Защекотать\n"
+        "• Опрос / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
+        "• Опрос ССС / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
         "• Топ все / Топ день / Топ богачи / Мое место\n"
         "• Шип @u1 @u2 (с ИИ)\n"
         "• Сделать предложение / +Брак / -Брак / Мой брак\n"
@@ -178,7 +181,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Казна / +ВКассу 500 / ОбрезатьКасну 15000\n"
         "• Зарплата — инфо за сегодня\n"
         "• +ССС / -ССС / Список ССС\n"
-        "• +Суд ССС / +Суд\n"
+        "• +Суд ССС / +Суд (с / Причина)\n"
         "• дроч / Аура / Топ аура\n"
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
@@ -186,6 +189,16 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
     )
+
+
+async def _cleanup_polls_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Страховка: удаляет просроченные опросы из памяти."""
+    try:
+        n = polls.cleanup_expired_polls()
+        if n:
+            logger.info("polls cleanup: removed %d", n)
+    except Exception as e:
+        logger.warning("polls cleanup: %s", e)
 
 
 async def post_init(app: Application) -> None:
@@ -202,6 +215,11 @@ async def post_init(app: Application) -> None:
             top.flush_job,
             interval=top.FLUSH_INTERVAL_SEC,
             first=top.FLUSH_INTERVAL_SEC,
+        )
+        app.job_queue.run_repeating(
+            _cleanup_polls_job,
+            interval=60,
+            first=60,
         )
         economy.register_jobs(app)
     else:
@@ -310,6 +328,20 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.sss_trial_callback, pattern=r"^ssstrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
+
+    # --- опросы ---
+    # ВАЖНО: Опрос ССС должен быть раньше Опрос (иначе Опрос перехватит)
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Опрос\s+ССС(\s|/)"),
+        polls.cmd_poll_sss,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Опрос(?!\s+ССС)(\s|/)"),
+        polls.cmd_poll_public,
+    ))
+    app.add_handler(CallbackQueryHandler(
+        polls.poll_callback, pattern=r"^poll:",
+    ))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
