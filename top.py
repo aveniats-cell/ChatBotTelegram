@@ -1,12 +1,18 @@
 """2.3 Топ чата: счётчик сообщений, Топ день / Топ все, Моё место.
 
-P1: track_message не делает upsert_user на каждое сообщение — кэширует
-(username, first_name) в памяти и пишет в БД только при изменении.
-Экономит 1 HTTP-запрос к Turso на каждое сообщение в активном чате.
+P2: батчинг счётчика. Сообщения копятся в памяти и сбрасываются раз
+в FLUSH_INTERVAL_SEC (или при превышении FLUSH_MAX_KEYS). Каждый батч
+пишется с ключом идемпотентности (db.inc_message_batch_idempotent),
+поэтому при обрыве Turso батч можно безопасно повторить — двойного
+инкремента не будет. Это убирает «проседание» счётчика из-за
+Server disconnected на каждом сообщении.
 """
+import asyncio
 import logging
-from html import escape
+import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
+from html import escape
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -17,9 +23,15 @@ import db
 
 logger = logging.getLogger(__name__)
 
-# user_id -> (username, first_name). Сбрасывается при рестарте — не страшно:
-# первый же апдейт после рестарта запишет актуальные данные.
+FLUSH_INTERVAL_SEC = 15
+FLUSH_MAX_KEYS = 200
+
+# user_id -> (username, first_name). Сбрасывается при рестарте.
 _USER_CACHE: dict[int, tuple[str, str]] = {}
+
+# (chat_id, user_id, day) -> delta
+_PENDING: dict[tuple[int, int, str], int] = defaultdict(int)
+_flush_lock = asyncio.Lock()
 
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -35,13 +47,57 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if _USER_CACHE.get(user.id) != cur:
             await db.upsert_user(user.id, user.username, user.first_name)
             _USER_CACHE[user.id] = cur
+
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        ok = await db.inc_message_and_day(chat.id, user.id, day)
-        if not ok:
-            logger.warning("track_message: batch не выполнен (chat=%s user=%s)",
-                           chat.id, user.id)
+        key = (chat.id, user.id, day)
+        _PENDING[key] += 1
+
+        # Если накопилось слишком много ключей — сбросить сразу.
+        if len(_PENDING) >= FLUSH_MAX_KEYS:
+            await _flush()
     except Exception as e:
         logger.warning("track_message: %s", e)
+
+
+async def _flush() -> None:
+    """Сбрасывает накопленные батчи в БД идемпотентно."""
+    async with _flush_lock:
+        if not _PENDING:
+            return
+        snapshot = dict(_PENDING)
+        _PENDING.clear()
+
+    for (chat_id, user_id, day), delta in snapshot.items():
+        if delta <= 0:
+            continue
+        key = uuid.uuid4().hex
+        ok = False
+        # До 3 попыток: при обрыве Turso ключ идемпотентности защищает
+        # от двойного инкремента, поэтому ретрай безопасен.
+        for attempt in range(3):
+            ok = await db.inc_message_batch_idempotent(
+                chat_id, user_id, day, delta, key,
+            )
+            if ok:
+                break
+            logger.warning(
+                "flush: попытка %d/3 не удалась (chat=%s user=%s delta=%s)",
+                attempt + 1, chat_id, user_id, delta,
+            )
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+        if not ok:
+            logger.error(
+                "flush: потерян батч (chat=%s user=%s day=%s delta=%s)",
+                chat_id, user_id, day, delta,
+            )
+
+
+async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await _flush()
+    except Exception as e:
+        logger.warning("flush_job: %s", e)
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -104,6 +160,11 @@ async def cmd_top_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat = update.effective_chat
     if not chat:
         return
+    # Перед показом топа — сбросить накопленное, чтобы цифры были свежими.
+    try:
+        await _flush()
+    except Exception:
+        pass
     text = await _build_top_text(context, chat.id, limit=50, title="🏆 Топ за всё время")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -112,6 +173,10 @@ async def cmd_top_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat = update.effective_chat
     if not chat:
         return
+    try:
+        await _flush()
+    except Exception:
+        pass
     text = await _build_top_day_text(context, chat.id, limit=50)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -121,6 +186,10 @@ async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat = update.effective_chat
     if not user or not chat:
         return
+    try:
+        await _flush()
+    except Exception:
+        pass
     res = await db.user_rank(chat.id, user.id)
     if not res:
         await update.message.reply_text("Вы ещё не писали в этом чате — места нет.")
