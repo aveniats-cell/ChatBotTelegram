@@ -1,5 +1,6 @@
 """Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
-проценты в казну, дефолт (обнуление всех балансов), топ богачи."""
+проценты в казну, дефолт (органический — процент, искусственный — всё),
+топ богачи."""
 import os
 import re
 import logging
@@ -30,9 +31,16 @@ TAX_MIN_BALANCE = 50
 TAX_ACTIVE_DAYS = 1
 TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
+# Органический дефолт: раз в N часов, когда казна пуста, забирает PCT% балансов.
 DEFAULT_COOLDOWN_HOURS = 6
+DEFAULT_PCT = 40
+
+# Искусственный дефолт по команде админа забирает 100% балансов.
+FORCE_DEFAULT_CMD = "Defloult220099"
 
 TZ = timezone.utc
+
+_default_in_progress: set[int] = set()
 
 
 def _today_utc() -> str:
@@ -600,45 +608,132 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+# ---------- Сбор балансов (общая функция) ----------
+
+async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
+    """Списывает pct% от баланса каждого юзера (balance > 0) в казну.
+
+    pct=100 → экстремальный дефолт (обнуляет всех).
+    Возвращает (собрано_всего, затронуто_юзеров).
+    """
+    if pct <= 0:
+        return 0, 0
+    if pct > 100:
+        pct = 100
+
+    rs = await db._exec(
+        "SELECT COALESCE(SUM(balance), 0), COUNT(*) "
+        "FROM users WHERE balance > 0",
+    )
+    if not rs.rows:
+        return 0, 0
+    total_before = rs.rows[0][0] or 0
+    users_count = rs.rows[0][1] or 0
+    if total_before <= 0:
+        return 0, 0
+
+    if pct == 100:
+        # Экстремальный: обнуляем всё.
+        rs2 = await db._exec(
+            "UPDATE users SET balance = 0 WHERE balance > 0",
+        )
+    else:
+        rs2 = await db._exec(
+            f"""UPDATE users
+                SET balance = balance - CAST(balance * {int(pct)} / 100 AS INTEGER)
+                WHERE balance > 0""",
+        )
+    if getattr(rs2, "error", False):
+        logger.error("_collect_balances: UPDATE failed")
+        return 0, 0
+
+    rs3 = await db._exec(
+        "SELECT COALESCE(SUM(balance), 0) FROM users WHERE balance > 0",
+    )
+    total_after = (rs3.rows[0][0] if rs3.rows else 0) or 0
+    real = total_before - total_after
+    if real <= 0:
+        logger.warning(
+            "_collect_balances: расхождение before=%s after=%s",
+            total_before, total_after,
+        )
+        return 0, users_count
+
+    logger.info(
+        "_collect_balances: списано %s у %s юзеров (pct=%s)",
+        real, users_count, pct,
+    )
+    return real, users_count
+
+
 # ---------- Дефолт ----------
 
-async def _run_default(context, chat_id: int) -> bool:
-    logger.info("default: start chat=%s", chat_id)
-    last = await db.get_last_default(chat_id)
-    logger.info("default: last=%s", last)
-    if last:
-        try:
-            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
-            if (datetime.now(TZ) - last_dt) < timedelta(hours=DEFAULT_COOLDOWN_HOURS):
-                logger.info("default: cooldown, skip")
-                return False
-        except Exception as e:
-            logger.warning("default: parse last: %s", e)
+async def _run_default(context, chat_id: int, force: bool = False) -> bool:
+    """Запускает дефолт.
 
-    total = await db.treasury_default_collect(chat_id)
-    logger.info("default: collected=%s", total)
-    if total <= 0:
-        logger.info("default: собирать нечего")
+    force=False — органический: только если казна пуста и cooldown прошёл,
+                  забирает DEFAULT_PCT% балансов.
+    force=True  — искусственный: игнорирует cooldown и пустоту казны,
+                  забирает 100% балансов.
+    """
+    if chat_id in _default_in_progress:
+        logger.info("default: уже выполняется для chat=%s, skip", chat_id)
         return False
-
-    await db.treasury_add(chat_id, total)
-    await db.set_last_default(chat_id, datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"))
-
+    _default_in_progress.add(chat_id)
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🏦 <b>ДЕФОЛТ</b>\n"
-                f"Казна пуста. Все балансы обнулены.\n"
-                f"Собрано в казну: <b>{total}</b> монет.\n"
-                f"<i>Зарплата и кредиты возобновятся, когда казна пополнится.</i>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError as e:
-        logger.warning("default send: %s", e)
+        logger.info("default: start chat=%s force=%s", chat_id, force)
 
-    return True
+        if not force:
+            last = await db.get_last_default(chat_id)
+            logger.info("default: last=%s", last)
+            if last:
+                try:
+                    last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                    if (datetime.now(TZ) - last_dt) < timedelta(hours=DEFAULT_COOLDOWN_HOURS):
+                        logger.info("default: cooldown, skip")
+                        return False
+                except Exception as e:
+                    logger.warning("default: parse last: %s", e)
+
+        pct = 100 if force else DEFAULT_PCT
+        total, users_count = await _collect_balances(chat_id, pct)
+        logger.info("default: collected=%s users=%s pct=%s", total, users_count, pct)
+        if total <= 0:
+            logger.info("default: собирать нечего")
+            return False
+
+        await db.treasury_add(chat_id, total)
+        await db.set_last_default(chat_id, datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"))
+
+        if force:
+            text = (
+                "⚠️ <b>ВНИМАНИЕ — ДЕФОЛТ</b> ⚠️\n\n"
+                "🏦 <b>ЭКСТРЕМАЛЬНЫЙ ДЕФОЛТ</b>\n"
+                "Правительство объявило дефолт.\n"
+                "Все балансы <b>обнулены</b>.\n"
+                f"Затронуто юзеров: <b>{users_count}</b>\n"
+                f"Конфисковано в казну: <b>{total}</b> монет."
+            )
+        else:
+            text = (
+                "⚠️ <b>ВНИМАНИЕ — ДЕФОЛТ</b> ⚠️\n\n"
+                "🏦 <b>ДЕФОЛТ</b>\n"
+                "Казна пуста. Объявлен дефолт.\n"
+                f"Списано <b>{DEFAULT_PCT}%</b> с балансов "
+                f"<b>{users_count}</b> юзеров.\n"
+                f"Собрано в казну: <b>{total}</b> монет."
+            )
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+            )
+        except TelegramError as e:
+            logger.warning("default send: %s", e)
+
+        return True
+    finally:
+        _default_in_progress.discard(chat_id)
 
 
 async def _check_default_after(context, chat_id: int) -> None:
@@ -650,7 +745,7 @@ async def _check_default_after(context, chat_id: int) -> None:
     logger.info("_check_default_after: bal=%s", bal)
     if bal > 0:
         return
-    await _run_default(context, chat_id)
+    await _run_default(context, chat_id, force=False)
 
 
 async def default_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,7 +758,42 @@ async def default_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("default_watchdog: %s", e)
         return
     if bal <= 0:
-        await _run_default(context, chat_id)
+        await _run_default(context, chat_id, force=False)
+
+
+# ---------- Искусственный дефолт по команде админа ----------
+
+async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/Defloult220099` — админ запускает экстремальный дефолт.
+
+    Бот удаляет команду из чата и обнуляет все балансы.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+
+    try:
+        await msg.delete()
+    except TelegramError as e:
+        logger.info("cmd_force_default: не удалось удалить команду: %s", e)
+
+    ok = await _run_default(context, chat.id, force=True)
+    if not ok:
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Экстремальный дефолт не удался: собирать нечего "
+                     "(у юзеров нулевые балансы) или ошибка БД.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
 
 
 # ---------- Налог ----------
@@ -742,6 +872,8 @@ def register_jobs(app) -> None:
         default_watchdog_job, interval=3600, first=60,
     )
     logger.info(
-        "economy: проценты (00:10), налог (00:40), дефолт-watchdog (раз в час), "
-        "cooldown дефолта %sч запланированы", DEFAULT_COOLDOWN_HOURS,
+        "economy: проценты (00:10), налог (00:40), "
+        "watchdog (раз в час), cooldown дефолта %sч, "
+        "органический pct=%s%%, искусственный pct=100%% запланированы",
+        DEFAULT_COOLDOWN_HOURS, DEFAULT_PCT,
     )
