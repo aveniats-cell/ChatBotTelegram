@@ -171,9 +171,11 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Сделать предложение @user / +Брак / -Брак\n"
         "• Мой брак\n"
         "• Профиль (базовый + кнопки разделов)\n"
-        "• хо @user 50 — крестики-нолики\n"
+        "• хо @user 50 — крестики-нолики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50\n"
-        "• +Монеты 100 @user (админ)\n"
+        "• +Монеты 100 @user / -Монеты 100 @user (админ)\n"
+        "• Перевод 50 @user — комиссия 3%\n"
+        "• Казна — баланс казны чата (админ)\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
         "• дроч / Аура / Топ аура — аурометр\n"
@@ -258,6 +260,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Кредит(\s|$)"), economy.cmd_credit_take))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Монеты(\s|$)"), economy.cmd_admin_coins_minus))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Перевод(\s|$)"), economy.cmd_transfer))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Казна(\s|$)"), economy.cmd_treasury))
 
     # Казино
     app.add_handler(MessageHandler(
@@ -346,12 +351,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
 
-    # ИИ: триггер словом. ВАЖНО: filters.Regex, а не сырой re.Pattern.
+    # ИИ
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
-    # ИИ: реплай на сообщение бота (без триггера)
     app.add_handler(MessageHandler(
         filters.REPLY & filters.Chat(chat_id=CHAT_ID),
         cmd_ai,
