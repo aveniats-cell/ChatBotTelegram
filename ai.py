@@ -1,13 +1,6 @@
-"""ИИ-модуль: запросы к gemini через Pollinations + контекст диалога.
-
-Использует AI_TOKEN и BASE_URL из переменных окружения.
-BASE_URL должен указывать на https://gen.pollinations.ai (актуальный gateway).
-Легаси-хост text.pollinations.ai отключён и возвращает 404.
-
-Контекст: на пользователя хранится до MAX_HISTORY сообщений (user+assistant)
-в TTLCache на час. Сброс — ai.reset_history(user_id) (/restart).
-"""
+"""ИИ-модуль: запросы к gemini через Pollinations + контекст диалога."""
 import os
+import asyncio
 import time
 import logging
 from typing import Optional
@@ -24,11 +17,11 @@ MODEL = "openai-fast"
 
 COOLDOWN_SEC = 5.0
 
-MAX_HISTORY = 10  # сообщений (5 пар user/assistant)
+MAX_HISTORY = 10
 
 _last_request: TTLCache = TTLCache(maxsize=10000, ttl=COOLDOWN_SEC * 2)
+_cooldown_lock = asyncio.Lock()
 
-# user_id -> list[{role, content}]
 _history: TTLCache = TTLCache(maxsize=5000, ttl=3600)
 
 _session: Optional[aiohttp.ClientSession] = None
@@ -79,22 +72,24 @@ def reset_history(user_id: int) -> None:
 
 
 def _get_history(user_id: int) -> list:
-    return _history.setdefault(user_id, [])
+    # __getitem__ в TTLCache обновляет TTL; setdefault — нет.
+    try:
+        return _history[user_id]
+    except KeyError:
+        _history[user_id] = []
+        return _history[user_id]
 
 
 def _append(user_id: int, role: str, content: str) -> None:
-    h = _history.setdefault(user_id, [])
+    h = _get_history(user_id)
     h.append({"role": role, "content": content})
-    if len(h) > MAX_HISTORY:
-        del h[: len(h) - MAX_HISTORY]
+    # Режем парами user/assistant, чтобы не оставить «висячего» user.
+    while len(h) > MAX_HISTORY:
+        h.pop(0)
 
 
 async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
-    """Отправляет запрос в gemini. Возвращает текст или None.
-
-    Если user_id задан — учитывает историю диалога и дописывает пару
-    (user, assistant) в историю после успешного ответа.
-    """
+    """Отправляет запрос в gemini. Возвращает текст или None."""
     if not AI_TOKEN:
         logger.error("ai: AI_TOKEN не задан в переменных окружения")
         return None
@@ -111,7 +106,7 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
         "content": "Ты умный чат-бот в Telegram. Пиши максимально кратко.",
     }]
     if user_id is not None:
-        messages.extend(_get_history(user_id))
+        messages.extend(dict(m) for m in _get_history(user_id))
     messages.append({"role": "user", "content": prompt})
 
     payload = {
@@ -173,16 +168,17 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
         return None
 
 
-def try_acquire(user_id: int) -> float:
+async def try_acquire(user_id: int) -> float:
     """Атомарно проверяет и занимает cooldown.
 
     Возвращает 0, если можно выполнять запрос, иначе — оставшиеся секунды.
     """
-    now = time.monotonic()
-    last = _last_request.get(user_id)
-    if last is not None:
-        elapsed = now - last
-        if elapsed < COOLDOWN_SEC:
-            return COOLDOWN_SEC - elapsed
-    _last_request[user_id] = now
-    return 0.0
+    async with _cooldown_lock:
+        now = time.monotonic()
+        last = _last_request.get(user_id)
+        if last is not None:
+            elapsed = now - last
+            if elapsed < COOLDOWN_SEC:
+                return COOLDOWN_SEC - elapsed
+        _last_request[user_id] = now
+        return 0.0
