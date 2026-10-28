@@ -61,9 +61,12 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
+    msg = update.effective_message
+    if not msg:
+        return
     if u:
         await db.upsert_user(u.id, u.username, u.first_name)
-    await update.message.reply_text(
+    await msg.reply_text(
         "Привет! Я PR-бот.\n"
         "/help — список команд по ролям\n"
         "/check — подписка\n"
@@ -75,7 +78,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("pong 🏓")
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("pong 🏓")
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -88,7 +93,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _run_ai(user, msg, prompt: str) -> None:
-    remain = ai.try_acquire(user.id)
+    remain = await ai.try_acquire(user.id)
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
@@ -140,10 +145,13 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
-    if not ADMIN_ID or not u or u.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Только для админа.")
+    msg = update.effective_message
+    if not msg:
         return
-    await update.message.reply_text(
+    if not ADMIN_ID or not u or u.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только для админа.")
+        return
+    await msg.reply_text(
         "📊 Админ-панель:\n"
         "• +Шериф / -Шериф @user\n"
         "• +Комиссар / -Комиссар @user\n"
@@ -226,7 +234,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
 
-    # Роли
     app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Шериф(\s|$)"), roles.revoke_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^\+Комиссар(\s|$)"), roles.grant_commissar))
@@ -242,7 +249,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
-    # Экономика
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Кредит(\s|$)"), economy.cmd_credit_take))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
@@ -254,7 +260,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Зарплата(\s|$)"), economy.cmd_salary))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+богачи(\s|$)"), economy.cmd_top_rich))
 
-    # -Утил / +Утил
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
                                    economy.cmd_burn_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
@@ -264,7 +269,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
                                    economy.cmd_mint_user))
 
-    # Казино
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^казино(\s|$)"), casino.cmd_casino,
     ))
@@ -272,32 +276,26 @@ def build_app() -> Application:
         casino.casino_help_callback, pattern=r"^cas:help:",
     ))
 
-    # Топ
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мое\s+место(\s|$)"), top.cmd_my_place))
 
-    # Шип
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Шип(\s|$)"), ship.cmd_ship))
 
-    # Свадьба
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"), wedding.cmd_propose))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # Профиль
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
                                    profile.cmd_profile))
     app.add_handler(CallbackQueryHandler(profile.profile_callback,
                                          pattern=r"^prof:"))
 
-    # Крестики-нолики
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
     app.add_handler(CallbackQueryHandler(tictactoe.ttt_callback, pattern=r"^ttt:"))
 
-    # ССС и суды
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ССС(\s|$)"), sss.cmd_sss_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]ССС(\s|$)"), sss.cmd_sss_remove))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Список\s+ССС(\s|$)"), sss.cmd_sss_list))
@@ -307,7 +305,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # Жалобы и предупреждения
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
         complaints.cmd_complaint,
@@ -323,7 +320,6 @@ def build_app() -> Application:
         warns.cmd_unwarn,
     ))
 
-    # Аурометр
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^дроч(\s|$)"),
                                    aura.cmd_droch))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+аура(\s|$)"),
@@ -331,13 +327,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аура(\s|$)"),
                                    aura.cmd_aura))
 
-    # Награды
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Награда(\s|$)"),
                                    awards.cmd_award))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
                                    awards.cmd_unaward))
 
-    # Действия
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
                                    actions.cmd_slap))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"),
@@ -351,32 +345,33 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
 
-    # ИИ
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
-    app.add_handler(MessageHandler(
-        filters.REPLY & filters.Chat(chat_id=CHAT_ID),
-        cmd_ai,
-    ))
+    if CHAT_ID:
+        app.add_handler(MessageHandler(
+            filters.REPLY & filters.Chat(chat_id=CHAT_ID),
+            cmd_ai,
+        ))
 
-    # Счётчик сообщений
-    app.add_handler(
-        MessageHandler(
-            filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
-            top.track_message,
-        ),
-        group=1,
-    )
+    if CHAT_ID:
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                top.track_message,
+            ),
+            group=1,
+        )
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, pr.on_new_member))
-    app.add_handler(
-        MessageHandler(
-            filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
-            pr.check_and_delete,
+    if CHAT_ID:
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                pr.check_and_delete,
+            )
         )
-    )
 
     return app
 
