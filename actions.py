@@ -1,5 +1,5 @@
 """Действия: старые + новые (Засос, Расстрел(админ), По шапке, Выстрел,
-Расцеловать, Сделать 18+, развлекательные).
+Расцеловать, Сделать 18+, развлекательные, Пожать руку).
 
 Все тексты — в TEXTS_OLD и TEXTS_NEW. В коде — нейтральные имена команд.
 «Сделать 18+» реализовано нейтрально (плейсхолдер «...»), заполняется в TEXTS_NEW.
@@ -97,6 +97,10 @@ TEXTS_NEW: dict[str, dict[str, str]] = {
     "tickle": {
         "self": "Себе нельзя 🙂",
         "ok": "🪶 {actor} защекотал(а) {target}",
+    },
+    "handshake": {
+        "self": "Сам с собой жать руку? 🙂",
+        "ok": "🤝 {actor} пожал(а) руку {target}",
     },
 }
 
@@ -301,3 +305,8 @@ async def cmd_poke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_tickle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     t = (update.effective_message.text or "") if update.effective_message else ""
     await _do_new(update, context, "tickle", _clean(t, r"защекотать|щекотать"))
+
+
+async def cmd_handshake(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    t = (update.effective_message.text or "") if update.effective_message else ""
+    await _do_new(update, context, "handshake", _clean(t, r"пожать\s+руку|рукопожатие"))
