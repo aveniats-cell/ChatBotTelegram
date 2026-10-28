@@ -1,4 +1,7 @@
-"""Справка /help: разделы Общий / Шериф / Комиссар / Создатель."""
+"""Справка /help: разделы Общий / Шериф / Комиссар / Создатель.
+
+Покрыты все команды, зарегистрированные в main.build_app().
+"""
 import os
 import logging
 from html import escape
@@ -13,38 +16,71 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
+# Каждый раздел: (заголовок, [строки]).
+# Строки — обычный текст, экранируются при рендере.
 _SECTIONS = {
     "general": ("📋 Общий", [
-        "Профиль — профиль (кнопки разделов)",
-        "Аура / Топ аура / дроч — аурометр",
-        "Топ все / Топ день / Мое место",
-        "Шип @u1 @u2",
-        "Сделать предложение / Мой брак / -Брак",
-        "хо @user 50 — крестики-нолики",
-        "+Кредит 50 / -Кредит 50",
-        "Казино — мини-казино на монеты",
+        "Профиль [@user] — профиль с кнопками разделов",
+        "Аура — своя аура и место в топе",
+        "Топ аура — топ-10 по ауре в чате",
+        "дроч — +1 аура (не чаще раза в час)",
+        "Топ все — топ чата за всё время",
+        "Топ день — топ чата за сегодня",
+        "Мое место — твоё место в топе сообщений",
+        "Шип @u1 @u2 — шуточная пара",
+        "Сделать предложение @user — предложение брака",
+        "Мой брак — информация о своём браке",
+        "-Брак — развод (свой или реплай)",
+        "хо @user 50 — крестики-нолики 5×5 на монеты",
+        "+Кредит 50 — взять кредит (1–100, раз в день)",
+        "-Кредит 50 — погасить долг",
+        "Перевод 50 @user — перевод монет (комиссия 3%)",
+        "Казино — меню мини-казино",
+        "Казино монетка 50 — 50/50, x1.92",
+        "Казино кубик 4 50 — ставка на число 1–6, x5.5",
+        "Казино слоты 50 — три x13, пара x1.4",
         "ИИ <запрос> — чат с ИИ (или реплай на сообщение бота)",
+        "Браини / Мозг / Brainy <запрос> — то же самое",
         "/restart — сбросить контекст ИИ",
-        "+Жалоба @user",
-        "Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить",
+        "+Жалоба @user (или +ЖБ / +Жал) — жалоба админу",
+        "Дать леща @user — лещ",
+        "Поцеловать @user — поцелуй",
+        "Обнять @user — объятие",
+        "Побить @user — удар",
+        "Обоссать @user — обоссать",
+        "Погладить @user — погладить",
+        "/help — эта справка",
+        "/check — перепроверить подписку",
+        "/ping — жив?",
+        "/start — приветствие",
     ]),
     "sheriff": ("👮 Шериф", [
         "Поймать @user — запрос админу на бан",
     ]),
     "commissar": ("🎖 Комиссар", [
-        "+Шериф / -Шериф @user",
-        "+Мут 5ч Причина @user / -Мут @user",
-        "+Бан @user / -Бан @user",
-        "+Пред / -Пред @user",
-        "+Награда Название / 5 @user",
-        "-Награда Название @user",
+        "+Шериф / -Шериф @user — назначить/снять шерифа",
+        "+Мут 5ч Причина @user — замутить",
+        "+Мут @user 1ч 30м Причина — время и причина в любом порядке",
+        "-Мут @user — размутить",
+        "+Бан @user / -Бан @user — бан/разбан",
+        "+Пред / +Предупреждение / +Варн @user — предупреждение",
+        "-Пред / -Предупреждение / -Варн @user — снять предупреждение",
+        "+Награда Название / 5 @user — выдать награду (1–6★)",
+        "-Награда Название @user — снять награду",
     ]),
     "creator": ("👑 Создатель", [
-        "+Комиссар / -Комиссар @user",
-        "Список шерифы / Список комиссары",
-        "+Монеты 100 @user",
-        "+ССС @user / -ССС @user / Список ССС",
-        "/stats — админ-панель",
+        "+Комиссар / -Комиссар @user — назначить/снять комиссара",
+        "Список шерифы — список шерифов",
+        "Список комиссары — список комиссаров",
+        "+Монеты 100 @user — начислить монеты",
+        "-Монеты 100 @user — списать монеты (в казну)",
+        "Казна — баланс казны чата",
+        "+ССС @user / -ССС @user — состав ССС",
+        "Список ССС — кто в ССС",
+        "+Суд ССС @user — суд ССС (голосование)",
+        "+Суд @user — публичный суд (голосование всех)",
+        "+Награда Название / 10 @user — награда до 10★ (админ)",
+        "/stats — админ-панель (текстом)",
     ]),
 }
 
@@ -53,7 +89,6 @@ def _visible_sections(is_admin: bool, role: str | None) -> list[str]:
     out = ["general"]
     if is_admin or role == "commissar":
         out.append("sheriff")
-    if is_admin or role == "commissar":
         out.append("commissar")
     if is_admin:
         out.append("creator")
@@ -65,6 +100,12 @@ def _main_kb(sections: list[str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(_SECTIONS[s][0], callback_data=f"help:{s}")]
         for s in sections
     ])
+
+
+def _section_kb(section: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Назад", callback_data="help:back")
+    ]])
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,10 +146,14 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     sections = _visible_sections(is_admin, role)
 
     if section == "back":
-        await q.edit_message_text(
-            "📖 <b>Справка</b>\nВыбери раздел:",
-            parse_mode=ParseMode.HTML, reply_markup=_main_kb(sections),
-        )
+        try:
+            await q.edit_message_text(
+                "📖 <b>Справка</b>\nВыбери раздел:",
+                parse_mode=ParseMode.HTML, reply_markup=_main_kb(sections),
+            )
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                logger.warning("help back edit: %s", e)
         await q.answer()
         return
 
@@ -120,12 +165,11 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = f"<b>{escape(title)}</b>\n" + "\n".join(
         f"• {escape(l)}" for l in lines
     )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Назад", callback_data="help:back")
-    ]])
     try:
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await q.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_section_kb(section),
+        )
     except Exception as e:
         if "not modified" not in str(e).lower():
-            logger.warning("help_callback edit: %s", e)
+            logger.warning("help section edit: %s", e)
     await q.answer()
