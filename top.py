@@ -1,12 +1,4 @@
-"""2.3 Топ чата + зарплата за активность из казны.
-
-- Сообщения копятся в памяти, сбрасываются раз в FLUSH_INTERVAL_SEC
-  идемпотентным батчем (защита от Server disconnected).
-- Зарплата: 1 сообщение >= MIN_SALARY_LEN символов = +SALARY_FRAC_PER_MSG
-  сотых монеты (0.20 = 20). Не команда, не от бота, не реплай на бота.
-  Списывается из казны через db.pay_salary_from_treasury.
-- flush_job после _flush проверяет казну: если <= 0 — дефолт.
-"""
+"""2.3 Топ чата + зарплата за активность из казны."""
 import asyncio
 import os
 import logging
@@ -28,7 +20,7 @@ FLUSH_INTERVAL_SEC = 15
 FLUSH_MAX_KEYS = 200
 
 MIN_SALARY_LEN = 2
-SALARY_FRAC_PER_MSG = 20  # 0.20 монеты за сообщение
+SALARY_FRAC_PER_MSG = 20
 
 _USER_CACHE: dict[int, tuple[str, str]] = {}
 
@@ -79,6 +71,16 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("track_message: %s", e)
 
 
+def _requeue_msg(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta > 0:
+        _PENDING[(chat_id, user_id, day)] += delta
+
+
+def _requeue_sal(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta > 0:
+        _PENDING_SALARY[(chat_id, user_id, day)] += delta
+
+
 async def _flush() -> None:
     async with _flush_lock:
         if not _PENDING and not _PENDING_SALARY:
@@ -88,7 +90,6 @@ async def _flush() -> None:
         _PENDING.clear()
         _PENDING_SALARY.clear()
 
-    # 1) Сообщения — идемпотентный батч.
     for (chat_id, user_id, day), delta in snap_msg.items():
         if delta <= 0:
             continue
@@ -106,8 +107,8 @@ async def _flush() -> None:
                 "flush msg: потерян батч (chat=%s user=%s day=%s delta=%s)",
                 chat_id, user_id, day, delta,
             )
+            _requeue_msg(chat_id, user_id, day, delta)
 
-    # 2) Зарплата — из казны.
     for (chat_id, user_id, day), frac_delta in snap_sal.items():
         if frac_delta <= 0:
             continue
@@ -125,6 +126,7 @@ async def _flush() -> None:
                 "flush salary: казна пуста или ошибка (chat=%s user=%s)",
                 chat_id, user_id,
             )
+            _requeue_sal(chat_id, user_id, day, frac_delta)
 
 
 async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,7 +135,6 @@ async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.warning("flush_job: %s", e)
 
-    # После зарплаты проверяем казну. Если <= 0 — дефолт.
     try:
         import economy
         chat_id = int(os.getenv("CHAT_ID", "0") or "0")
@@ -237,8 +238,7 @@ async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     res = await db.user_rank(chat.id, user.id)
     if not res:
         await update.message.reply_text("Вы ещё не писали в этом чате — места нет.")
-        return
-    count, rank, total = res
+        return    count, rank, total = res
     await update.message.reply_text(
         f"📊 Ваше место: <b>{rank}/{total}</b>\n"
         f"Сообщений: <b>{count}</b>",
