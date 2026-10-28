@@ -236,6 +236,17 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, action)
         )
     """)
+    # Персистентная очередь дробной зарплаты: переживает рестарты Render.
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS pending_salary (
+            chat_id    INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            day        TEXT NOT NULL,
+            frac_delta INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, user_id, day)
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -694,6 +705,79 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
         )
         return False
     return True
+
+
+# ---------- pending_salary (персистентная очередь дробей) ----------
+
+async def add_pending_salary(chat_id: int, user_id: int, day: str, frac_delta: int) -> bool:
+    """Атомарно прибавить дробные копейки в персистентную очередь."""
+    if frac_delta <= 0:
+        return True
+    rs = await _exec(
+        """INSERT INTO pending_salary (chat_id, user_id, day, frac_delta)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             frac_delta = pending_salary.frac_delta + excluded.frac_delta,
+             updated_at = datetime('now')""",
+        [chat_id, user_id, day, frac_delta],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_pending_salary(chat_id: int, user_id: int, day: str) -> int:
+    rs = await _exec(
+        """SELECT frac_delta FROM pending_salary
+           WHERE chat_id = ? AND user_id = ? AND day = ?""",
+        [chat_id, user_id, day],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def take_pending_salary(chat_id: int, user_id: int, day: str,
+                              max_frac: Optional[int] = None) -> int:
+    """Атомарно снять до max_frac (или всё, если None) из очереди."""
+    rs = await _exec(
+        """SELECT frac_delta FROM pending_salary
+           WHERE chat_id = ? AND user_id = ? AND day = ?""",
+        [chat_id, user_id, day],
+    )
+    if not rs.rows:
+        return 0
+    cur = rs.rows[0][0] or 0
+    if cur <= 0:
+        return 0
+    take = cur if max_frac is None else min(cur, max_frac)
+    if take <= 0:
+        return 0
+    rs2 = await _exec(
+        """UPDATE pending_salary
+           SET frac_delta = frac_delta - ?,
+               updated_at = datetime('now')
+           WHERE chat_id = ? AND user_id = ? AND day = ? AND frac_delta >= ?""",
+        [take, chat_id, user_id, day, take],
+    )
+    if getattr(rs2, "error", False):
+        return 0
+    if (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        return 0
+    return take
+
+
+async def return_pending_salary(chat_id: int, user_id: int, day: str, frac: int) -> bool:
+    """Вернуть снятые дроби обратно (при сбое начисления)."""
+    if frac <= 0:
+        return True
+    return await add_pending_salary(chat_id, user_id, day, frac)
+
+
+async def cleanup_pending_salary(keep_days: int = 2) -> int:
+    rs = await _exec(
+        "DELETE FROM pending_salary WHERE day < date('now', ?)",
+        [f"-{int(keep_days)} days"],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 # ---------- salary ----------
