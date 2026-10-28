@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
-MODEL = "qwen-coder"
+MODEL = "openai-fast"
 
 COOLDOWN_SEC = 5.0
 
