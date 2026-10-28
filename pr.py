@@ -1,15 +1,4 @@
-"""Логика PR-бота: проверка подписки, удаление сообщений, приглашение.
-
-P1: _looks_like_admin_command — белый список «команд, которые должны
-работать без подписки» (первое слово совпадает полностью, а не по
-префиксу).
-
-P2: сообщения-реплаи на сообщения бота (для чата с ИИ) не удаляются
-и не требуют подписки — иначе бот режет свой же диалог.
-
-P2: добавлены новые экономические команды (Перевод, Казна, -Монеты,
-казино) в белый список, чтобы они работали без подписки.
-"""
+"""Логика PR-бота: проверка подписки, удаление сообщений, приглашение."""
 import os
 import logging
 from html import escape
@@ -33,22 +22,15 @@ CANAL_ID = int(os.getenv("CANAL_ID", "0") or "0")
 CANAL_URL = os.getenv("CANAL_URL", "https://t.me/")
 CANAL_TITLE = os.getenv("CANAL_TITLE", "наш канал")
 
-# Команды, которые должны работать даже без подписки.
-# Первое слово сравнивается полностью (casefold), не по префиксу.
 _ADMIN_WORDS = {
-    # общие
     "топ", "шип", "сделать", "профиль", "мой", "мое",
     "список", "поймать", "хо",
-    "статы", "stats", "start", "ping", "check",
-    "help", "restart", "казино", "казик",
-    # ИИ
+    "stats", "start", "ping", "check",
+    "help", "restart", "казино",
     "ии", "браин", "браини", "мозг", "brainy", "brain",
-    # экономика
     "перевод", "казна",
     "кредит", "монеты",
-    # игры/аура
     "дроч", "аура",
-    # действия
     "дать", "поцеловать", "обнять", "побить", "обоссать", "погладить",
 }
 
@@ -72,6 +54,8 @@ def _is_reply_to_bot(msg: Message, bot_id: int) -> bool:
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
+    if not CANAL_ID:
+        return True
     try:
         member = await bot.get_chat_member(chat_id=CANAL_ID, user_id=user_id)
         return member.status not in (ChatMember.LEFT, ChatMember.BANNED)
