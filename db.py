@@ -233,6 +233,9 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
+        ("users", "salary_today", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "salary_day", "TEXT"),
+        ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
     ]
@@ -520,6 +523,57 @@ async def treasury_reset(chat_id: int) -> int:
     return getattr(rs, "rows_affected", 0) or 0
 
 
+async def treasury_withdraw(chat_id: int, amount: int) -> bool:
+    """Списывает amount из казны. False, если не хватает."""
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE treasury SET balance = balance - ?
+           WHERE chat_id = ? AND balance >= ?""",
+        [amount, chat_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+# ---------- tax ----------
+
+async def tax_active_balances(min_balance: int, pct: int, days: int = 1) -> int:
+    """Списывает pct% с баланса > min_balance ТОЛЬКО у тех, кто писал
+    за последние `days` дней. Возвращает суммарно списанное.
+
+    Неактивные не платят — баланс сохраняется (Вася вернётся без долга).
+    В минус не уводит: WHERE balance > min_balance.
+    """
+    rs = await _exec(
+        f"""SELECT COALESCE(SUM(CAST(u.balance * ? / 100 AS INTEGER)), 0)
+            FROM users u
+            WHERE u.balance > ?
+              AND EXISTS (
+                  SELECT 1 FROM messages_day m
+                  WHERE m.user_id = u.user_id
+                    AND m.day >= date('now', '-{int(days)} days')
+              )""",
+        [pct, min_balance],
+    )
+    total = (rs.rows[0][0] if rs.rows else 0) or 0
+    if total <= 0:
+        return 0
+    await _exec(
+        f"""UPDATE users
+            SET balance = balance - CAST(balance * ? / 100 AS INTEGER)
+            WHERE balance > ?
+              AND EXISTS (
+                  SELECT 1 FROM messages_day m
+                  WHERE m.user_id = users.user_id
+                    AND m.day >= date('now', '-{int(days)} days')
+              )""",
+        [pct, min_balance],
+    )
+    return total
+
+
 # ---------- transfers ----------
 
 async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bool:
@@ -556,6 +610,116 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
         )
         return False
     return True
+
+
+# ---------- salary (за активность) ----------
+
+async def add_salary_atomic(user_id: int, day: str, delta: int) -> bool:
+    """Прибавляет delta к salary_today и balance. Если день сменился — сбрасывает.
+
+    Возвращает True, если запись прошла.
+    """
+    if delta <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) + ?,
+               salary_today = CASE
+                   WHEN salary_day = ? THEN COALESCE(salary_today, 0) + ?
+                   ELSE ?
+               END,
+               salary_day = ?
+           WHERE user_id = ?""",
+        [delta, day, delta, delta, day, user_id],
+    )
+    if getattr(rs, "error", False):
+        return False
+    if (getattr(rs, "rows_affected", 0) or 0) > 0:
+        return True
+    rs2 = await _exec(
+        """INSERT INTO users (user_id, balance, salary_today, salary_day)
+           VALUES (?, 10 + ?, ?, ?)""",
+        [user_id, delta, delta, day],
+    )
+    return not getattr(rs2, "error", False)
+
+
+async def add_salary_frac_atomic(
+    user_id: int, day: str, frac_delta: int,
+) -> Optional[int]:
+    """Прибавляет frac_delta сотых к salary_frac. Накопленные 100 → 1 монета.
+
+    Возвращает число начисленных целых монет (0 или больше), None при ошибке.
+    """
+    if frac_delta <= 0:
+        return 0
+
+    rs = await _exec(
+        "SELECT salary_frac, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if not rs.rows:
+        coins = frac_delta // 100
+        new_frac = frac_delta % 100
+        rs2 = await _exec(
+            """INSERT INTO users
+                 (user_id, balance, salary_frac, salary_day, salary_today)
+               VALUES (?, 10 + ?, ?, ?, ?)""",
+            [user_id, coins, new_frac, day, coins],
+        )
+        if getattr(rs2, "error", False):
+            return None
+        return coins
+
+    cur_frac, cur_day = rs.rows[0]
+    if cur_day != day:
+        cur_frac = 0
+
+    total = (cur_frac or 0) + frac_delta
+    coins = total // 100
+    new_frac = total % 100
+
+    rs2 = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) + ?,
+               salary_frac = ?,
+               salary_day = ?,
+               salary_today = CASE
+                   WHEN salary_day = ? THEN COALESCE(salary_today, 0) + ?
+                   ELSE ?
+               END
+           WHERE user_id = ?""",
+        [coins, new_frac, day, day, coins, coins, user_id],
+    )
+    if getattr(rs2, "error", False):
+        return None
+    return coins
+
+
+async def get_salary_today(user_id: int, day: str) -> int:
+    rs = await _exec(
+        "SELECT salary_today, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if not rs.rows:
+        return 0
+    today_val, today_day = rs.rows[0]
+    if today_day != day:
+        return 0
+    return today_val or 0
+
+
+async def get_salary_frac(user_id: int, day: str) -> int:
+    rs = await _exec(
+        "SELECT salary_frac, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if not rs.rows:
+        return 0
+    frac, d = rs.rows[0]
+    if d != day:
+        return 0
+    return frac or 0
 
 
 # ---------- subscriptions ----------
