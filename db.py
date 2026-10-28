@@ -225,30 +225,6 @@ async def _create_tables() -> None:
             created_at  TEXT DEFAULT (datetime('now'))
         )
     """)
-    await _exec("""
-        CREATE TABLE IF NOT EXISTS purchases (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            item_id    TEXT NOT NULL,
-            price      INTEGER NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    await _exec("""
-        CREATE TABLE IF NOT EXISTS user_cosmetics (
-            user_id    INTEGER PRIMARY KEY,
-            prefix     TEXT,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    await _exec("""
-        CREATE TABLE IF NOT EXISTS temp_roles (
-            user_id     INTEGER PRIMARY KEY,
-            role        TEXT NOT NULL,
-            expires_at  TEXT NOT NULL,
-            granted_at  TEXT DEFAULT (datetime('now'))
-        )
-    """)
 
 
 async def _migrate_tables() -> None:
@@ -267,7 +243,6 @@ async def _migrate_tables() -> None:
         ("users", "salary_day", "TEXT"),
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "avatar_file_id", "TEXT"),
-        ("users", "top_bonus", "INTEGER NOT NULL DEFAULT 0"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
     ]
@@ -305,10 +280,6 @@ async def _migrate_tables() -> None:
         "ON aura(chat_id, value DESC)",
         "CREATE INDEX IF NOT EXISTS idx_awards_user "
         "ON awards(chat_id, user_id, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_purchases_user "
-        "ON purchases(user_id, created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_temp_roles_expires "
-        "ON temp_roles(expires_at)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -384,7 +355,6 @@ async def set_sss(user_id: int, is_member: bool) -> bool:
         [1 if is_member else 0, user_id],
     )
     if getattr(rs, "error", False):
-        logger.error("set_sss: ошибка БД (user=%s member=%s)", user_id, is_member)
         return False
     return True
 
@@ -400,7 +370,6 @@ async def add_balance(user_id: int, delta: int) -> bool:
         [delta, user_id],
     )
     if getattr(rs, "error", False):
-        logger.error("add_balance: ошибка UPDATE (user=%s delta=%s)", user_id, delta)
         return False
     if (getattr(rs, "rows_affected", 0) or 0) == 0:
         rs2 = await _exec(
@@ -409,8 +378,6 @@ async def add_balance(user_id: int, delta: int) -> bool:
             [user_id, delta],
         )
         if getattr(rs2, "error", False):
-            logger.error("add_balance: ошибка INSERT (user=%s delta=%s)",
-                         user_id, delta)
             return False
     return True
 
@@ -425,8 +392,6 @@ async def take_balance_atomic(user_id: int, amount: int) -> bool:
         [amount, user_id, amount],
     )
     if getattr(rs, "error", False):
-        logger.error("take_balance_atomic: ошибка БД (user=%s amount=%s)",
-                     user_id, amount)
         return False
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
@@ -1198,17 +1163,14 @@ async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
          chat_id, user1_id, user2_id, user1_id, user2_id],
     )
     if getattr(rs, "error", False):
-        logger.error("create_proposal: ошибка INSERT (chat=%s)", chat_id)
         return 0
     rs2 = await _exec(
         "SELECT id FROM marriages WHERE client_token = ? LIMIT 1", [token],
     )
     if getattr(rs2, "error", False):
-        logger.error("create_proposal: ошибка SELECT по token (chat=%s)", chat_id)
         await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
         return 0
     if not rs2.rows:
-        logger.info("create_proposal: не вставлено (chat=%s)", chat_id)
         await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
         return 0
     return rs2.rows[0][0]
@@ -1232,7 +1194,6 @@ async def accept_marriage(marriage_id: int) -> int:
         [marriage_id],
     )
     if getattr(rs, "error", False):
-        logger.error("accept_marriage(%s): ошибка БД", marriage_id)
         return 0
     return getattr(rs, "rows_affected", 0) or 0
 
@@ -1250,7 +1211,6 @@ async def get_marriage(marriage_id: int) -> Optional[dict]:
         [marriage_id],
     )
     if getattr(rs, "error", False):
-        logger.error("get_marriage(%s): ошибка БД", marriage_id)
         return None
     if not rs.rows:
         return None
@@ -1290,10 +1250,6 @@ async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
         [chat_id, user1_id, user2_id, event, by_user_id],
     )
     if getattr(rs, "error", False):
-        logger.error(
-            "log_marriage_event: ошибка записи (chat=%s event=%s)",
-            chat_id, event,
-        )
         return False
     return True
 
@@ -1320,7 +1276,6 @@ async def add_warning(chat_id: int, user_id: int, issued_by: int,
         [chat_id, user_id, issued_by, reason, expires_at],
     )
     if getattr(rs, "error", False):
-        logger.error("add_warning: ошибка INSERT (user=%s)", user_id)
         return 0
     rs2 = await _exec(
         """SELECT id FROM warnings
@@ -1390,7 +1345,6 @@ async def add_complaint(chat_id: int, target_id: int, reporter_id: int,
         [chat_id, target_id, reporter_id, message_id],
     )
     if getattr(rs, "error", False):
-        logger.error("add_complaint: ошибка INSERT (target=%s)", target_id)
         return 0
     rs2 = await _exec(
         """SELECT id FROM complaints
@@ -1470,7 +1424,6 @@ async def aura_droch(chat_id: int, user_id: int) -> bool:
         [chat_id, user_id],
     )
     if getattr(rs, "error", False):
-        logger.error("aura_droch: ошибка БД (chat=%s user=%s)", chat_id, user_id)
         return False
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
@@ -1532,7 +1485,6 @@ async def add_award(chat_id: int, user_id: int, title: str, stars: int,
         [chat_id, user_id, title, stars, issued_by],
     )
     if getattr(rs, "error", False):
-        logger.error("add_award: ошибка INSERT (user=%s)", user_id)
         return 0
     rs2 = await _exec(
         """SELECT id FROM awards
@@ -1594,104 +1546,6 @@ async def count_awards(chat_id: int, user_id: int) -> int:
     if not rs.rows:
         return 0
     return rs.rows[0][0] or 0
-
-
-# ---------- shop ----------
-
-async def log_purchase(user_id: int, item_id: str, price: int) -> None:
-    await _exec(
-        """INSERT INTO purchases (user_id, item_id, price)
-           VALUES (?, ?, ?)""",
-        [user_id, item_id, price],
-    )
-
-
-async def set_prefix(user_id: int, prefix: str) -> bool:
-    rs = await _exec(
-        """INSERT INTO user_cosmetics (user_id, prefix, updated_at)
-           VALUES (?, ?, datetime('now'))
-           ON CONFLICT(user_id) DO UPDATE SET
-             prefix = excluded.prefix,
-             updated_at = datetime('now')""",
-        [user_id, prefix],
-    )
-    return not getattr(rs, "error", False)
-
-
-async def get_prefix(user_id: int) -> Optional[str]:
-    rs = await _exec(
-        "SELECT prefix FROM user_cosmetics WHERE user_id = ?", [user_id],
-    )
-    if not rs.rows:
-        return None
-    return rs.rows[0][0]
-
-
-async def set_temp_role(user_id: int, role: str, expires_at: str) -> bool:
-    rs = await _exec(
-        """INSERT INTO temp_roles (user_id, role, expires_at, granted_at)
-           VALUES (?, ?, ?, datetime('now'))
-           ON CONFLICT(user_id) DO UPDATE SET
-             role = excluded.role,
-             expires_at = excluded.expires_at,
-             granted_at = datetime('now')""",
-        [user_id, role, expires_at],
-    )
-    return not getattr(rs, "error", False)
-
-
-async def get_temp_role(user_id: int) -> Optional[dict]:
-    rs = await _exec(
-        """SELECT role, expires_at FROM temp_roles
-           WHERE user_id = ? AND expires_at > datetime('now')""",
-        [user_id],
-    )
-    if not rs.rows:
-        return None
-    r = rs.rows[0]
-    return {"role": r[0], "expires_at": r[1]}
-
-
-async def list_expired_temp_roles() -> List[tuple]:
-    rs = await _exec(
-        "SELECT user_id, role FROM temp_roles WHERE expires_at <= datetime('now')",
-    )
-    return [(r[0], r[1]) for r in rs.rows]
-
-
-async def delete_temp_role(user_id: int) -> int:
-    rs = await _exec("DELETE FROM temp_roles WHERE user_id = ?", [user_id])
-    return getattr(rs, "rows_affected", 0) or 0
-
-
-async def add_top_bonus(user_id: int, delta: int) -> bool:
-    rs = await _exec(
-        "UPDATE users SET top_bonus = COALESCE(top_bonus, 0) + ? WHERE user_id = ?",
-        [delta, user_id],
-    )
-    return not getattr(rs, "error", False)
-
-
-async def get_top_bonus(user_id: int) -> int:
-    rs = await _exec(
-        "SELECT COALESCE(top_bonus, 0) FROM users WHERE user_id = ?", [user_id],
-    )
-    if not rs.rows:
-        return 0
-    return rs.rows[0][0] or 0
-
-
-async def add_aura_bonus(chat_id: int, user_id: int, delta: int) -> bool:
-    if delta == 0:
-        return True
-    await _exec(
-        """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
-           VALUES (?, ?, ?, NULL)
-           ON CONFLICT(chat_id, user_id) DO UPDATE SET
-             value = value + excluded.value""",
-        [chat_id, user_id, delta],
-    )
-    return True
 
 
 # ---------- avatar ----------
