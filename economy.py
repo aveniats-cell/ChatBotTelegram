@@ -1,22 +1,9 @@
-"""Экономика: кредит, монеты, перевод, казна, налог, зарплата, проценты.
-
-- +Кредит / -Кредит — кредит (1–100, раз в день), погашение.
-- +Монеты / -Монеты — админ начисляет/списывает.
-- Перевод — перевод с комиссией 3%.
-- Казна — баланс казны чата (админ).
-- +ВКассу — админ пополняет казну.
-- Налог дня — раз в день списывает 3% с баланса > 50 только у активных,
-  кладёт в казну, пишет отчёт в чат.
-- Зарплата за активность (0.2 монеты за сообщение) — считается в top.py.
-- -Утил N @user — сжечь монеты у юзера (в никуда).
-- -Утил N казна — сжечь монеты из казны (в никуда).
-- +Утил N @user — начислить монеты (из воздуха).
-- +Утил N казна — начислить монеты в казну (из воздуха).
-"""
+"""Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
+проценты в казну, дефолт, топ богачи."""
 import os
 import re
 import logging
-from datetime import time as dtime, datetime, timezone
+from datetime import time as dtime, datetime, timezone, timedelta
 from html import escape
 
 from telegram import Update
@@ -46,6 +33,10 @@ TAX_MIN_BALANCE = 50
 TAX_ACTIVE_DAYS = 1
 TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
+DEFAULT_MIN_BALANCE = 100
+DEFAULT_PCT = 10
+DEFAULT_COOLDOWN_HOURS = 24
+
 TZ = timezone.utc
 
 
@@ -53,12 +44,13 @@ def _today_utc() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-# ---------- +Кредит / -Кредит ----------
+# ---------- Кредит из казны ----------
 
 async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    chat = update.effective_chat
     msg = update.effective_message
-    if not user or not msg:
+    if not user or not chat or not msg:
         return
 
     text = msg.text or ""
@@ -88,8 +80,7 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if balance < 0:
         await msg.reply_text(
-            "⛔ У вас отрицательный баланс — новый кредит взять нельзя.\n"
-            "Погасите долг: <code>-Кредит СУММА</code> или попросите админа.",
+            "⛔ У вас отрицательный баланс — новый кредит взять нельзя.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -100,49 +91,41 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     if taken_day == _today_utc():
+        await msg.reply_text("⛔ Вы уже брали кредит сегодня.")
+        return
+
+    treasury = await db.treasury_get(chat.id)
+    if treasury < amount:
         await msg.reply_text(
-            "⛔ Вы уже брали кредит сегодня. Повторите завтра.",
+            f"🏦 Банк пуст: в казне <b>{treasury}</b>, нужно <b>{amount}</b>.\n"
+            f"Кредиты временно недоступны.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    ok = await db.take_credit_daily_atomic(
-        user.id, amount, _today_utc(), balance_floor=0,
-    )
+    ok = await db.take_credit_from_treasury(chat.id, user.id, amount, _today_utc())
     if not ok:
-        fresh = await db.get_user(user.id)
-        f_balance = (fresh or {}).get("balance") or 0
-        f_credit = (fresh or {}).get("credit") or 0
-        f_day = (fresh or {}).get("credit_taken_day")
-        if f_credit > 0:
-            reason = f"У вас уже есть долг <b>{f_credit}</b>."
-        elif f_day == _today_utc():
-            reason = "Вы уже брали кредит сегодня."
-        elif f_balance < 0:
-            reason = "У вас отрицательный баланс."
-        else:
-            reason = "Не удалось выдать кредит (ошибка БД). Попробуйте позже."
-        await msg.reply_text(
-            f"⛔ Кредит не выдан. {reason}",
-            parse_mode=ParseMode.HTML,
-        )
+        await msg.reply_text("⚠️ Не удалось выдать кредит. Попробуйте позже.")
         return
 
     new_row = await db.get_user(user.id)
-    new_credit = (new_row or {}).get("credit") or (credit + amount)
+    new_credit = (new_row or {}).get("credit") or amount
+    new_treasury = await db.treasury_get(chat.id)
     await msg.reply_text(
-        f"💳 Взят кредит: <b>{amount}</b>\n"
+        f"💳 Взят кредит из казны: <b>{amount}</b>\n"
         f"Долг: <b>{new_credit}</b>\n"
-        f"Ставка: <b>{CREDIT_PERCENT_PER_DAY}%</b> в день на остаток.\n"
-        f"Погасить: <code>-Кредит СУММА</code>",
+        f"Казна: <b>{new_treasury}</b>\n"
+        f"Ставка: <b>{CREDIT_PERCENT_PER_DAY}%</b> в день (идёт в казну).",
         parse_mode=ParseMode.HTML,
     )
+    await _check_default_after(context, chat.id)
 
 
 async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    chat = update.effective_chat
     msg = update.effective_message
-    if not user or not msg:
+    if not user or not chat or not msg:
         return
 
     text = msg.text or ""
@@ -167,7 +150,7 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if balance <= 0:
         await msg.reply_text(
-            f"⛔ Недостаточно монет для погашения. Баланс: <b>{balance}</b>.",
+            f"⛔ Недостаточно монет. Баланс: <b>{balance}</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -177,26 +160,25 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await msg.reply_text("⛔ Нечего погашать.")
         return
 
-    ok = await db.repay_credit_atomic(user.id, amount)
+    ok = await db.repay_credit_to_treasury(chat.id, user.id, amount)
     if not ok:
-        await msg.reply_text(
-            "⚠️ Не удалось погасить (ошибка БД или изменился баланс). "
-            "Попробуйте ещё раз."
-        )
+        await msg.reply_text("⚠️ Не удалось погасить. Попробуйте ещё раз.")
         return
 
     new_row = await db.get_user(user.id)
     new_credit = (new_row or {}).get("credit") or 0
     new_balance = (new_row or {}).get("balance") or 0
+    new_treasury = await db.treasury_get(chat.id)
     await msg.reply_text(
-        f"✅ Погашено <b>{amount}</b>.\n"
+        f"✅ Погашено <b>{amount}</b> в казну.\n"
         f"Остаток долга: <b>{new_credit}</b>.\n"
-        f"Баланс: <b>{new_balance}</b>.",
+        f"Баланс: <b>{new_balance}</b>.\n"
+        f"Казна: <b>{new_treasury}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
 
-# ---------- +Монеты / -Монеты (админ) ----------
+# ---------- +Монеты / -Монеты ----------
 
 async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -211,8 +193,7 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     m = re.search(r"\+Монеты\s+(-?\d+)", text, re.IGNORECASE)
     if not m:
         await msg.reply_text(
-            "Формат: <code>+Монеты 100 @user</code> или реплай + "
-            "<code>+Монеты 100</code>.",
+            "Формат: <code>+Монеты 100 @user</code> или реплай.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -230,19 +211,11 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     ok = await db.add_balance(uid, amount)
     if not ok:
-        await msg.reply_text(
-            "⚠️ Не удалось изменить баланс (ошибка БД). Попробуйте ещё раз."
-        )
+        await msg.reply_text("⚠️ Не удалось изменить баланс.")
         return
 
     new_row = await db.get_user(uid)
-    if not new_row:
-        await msg.reply_text(
-            "⚠️ Баланс изменён, но профиль не читается. Проверьте «Профиль»."
-        )
-        return
-    new_balance = new_row.get("balance") or 0
-
+    new_balance = (new_row or {}).get("balance") or 0
     sign = "+" if amount >= 0 else ""
     await msg.reply_text(
         f"💰 {escape(str(name))}: <b>{sign}{amount}</b>\n"
@@ -264,8 +237,7 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
     m = re.search(r"[-–−]Монеты\s+(\d+)", text, re.IGNORECASE)
     if not m:
         await msg.reply_text(
-            "Формат: <code>-Монеты 100 @user</code> или реплай + "
-            "<code>-Монеты 100</code>.",
+            "Формат: <code>-Монеты 100 @user</code> или реплай.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -284,7 +256,7 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
     taken = await db.take_balance_any(uid, amount)
     if taken == 0:
         await msg.reply_text(
-            f"⚠️ У {escape(str(name))} нечего списывать (баланс 0 или меньше).",
+            f"⚠️ У {escape(str(name))} нечего списывать.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -300,7 +272,7 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
     new_balance = (new_row or {}).get("balance") or 0
     note = ""
     if taken < amount:
-        note = f"\n<i>Списано меньше запрошенного: было только {taken}.</i>"
+        note = f"\n<i>Списано меньше: было только {taken}.</i>"
     await msg.reply_text(
         f"💸 {escape(str(name))}: <b>-{taken}</b>\n"
         f"Баланс: <b>{new_balance}</b>{note}",
@@ -321,8 +293,7 @@ async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     m = re.search(r"(?i)^Перевод\s+(\d+)", text)
     if not m:
         await msg.reply_text(
-            "Формат: <code>Перевод 100 @user</code> или реплай + "
-            "<code>Перевод 100</code>.\n"
+            "Формат: <code>Перевод 100 @user</code> или реплай.\n"
             f"Комиссия: {TRANSFER_FEE_PCT}% (мин. {TRANSFER_FEE_MIN}), "
             f"минимум перевода — {TRANSFER_MIN}.",
             parse_mode=ParseMode.HTML,
@@ -373,8 +344,7 @@ async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await msg.reply_text(
         f"💸 <b>Перевод</b>\n"
         f"Кому: {escape(str(name))}\n"
-        f"Сумма: <b>{amount}</b> · комиссия <b>{fee}</b> "
-        f"({TRANSFER_FEE_PCT}%, мин. {TRANSFER_FEE_MIN})\n"
+        f"Сумма: <b>{amount}</b> · комиссия <b>{fee}</b>\n"
         f"Получатель получил: <b>{net}</b>\n"
         f"Ваш баланс: <b>{new_bal}</b>",
         parse_mode=ParseMode.HTML,
@@ -395,15 +365,12 @@ async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bal = await db.treasury_get(chat.id)
     await msg.reply_text(
         f"🏦 <b>Казна чата</b>\n"
-        f"Накоплено: <b>{bal}</b> монет\n\n"
-        f"<i>Сюда идут комиссии казино, крестиков-ноликов, переводов, "
-        f"налог и списания через -Монеты.</i>",
+        f"Накоплено: <b>{bal}</b> монет",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_treasury_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+ВКассу N — админ пополняет казну."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -414,34 +381,21 @@ async def cmd_treasury_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     m = re.search(r"\+ВКассу\s+(\d+)", msg.text or "", re.IGNORECASE)
     if not m:
-        await msg.reply_text(
-            "Формат: <code>+ВКассу 500</code>", parse_mode=ParseMode.HTML,
-        )
+        await msg.reply_text("Формат: <code>+ВКассу 500</code>", parse_mode=ParseMode.HTML)
         return
     amount = int(m.group(1))
     if amount <= 0:
         await msg.reply_text("⛔ Сумма должна быть положительной.")
         return
-
-    admin_row = await db.get_user(user.id)
-    admin_bal = (admin_row or {}).get("balance") or 0
-    if admin_bal >= amount:
-        ok = await db.take_balance_atomic(user.id, amount)
-        if not ok:
-            await msg.reply_text("⚠️ Не удалось списать с баланса.")
-            return
-
     await db.treasury_add(chat.id, amount)
     new_treasury = await db.treasury_get(chat.id)
     await msg.reply_text(
-        f"🏦 В казну добавлено: <b>{amount}</b>\n"
-        f"Казна: <b>{new_treasury}</b>",
+        f"🏦 В казну добавлено: <b>{amount}</b>\nКазна: <b>{new_treasury}</b>",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_treasury_trim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ОбрезатьКасну N — оставить N монет, остальное сжечь. Только админ."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -450,13 +404,10 @@ async def cmd_treasury_trim(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
-
     m = re.search(r"ОбрезатьКасну\s+(\d+)", msg.text or "", re.IGNORECASE)
     if not m:
         await msg.reply_text(
-            "Формат: <code>ОбрезатьКасну 5000</code> — оставить 5000, "
-            "остальное сжечь.\n\n"
-            "⚠️ Необратимо.",
+            "Формат: <code>ОбрезатьКасну 15000</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -464,13 +415,144 @@ async def cmd_treasury_trim(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if keep < 0:
         await msg.reply_text("⛔ Не может быть отрицательным.")
         return
-
     burned = await db.treasury_trim(chat.id, keep)
     new_bal = await db.treasury_get(chat.id)
     await msg.reply_text(
-        f"🔥 <b>Обрезка казны</b>\n"
-        f"Сожжено: <b>{burned}</b>\n"
-        f"Осталось: <b>{new_bal}</b>",
+        f"🔥 Сожжено: <b>{burned}</b>\nОсталось: <b>{new_bal}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- -Утил / +Утил ----------
+
+async def cmd_burn_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    m = re.search(r"[-–−]Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>-Утил 100 казна</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    burned = await db.burn_treasury(chat.id, amount)
+    if burned == 0:
+        await msg.reply_text("⚠️ В казне нечего сжигать.")
+        return
+    new_bal = await db.treasury_get(chat.id)
+    await msg.reply_text(
+        f"🔥 Казна: сожжено <b>{burned}</b>\nОсталось: <b>{new_bal}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    await _check_default_after(context, chat.id)
+
+
+async def cmd_burn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    text = msg.text or ""
+    m = re.search(r"[-–−]Утил\s+(\d+)", text, re.IGNORECASE)
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>-Утил 100 @user</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+    clean = re.sub(r"[-–−]Утил\s+\d+", "", text, flags=re.IGNORECASE).strip()
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажите @username или сделайте реплай.")
+        return
+    uid, name = target
+    burned = await db.burn_balance(uid, amount)
+    if burned == 0:
+        await msg.reply_text(
+            f"⚠️ У {escape(str(name))} нечего сжигать.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    new_row = await db.get_user(uid)
+    new_balance = (new_row or {}).get("balance") or 0
+    await msg.reply_text(
+        f"🔥 {escape(str(name))}: <b>-{burned}</b>\n"
+        f"Баланс: <b>{new_balance}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_mint_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    m = re.search(r"\+Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
+    if not m:
+        await msg.reply_text("Формат: <code>+Утил 100 казна</code>", parse_mode=ParseMode.HTML)
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+    await db.treasury_add(chat.id, amount)
+    new_bal = await db.treasury_get(chat.id)
+    await msg.reply_text(
+        f"✨ Казна: +{amount}\nКазна: <b>{new_bal}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_mint_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    text = msg.text or ""
+    m = re.search(r"\+Утил\s+(\d+)", text, re.IGNORECASE)
+    if not m:
+        await msg.reply_text("Формат: <code>+Утил 100 @user</code>", parse_mode=ParseMode.HTML)
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+    clean = re.sub(r"\+Утил\s+\d+", "", text, flags=re.IGNORECASE)
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажите @username или сделайте реплай.")
+        return
+    uid, name = target
+    ok = await db.add_balance(uid, amount)
+    if not ok:
+        await msg.reply_text("⚠️ Не удалось начислить.")
+        return
+    new_row = await db.get_user(uid)
+    new_balance = (new_row or {}).get("balance") or 0
+    await msg.reply_text(
+        f"✨ {escape(str(name))}: <b>+{amount}</b>\n"
+        f"Баланс: <b>{new_balance}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -494,177 +576,96 @@ async def cmd_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ---------- -Утил / +Утил ----------
+# ---------- Топ богачи ----------
 
-async def cmd_burn_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Утил N казна — сжечь N монет из казны. Только админ."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
-        return
-    if not ADMIN_ID or user.id != ADMIN_ID:
-        await msg.reply_text("⛔ Только админ.")
-        return
-    m = re.search(r"[-–−]Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
-    if not m:
-        await msg.reply_text(
-            "Формат: <code>-Утил 100 казна</code>\n"
-            "<i>Сжигает монеты из казны (в никуда).</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await _burn_treasury(update, context, int(m.group(1)))
-
-
-async def _burn_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                         amount: int) -> None:
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not chat or not msg:
-        return
-    burned = await db.burn_treasury(chat.id, amount)
-    if burned == 0:
-        await msg.reply_text("⚠️ В казне нечего сжигать.")
-        return
-    new_bal = await db.treasury_get(chat.id)
-    note = ""
-    if burned < amount:
-        note = f"\n<i>Сожжено меньше запрошенного: в казне было только {burned}.</i>"
-    await msg.reply_text(
-        f"🔥 <b>Казна</b>: сожжено <b>{burned}</b>\n"
-        f"Осталось: <b>{new_bal}</b>{note}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_burn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Утил N @user (или реплай) — сжечь N монет у юзера. Только админ."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
-        return
-    if not ADMIN_ID or user.id != ADMIN_ID:
-        await msg.reply_text("⛔ Только админ.")
-        return
-
-    text = msg.text or ""
-    m = re.search(r"[-–−]Утил\s+(\d+)", text, re.IGNORECASE)
-    if not m:
-        await msg.reply_text(
-            "Формат: <code>-Утил 100 @user</code> или реплай + "
-            "<code>-Утил 100</code>.\n"
-            "<i>Сжигает монеты (в никуда).</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    amount = int(m.group(1))
-    if amount <= 0:
-        await msg.reply_text("⛔ Сумма должна быть положительной.")
-        return
-
-    clean = re.sub(r"[-–−]Утил\s+\d+", "", text, flags=re.IGNORECASE).strip()
-
-    target = await utils.resolve_target(update, context, clean)
-    if not target:
-        await msg.reply_text("Укажите @username, «казна» или сделайте реплай.")
-        return
-    uid, name = target
-
-    burned = await db.burn_balance(uid, amount)
-    if burned == 0:
-        await msg.reply_text(
-            f"⚠️ У {escape(str(name))} нечего сжигать (баланс 0 или меньше).",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    new_row = await db.get_user(uid)
-    new_balance = (new_row or {}).get("balance") or 0
-    note = ""
-    if burned < amount:
-        note = f"\n<i>Сожжено меньше запрошенного: было только {burned}.</i>"
-    await msg.reply_text(
-        f"🔥 {escape(str(name))}: <b>-{burned}</b>\n"
-        f"Баланс: <b>{new_balance}</b>{note}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_mint_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Утил N казна — начислить N монет в казну (из воздуха). Только админ."""
+async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg:
         return
-    if not ADMIN_ID or user.id != ADMIN_ID:
-        await msg.reply_text("⛔ Только админ.")
+    rows = await db.top_balances(20)
+    if not rows:
+        await msg.reply_text("Топ богачей пуст.")
         return
-    m = re.search(r"\+Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
-    if not m:
-        await msg.reply_text(
-            "Формат: <code>+Утил 100 казна</code>",
+    lines = ["💰 <b>Топ богачи</b>"]
+    for i, (uid, bal) in enumerate(rows, start=1):
+        name = str(uid)
+        try:
+            c = await context.bot.get_chat(uid)
+            name = c.first_name or c.username or str(uid)
+        except TelegramError:
+            pass
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lines.append(f"{medal} {escape(name)} — <b>{bal}</b>")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------- Дефолт ----------
+
+async def _run_default(context, chat_id: int) -> bool:
+    last = await db.get_last_default(chat_id)
+    if last:
+        try:
+            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            if (datetime.now(TZ) - last_dt) < timedelta(hours=DEFAULT_COOLDOWN_HOURS):
+                return False
+        except Exception:
+            pass
+
+    total = await db.treasury_default_collect(
+        chat_id, DEFAULT_MIN_BALANCE, DEFAULT_PCT,
+    )
+    if total <= 0:
+        return False
+
+    await db.treasury_add(chat_id, total)
+    await db.set_last_default(chat_id, datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"))
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🏦 <b>ДЕФОЛТ</b>\n"
+                f"Казна пуста. Собираем <b>{DEFAULT_PCT}%</b> с баланса > {DEFAULT_MIN_BALANCE}.\n"
+                f"Собрано: <b>{total}</b> монет в казну.\n"
+                f"<i>Зарплата и кредиты возобновятся, когда казна пополнится.</i>"
+            ),
             parse_mode=ParseMode.HTML,
         )
-        return
-    amount = int(m.group(1))
-    if amount <= 0:
-        await msg.reply_text("⛔ Сумма должна быть положительной.")
-        return
-    await db.treasury_add(chat.id, amount)
-    new_bal = await db.treasury_get(chat.id)
-    await msg.reply_text(
-        f"✨ <b>Казна</b>: +{amount}\n"
-        f"Казна: <b>{new_bal}</b>",
-        parse_mode=ParseMode.HTML,
-    )
+    except TelegramError as e:
+        logger.warning("default send: %s", e)
+
+    return True
 
 
-async def cmd_mint_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Утил N @user — начислить N монет (из воздуха). Только админ."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
+async def _check_default_after(context, chat_id: int) -> None:
+    try:
+        bal = await db.treasury_get(chat_id)
+    except Exception as e:
+        logger.warning("_check_default_after: %s", e)
         return
-    if not ADMIN_ID or user.id != ADMIN_ID:
-        await msg.reply_text("⛔ Только админ.")
+    if bal > 0:
         return
-    text = msg.text or ""
-    m = re.search(r"\+Утил\s+(\d+)", text, re.IGNORECASE)
-    if not m:
-        await msg.reply_text(
-            "Формат: <code>+Утил 100 @user</code> или реплай.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    amount = int(m.group(1))
-    if amount <= 0:
-        await msg.reply_text("⛔ Сумма должна быть положительной.")
-        return
-    clean = re.sub(r"\+Утил\s+\d+", "", text, flags=re.IGNORECASE)
-    target = await utils.resolve_target(update, context, clean)
-    if not target:
-        await msg.reply_text("Укажите @username или сделайте реплай.")
-        return
-    uid, name = target
-    ok = await db.add_balance(uid, amount)
-    if not ok:
-        await msg.reply_text("⚠️ Не удалось начислить (ошибка БД).")
-        return
-    new_row = await db.get_user(uid)
-    new_balance = (new_row or {}).get("balance") or 0
-    await msg.reply_text(
-        f"✨ {escape(str(name))}: <b>+{amount}</b>\n"
-        f"Баланс: <b>{new_balance}</b>",
-        parse_mode=ParseMode.HTML,
-    )
+    await _run_default(context, chat_id)
 
 
-# ---------- Ежедневный налог ----------
+async def default_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = int(os.getenv("CHAT_ID", "0") or "0")
+    if not chat_id:
+        return
+    try:
+        bal = await db.treasury_get(chat_id)
+    except Exception as e:
+        logger.warning("default_watchdog: %s", e)
+        return
+    if bal <= 0:
+        await _run_default(context, chat_id)
+
+
+# ---------- Налог ----------
 
 async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в день: списывает налог только с активных, кладёт в казну,
-    пишет отчёт в общий чат."""
     try:
         total = await db.tax_active_balances(
             TAX_MIN_BALANCE, TAX_PCT, days=TAX_ACTIVE_DAYS,
@@ -674,7 +675,6 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     chat_id = TAX_REPORT_CHAT_ID
-
     if total > 0 and chat_id:
         try:
             await db.treasury_add(chat_id, total)
@@ -682,9 +682,7 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("tax_job treasury: %s", e)
 
     new_treasury = await db.treasury_get(chat_id) if chat_id else 0
-
     if not chat_id:
-        logger.warning("tax_job: CHAT_ID не задан, отчёт не отправлен")
         return
 
     if total <= 0:
@@ -709,18 +707,18 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError as e:
         logger.warning("tax_job send: %s", e)
 
-    logger.info(
-        "tax_job: списано %s, казна %s, чат %s",
-        total, new_treasury, chat_id,
-    )
 
-
-# ---------- Ежедневные проценты по кредиту ----------
+# ---------- Проценты по кредиту — в казну ----------
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = int(os.getenv("CHAT_ID", "0") or "0")
+    if not chat_id:
+        return
     try:
-        affected = await db.apply_credit_interest(CREDIT_PERCENT_PER_DAY)
-        logger.info("daily_interest_job: затронуто записей: %s", affected)
+        affected = await db.apply_credit_interest_to_treasury(
+            chat_id, CREDIT_PERCENT_PER_DAY,
+        )
+        logger.info("daily_interest_job: затронуто %s, казна пополнена", affected)
     except Exception as e:
         logger.warning("daily_interest_job: %s", e)
 
@@ -737,6 +735,9 @@ def register_jobs(app) -> None:
         tax_job,
         time=dtime(hour=0, minute=40, tzinfo=TZ),
     )
+    app.job_queue.run_repeating(
+        default_watchdog_job, interval=3600, first=60,
+    )
     logger.info(
-        "economy: ежедневные проценты (UTC 00:10) и налог (UTC 00:40) запланированы"
+        "economy: проценты (00:10), налог (00:40), дефолт-watchdog (раз в час) запланированы"
     )
