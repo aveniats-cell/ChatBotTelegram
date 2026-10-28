@@ -1,10 +1,6 @@
-"""Аурометр: раз в час «дроч» +1 к ауре, просмотр и топ-10.
-
-- «дроч»     — +1 к ауре, не чаще раза в час (UTC, атомарно в UPDATE).
-- «Аура»     — своя аура + место в топе.
-- «Топ аура» — топ-10 в чате по ауре.
-"""
+"""Аурометр: раз в час «дроч» +1 к ауре, просмотр и топ-10."""
 import logging
+from datetime import datetime, timezone
 from html import escape
 
 from telegram import Update
@@ -16,7 +12,7 @@ import db
 
 logger = logging.getLogger(__name__)
 
-AURA_COOLDOWN_SEC = 3600  # 1 час
+AURA_COOLDOWN_SEC = 3600
 
 
 def _fmt_hms(seconds: int) -> str:
@@ -30,8 +26,14 @@ def _fmt_hms(seconds: int) -> str:
     return f"{s}с"
 
 
+def _parse_utc(ts: str) -> datetime | None:
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 async def cmd_droch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """дроч — раз в час +1 к ауре."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -47,17 +49,10 @@ async def cmd_droch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ok:
         row = await db.aura_get(chat.id, user.id)
         last = (row or {}).get("last_droch_at")
-        if last:
-            # last_droch_at — «YYYY-MM-DD HH:MM:SS» в UTC (datetime('now')).
-            # Остаток считаем на стороне SQLite, чтобы не парсить в Python.
-            rs = await db._exec(
-                "SELECT CAST((julianday(datetime('now')) - "
-                "julianday(datetime(?, '+1 hour'))) * 86400 AS INTEGER)",
-                [last],
-            )
-            remain = 0
-            if rs.rows:
-                remain = max(0, -(rs.rows[0][0] or 0))
+        last_dt = _parse_utc(last) if last else None
+        if last_dt:
+            elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            remain = max(0, AURA_COOLDOWN_SEC - int(elapsed))
             await msg.reply_text(
                 f"⏳ Рано! Следующий раз через <b>{_fmt_hms(remain)}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -85,7 +80,6 @@ async def cmd_droch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_aura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Аура — показать свою ауру (и место в топе)."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -119,7 +113,6 @@ def _medal(i: int) -> str:
 
 
 async def cmd_aura_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Топ аура — топ-10 по ауре в текущем чате."""
     chat = update.effective_chat
     msg = update.effective_message
     if not chat or not msg:
