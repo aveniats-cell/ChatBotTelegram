@@ -238,7 +238,8 @@ async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     res = await db.user_rank(chat.id, user.id)
     if not res:
         await update.message.reply_text("Вы ещё не писали в этом чате — места нет.")
-        return    count, rank, total = res
+        return
+    count, rank, total = res
     await update.message.reply_text(
         f"📊 Ваше место: <b>{rank}/{total}</b>\n"
         f"Сообщений: <b>{count}</b>",
