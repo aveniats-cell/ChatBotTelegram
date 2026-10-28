@@ -18,9 +18,6 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
-AMOUNT_RE = re.compile(r"\b(\d+)\b")
-
 CREDIT_DAILY_LIMIT = 100
 CREDIT_PERCENT_PER_DAY = 10
 
@@ -42,6 +39,11 @@ def _today_utc() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
+def _num_after(text: str, keyword: str) -> int | None:
+    m = re.search(rf"(?i){re.escape(keyword)}\s+(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
 # ---------- Кредит из казны ----------
 
 async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -51,15 +53,13 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user or not chat or not msg:
         return
 
-    text = msg.text or ""
-    nums = AMOUNT_RE.findall(text)
-    if not nums:
+    amount = _num_after(msg.text or "", "+Кредит")
+    if amount is None:
         await msg.reply_text(
             "Формат: <code>+Кредит 50</code> (от 1 до 100).",
             parse_mode=ParseMode.HTML,
         )
         return
-    amount = int(nums[0])
     if amount < 1 or amount > CREDIT_DAILY_LIMIT:
         await msg.reply_text(f"⛔ Сумма кредита: от 1 до {CREDIT_DAILY_LIMIT}.")
         return
@@ -126,12 +126,14 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user or not chat or not msg:
         return
 
-    text = msg.text or ""
-    nums = AMOUNT_RE.findall(text)
-    if not nums:
+    amount = _num_after(msg.text or "", "-Кредит")
+    if amount is None:
+        # Для «-Кредит» с дефисом regex может не сработать, пробуем вручную.
+        m = re.search(r"(?i)Кредит\s+(\d+)", msg.text or "")
+        amount = int(m.group(1)) if m else None
+    if amount is None:
         await msg.reply_text("Формат: <code>-Кредит 50</code>.", parse_mode=ParseMode.HTML)
         return
-    amount = int(nums[0])
     if amount <= 0:
         await msg.reply_text("⛔ Сумма должна быть положительной.")
         return
@@ -188,7 +190,7 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     text = msg.text or ""
-    m = re.search(r"\+Монеты\s+(-?\d+)", text, re.IGNORECASE)
+    m = re.search(r"(?i)\+Монеты\s+(-?\d+)", text)
     if not m:
         await msg.reply_text(
             "Формат: <code>+Монеты 100 @user</code> или реплай.",
@@ -200,7 +202,7 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text("⛔ Сумма не может быть нулевой.")
         return
 
-    clean = re.sub(r"\+Монеты\s+-?\d+", "", text, flags=re.IGNORECASE)
+    clean = re.sub(r"(?i)\+Монеты\s+-?\d+", "", text)
     target = await utils.resolve_target(update, context, clean)
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
@@ -232,7 +234,7 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = msg.text or ""
-    m = re.search(r"[-–−]Монеты\s+(\d+)", text, re.IGNORECASE)
+    m = re.search(r"(?i)[-–−]Монеты\s+(\d+)", text)
     if not m:
         await msg.reply_text(
             "Формат: <code>-Монеты 100 @user</code> или реплай.",
@@ -244,7 +246,7 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
         await msg.reply_text("⛔ Сумма должна быть положительной.")
         return
 
-    clean = re.sub(r"[-–−]Монеты\s+\d+", "", text, flags=re.IGNORECASE)
+    clean = re.sub(r"(?i)[-–−]Монеты\s+\d+", "", text)
     target = await utils.resolve_target(update, context, clean)
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
@@ -377,7 +379,7 @@ async def cmd_treasury_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
-    m = re.search(r"\+ВКассу\s+(\d+)", msg.text or "", re.IGNORECASE)
+    m = re.search(r"(?i)\+ВКассу\s+(\d+)", msg.text or "")
     if not m:
         await msg.reply_text("Формат: <code>+ВКассу 500</code>", parse_mode=ParseMode.HTML)
         return
@@ -402,7 +404,7 @@ async def cmd_treasury_trim(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
-    m = re.search(r"ОбрезатьКасну\s+(\d+)", msg.text or "", re.IGNORECASE)
+    m = re.search(r"(?i)ОбрезатьКасну\s+(\d+)", msg.text or "")
     if not m:
         await msg.reply_text(
             "Формат: <code>ОбрезатьКасну 15000</code>",
@@ -432,7 +434,7 @@ async def cmd_burn_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
-    m = re.search(r"[-–−]Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
+    m = re.search(r"(?i)[-–−]Утил\s+(\d+)\s+казна", msg.text or "")
     if not m:
         await msg.reply_text(
             "Формат: <code>-Утил 100 казна</code>",
@@ -461,7 +463,7 @@ async def cmd_burn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("⛔ Только админ.")
         return
     text = msg.text or ""
-    m = re.search(r"[-–−]Утил\s+(\d+)", text, re.IGNORECASE)
+    m = re.search(r"(?i)[-–−]Утил\s+(\d+)", text)
     if not m:
         await msg.reply_text(
             "Формат: <code>-Утил 100 @user</code>",
@@ -472,7 +474,7 @@ async def cmd_burn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if amount <= 0:
         await msg.reply_text("⛔ Сумма должна быть положительной.")
         return
-    clean = re.sub(r"[-–−]Утил\s+\d+", "", text, flags=re.IGNORECASE).strip()
+    clean = re.sub(r"(?i)[-–−]Утил\s+\d+", "", text).strip()
     target = await utils.resolve_target(update, context, clean)
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
@@ -503,7 +505,7 @@ async def cmd_mint_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ADMIN_ID or user.id != ADMIN_ID:
         await msg.reply_text("⛔ Только админ.")
         return
-    m = re.search(r"\+Утил\s+(\d+)\s+казна", msg.text or "", re.IGNORECASE)
+    m = re.search(r"(?i)\+Утил\s+(\d+)\s+казна", msg.text or "")
     if not m:
         await msg.reply_text("Формат: <code>+Утил 100 казна</code>", parse_mode=ParseMode.HTML)
         return
@@ -528,7 +530,7 @@ async def cmd_mint_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("⛔ Только админ.")
         return
     text = msg.text or ""
-    m = re.search(r"\+Утил\s+(\d+)", text, re.IGNORECASE)
+    m = re.search(r"(?i)\+Утил\s+(\d+)", text)
     if not m:
         await msg.reply_text("Формат: <code>+Утил 100 @user</code>", parse_mode=ParseMode.HTML)
         return
@@ -536,7 +538,7 @@ async def cmd_mint_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if amount <= 0:
         await msg.reply_text("⛔ Сумма должна быть положительной.")
         return
-    clean = re.sub(r"\+Утил\s+\d+", "", text, flags=re.IGNORECASE)
+    clean = re.sub(r"(?i)\+Утил\s+\d+", "", text)
     target = await utils.resolve_target(update, context, clean)
     if not target:
         await msg.reply_text("Укажите @username или сделайте реплай.")
