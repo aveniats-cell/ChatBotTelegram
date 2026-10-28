@@ -34,7 +34,6 @@ import actions
 import ai
 import help_menu
 import casino
-import avatar
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -71,7 +70,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
-        "Аватар — аватарка в профиле\n"
         "Казино — мини-казино"
     )
 
@@ -161,7 +159,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Топ все / Топ день / Топ богачи / Мое место\n"
         "• Шип @u1 @u2 (с ИИ)\n"
         "• Сделать предложение / +Брак / -Брак / Мой брак\n"
-        "• Профиль / Аватар\n"
+        "• Профиль\n"
         "• хо @user 50 — крестики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50 — из казны\n"
         "• +Монеты / -Монеты @user\n"
@@ -265,15 +263,6 @@ def build_app() -> Application:
                                    economy.cmd_mint_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
                                    economy.cmd_mint_user))
-
-    # Аватар
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аватар(\s|$)"), avatar.cmd_avatar))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Аватар(\s|$)"), avatar.cmd_remove_avatar))
-    app.add_handler(CallbackQueryHandler(avatar.avatar_callback, pattern=r"^avatar:"))
-    app.add_handler(MessageHandler(
-        filters.PHOTO & filters.ChatType.PRIVATE,
-        avatar.handle_avatar_photo,
-    ))
 
     # Казино
     app.add_handler(MessageHandler(
