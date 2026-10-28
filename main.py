@@ -50,8 +50,6 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
 
-# Скомпилированный паттерн используется ТОЛЬКО внутри cmd_ai (_AI_WORD.sub/.match).
-# В MessageHandler его передавать нельзя — там нужен filters.Regex(...).
 _AI_WORD = re.compile(
     r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"
 )
@@ -125,7 +123,6 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (msg.text or "").strip()
 
-    # Реплай на сообщение бота — prompt = текст (без триггера, если он есть).
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if msg.reply_to_message.from_user.id == context.bot.id:
             prompt = _AI_WORD.sub("", text).strip()
@@ -197,13 +194,25 @@ async def post_init(app: Application) -> None:
             top.cleanup_job,
             time=dtime(hour=0, minute=5, tzinfo=timezone.utc),
         )
-        logger.info("JobQueue: ежедневная очистка messages_day запланирована")
+        app.job_queue.run_repeating(
+            top.flush_job,
+            interval=top.FLUSH_INTERVAL_SEC,
+            first=top.FLUSH_INTERVAL_SEC,
+        )
+        logger.info(
+            "JobQueue: cleanup + flush каждые %s сек запланированы",
+            top.FLUSH_INTERVAL_SEC,
+        )
         economy.register_jobs(app)
     else:
         logger.warning("JobQueue не инициализирован")
 
 
 async def post_shutdown(app: Application) -> None:
+    try:
+        await top._flush()
+    except Exception as e:
+        logger.warning("flush on shutdown: %s", e)
     await resolver.stop_client()
     await ai.close_session()
     await db.close_db()
