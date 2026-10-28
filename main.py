@@ -173,9 +173,12 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• хо @user 50 — крестики-нолики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50\n"
         "• +Монеты 100 @user / -Монеты 100 @user (админ)\n"
+        "• +Утил 100 @user / -Утил 100 @user (админ)\n"
+        "• +Утил 100 казна / -Утил 100 казна (админ)\n"
         "• Перевод 50 @user — комиссия 3%\n"
         "• Казна — баланс казны чата (админ)\n"
         "• +ВКассу 500 — пополнить казну (админ)\n"
+        "• ОбрезатьКасну 5000 — сжечь излишек казны (админ)\n"
         "• Зарплата — сколько начислено за сегодня\n"
         "• +ССС @user / -ССС @user / Список ССС\n"
         "• +Суд ССС @user / +Суд @user\n"
@@ -265,7 +268,18 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Перевод(\s|$)"), economy.cmd_transfer))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Казна(\s|$)"), economy.cmd_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ВКассу(\s|$)"), economy.cmd_treasury_add))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^ОбрезатьКасну(\s|$)"), economy.cmd_treasury_trim))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Зарплата(\s|$)"), economy.cmd_salary))
+
+    # -Утил / +Утил (казна — отдельным хендлером первым, чтобы перехватить)
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
+                                   economy.cmd_burn_treasury))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
+                                   economy.cmd_burn_user))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил\s+\d+\s+казна(\s|$)"),
+                                   economy.cmd_mint_treasury))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
+                                   economy.cmd_mint_user))
 
     # Казино
     app.add_handler(MessageHandler(
