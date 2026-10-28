@@ -225,7 +225,7 @@ async def _create_tables() -> None:
             created_at  TEXT DEFAULT (datetime('now'))
         )
     """)
-    # Статистика действий (кто сколько раз что сделал)
+    # Статистика действий
     await _exec("""
         CREATE TABLE IF NOT EXISTS action_stats (
             chat_id    INTEGER NOT NULL,
@@ -236,7 +236,7 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, action)
         )
     """)
-    # Персистентная очередь дробной зарплаты: переживает рестарты Render.
+    # Персистентная очередь дробной зарплаты
     await _exec("""
         CREATE TABLE IF NOT EXISTS pending_salary (
             chat_id    INTEGER NOT NULL,
@@ -710,7 +710,6 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
 # ---------- pending_salary (персистентная очередь дробей) ----------
 
 async def add_pending_salary(chat_id: int, user_id: int, day: str, frac_delta: int) -> bool:
-    """Атомарно прибавить дробные копейки в персистентную очередь."""
     if frac_delta <= 0:
         return True
     rs = await _exec(
@@ -737,7 +736,6 @@ async def get_pending_salary(chat_id: int, user_id: int, day: str) -> int:
 
 async def take_pending_salary(chat_id: int, user_id: int, day: str,
                               max_frac: Optional[int] = None) -> int:
-    """Атомарно снять до max_frac (или всё, если None) из очереди."""
     rs = await _exec(
         """SELECT frac_delta FROM pending_salary
            WHERE chat_id = ? AND user_id = ? AND day = ?""",
@@ -766,7 +764,6 @@ async def take_pending_salary(chat_id: int, user_id: int, day: str,
 
 
 async def return_pending_salary(chat_id: int, user_id: int, day: str, frac: int) -> bool:
-    """Вернуть снятые дроби обратно (при сбое начисления)."""
     if frac <= 0:
         return True
     return await add_pending_salary(chat_id, user_id, day, frac)
