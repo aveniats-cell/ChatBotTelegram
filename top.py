@@ -1,12 +1,14 @@
-"""2.3 Топ чата + зарплата за активность.
+"""2.3 Топ чата + зарплата за активность из казны.
 
 - Сообщения копятся в памяти, сбрасываются раз в FLUSH_INTERVAL_SEC
   идемпотентным батчем (защита от Server disconnected).
 - Зарплата: 1 сообщение >= MIN_SALARY_LEN символов = +SALARY_FRAC_PER_MSG
   сотых монеты (0.20 = 20). Не команда, не от бота, не реплай на бота.
-  Дроби копятся в salary_frac, при накоплении 100 → +1 к balance.
+  Списывается из казны через db.pay_salary_from_treasury.
+- flush_job после _flush проверяет казну: если <= 0 — дефолт.
 """
 import asyncio
+import os
 import logging
 import uuid
 from collections import defaultdict
@@ -26,15 +28,11 @@ FLUSH_INTERVAL_SEC = 15
 FLUSH_MAX_KEYS = 200
 
 MIN_SALARY_LEN = 2
-
-# 0.20 монеты за сообщение = 20 сотых
-SALARY_FRAC_PER_MSG = 20
+SALARY_FRAC_PER_MSG = 20  # 0.20 монеты за сообщение
 
 _USER_CACHE: dict[int, tuple[str, str]] = {}
 
-# (chat_id, user_id, day) -> delta сообщений
 _PENDING: dict[tuple[int, int, str], int] = defaultdict(int)
-# (chat_id, user_id, day) -> delta сотых монет
 _PENDING_SALARY: dict[tuple[int, int, str], int] = defaultdict(int)
 _flush_lock = asyncio.Lock()
 
@@ -82,7 +80,6 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _flush() -> None:
-    """Сбрасывает накопленные сообщения и зарплату в БД идемпотентно."""
     async with _flush_lock:
         if not _PENDING and not _PENDING_SALARY:
             return
@@ -103,10 +100,6 @@ async def _flush() -> None:
             )
             if ok:
                 break
-            logger.warning(
-                "flush msg: попытка %d/3 не удалась (chat=%s user=%s delta=%s)",
-                attempt + 1, chat_id, user_id, delta,
-            )
             await asyncio.sleep(0.5 * (attempt + 1))
         if not ok:
             logger.error(
@@ -114,25 +107,23 @@ async def _flush() -> None:
                 chat_id, user_id, day, delta,
             )
 
-    # 2) Зарплата — начисляем дробные монеты.
+    # 2) Зарплата — из казны.
     for (chat_id, user_id, day), frac_delta in snap_sal.items():
         if frac_delta <= 0:
             continue
         ok = False
         for attempt in range(3):
-            coins = await db.add_salary_frac_atomic(user_id, day, frac_delta)
+            coins = await db.pay_salary_from_treasury(
+                chat_id, user_id, day, frac_delta,
+            )
             if coins is not None:
                 ok = True
                 break
-            logger.warning(
-                "flush salary: попытка %d/3 не удалась (user=%s frac=%s)",
-                attempt + 1, user_id, frac_delta,
-            )
             await asyncio.sleep(0.5 * (attempt + 1))
         if not ok:
-            logger.error(
-                "flush salary: потерян батч (user=%s day=%s frac=%s)",
-                user_id, day, frac_delta,
+            logger.warning(
+                "flush salary: казна пуста или ошибка (chat=%s user=%s)",
+                chat_id, user_id,
             )
 
 
@@ -141,6 +132,17 @@ async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _flush()
     except Exception as e:
         logger.warning("flush_job: %s", e)
+
+    # После зарплаты проверяем казну. Если <= 0 — дефолт.
+    try:
+        import economy
+        chat_id = int(os.getenv("CHAT_ID", "0") or "0")
+        if chat_id:
+            bal = await db.treasury_get(chat_id)
+            if bal <= 0:
+                await economy._run_default(context, chat_id)
+    except Exception as e:
+        logger.warning("flush_job default: %s", e)
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
