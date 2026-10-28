@@ -48,7 +48,10 @@ async def _exec(
         logger.error("db: _client не инициализирован (sql: %.80s)", sql)
         return _EmptyResult(error=True)
 
-    max_retries = retries if _is_read_only(sql) else 0
+    # write-запросы тоже ретраим: Turso по HTTP нестабилен на Render free.
+    # Идемпотентность write-ретраев обеспечивается на уровне вызывающего кода
+    # (условные UPDATE ... WHERE, ON CONFLICT, idempotency-ключи).
+    max_retries = retries
     last_exc: Optional[BaseException] = None
 
     for attempt in range(max_retries + 1):
@@ -223,6 +226,17 @@ async def _create_tables() -> None:
             stars       INTEGER NOT NULL,
             issued_by   INTEGER NOT NULL,
             created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Персистентная очередь дробной зарплаты: переживает рестарты Render.
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS pending_salary (
+            chat_id    INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            day        TEXT NOT NULL,
+            frac_delta INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, user_id, day)
         )
     """)
 
@@ -683,6 +697,80 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
     return True
 
 
+# ---------- pending_salary (персистентная очередь дробей) ----------
+
+async def add_pending_salary(chat_id: int, user_id: int, day: str, frac_delta: int) -> bool:
+    """Атомарно прибавить дробные копейки в персистентную очередь."""
+    if frac_delta <= 0:
+        return True
+    rs = await _exec(
+        """INSERT INTO pending_salary (chat_id, user_id, day, frac_delta)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             frac_delta = pending_salary.frac_delta + excluded.frac_delta,
+             updated_at = datetime('now')""",
+        [chat_id, user_id, day, frac_delta],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_pending_salary(chat_id: int, user_id: int, day: str) -> int:
+    rs = await _exec(
+        """SELECT frac_delta FROM pending_salary
+           WHERE chat_id = ? AND user_id = ? AND day = ?""",
+        [chat_id, user_id, day],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def take_pending_salary(chat_id: int, user_id: int, day: str,
+                              max_frac: Optional[int] = None) -> int:
+    """Атомарно снять до max_frac (или всё, если None) из очереди.
+    Возвращает снятое количество; 0 — если ничего не было/ошибка."""
+    rs = await _exec(
+        """SELECT frac_delta FROM pending_salary
+           WHERE chat_id = ? AND user_id = ? AND day = ?""",
+        [chat_id, user_id, day],
+    )
+    if not rs.rows:
+        return 0
+    cur = rs.rows[0][0] or 0
+    if cur <= 0:
+        return 0
+    take = cur if max_frac is None else min(cur, max_frac)
+    if take <= 0:
+        return 0
+    rs2 = await _exec(
+        """UPDATE pending_salary
+           SET frac_delta = frac_delta - ?,
+               updated_at = datetime('now')
+           WHERE chat_id = ? AND user_id = ? AND day = ? AND frac_delta >= ?""",
+        [take, chat_id, user_id, day, take],
+    )
+    if getattr(rs2, "error", False):
+        return 0
+    if (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        return 0
+    return take
+
+
+async def return_pending_salary(chat_id: int, user_id: int, day: str, frac: int) -> bool:
+    """Вернуть снятые дроби обратно (при сбое начисления)."""
+    if frac <= 0:
+        return True
+    return await add_pending_salary(chat_id, user_id, day, frac)
+
+
+async def cleanup_pending_salary(keep_days: int = 2) -> int:
+    rs = await _exec(
+        "DELETE FROM pending_salary WHERE day < date('now', ?)",
+        [f"-{int(keep_days)} days"],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
 # ---------- salary ----------
 
 async def add_salary_atomic(user_id: int, day: str, delta: int) -> bool:
@@ -714,6 +802,7 @@ async def add_salary_atomic(user_id: int, day: str, delta: int) -> bool:
 async def add_salary_frac_atomic(
     user_id: int, day: str, frac_delta: int,
 ) -> Optional[int]:
+    """Правильное накопление дробей (не затирает salary_frac)."""
     if frac_delta <= 0:
         return 0
 
@@ -762,31 +851,84 @@ async def add_salary_frac_atomic(
 async def pay_salary_from_treasury(
     chat_id: int, user_id: int, day: str, frac_delta: int,
 ) -> Optional[int]:
-    logger.info("salary: chat=%s user=%s frac=%s", chat_id, user_id, frac_delta)
+    """Выплатить накопленную дробную зарплату с накоплением в БД.
+
+    Семантика:
+      - читаем текущий salary_frac (если salary_day != day — сбрасываем);
+      - total = cur_frac + frac_delta; coins = total // 100;
+      - если coins > 0 — списываем coins из казны (атомарно через withdraw);
+      - UPDATE users с НАКОПЛЕННЫМ new_frac (не затирая);
+      - при ошибке UPDATE users — возвращаем coins в казну, возвращаем None;
+      - при нехватке казны — coins = min(coins, treasury);
+      - возвращаем фактически начисленные coins (может быть 0).
+    """
     if frac_delta <= 0:
         return 0
-    coins = frac_delta // 100
-    frac = frac_delta % 100
+
+    rs = await _exec(
+        "SELECT salary_frac, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if getattr(rs, "error", False):
+        logger.warning("salary: SELECT users failed (user=%s)", user_id)
+        return None
+
+    if not rs.rows:
+        # юзера нет — создаём с нулевым балансом и записываем дроби
+        coins = frac_delta // 100
+        new_frac = frac_delta % 100
+        if coins > 0:
+            cur = await treasury_get(chat_id)
+            if cur <= 0:
+                logger.info("salary: казна пуста, зарплата не платится (user=%s)", user_id)
+                return None
+            take = min(coins, cur)
+            ok = await treasury_withdraw(chat_id, take)
+            if not ok:
+                logger.warning("salary: withdraw failed (user=%s take=%s)", user_id, take)
+                return None
+            coins = take
+        rs2 = await _exec(
+            """INSERT INTO users
+                 (user_id, balance, salary_frac, salary_day, salary_today)
+               VALUES (?, 10 + ?, ?, ?, ?)""",
+            [user_id, coins, new_frac, day, coins],
+        )
+        if getattr(rs2, "error", False):
+            if coins > 0:
+                await treasury_add(chat_id, coins)
+            return None
+        return coins
+
+    cur_frac, cur_day = rs.rows[0]
+    if cur_day != day:
+        cur_frac = 0
+
+    total = (cur_frac or 0) + frac_delta
+    coins = total // 100
+    new_frac = total % 100
 
     if coins > 0:
         cur = await treasury_get(chat_id)
-        logger.info("salary: treasury_before=%s coins=%s", cur, coins)
         if cur <= 0:
-            logger.info("salary: казна пуста, зарплата не платится")
+            logger.info("salary: казна пуста, зарплата не платится (user=%s)", user_id)
             return None
         take = min(coins, cur)
         ok = await treasury_withdraw(chat_id, take)
-        logger.info("salary: withdraw ok=%s take=%s", ok, take)
         if not ok:
+            logger.warning("salary: withdraw failed (user=%s take=%s)", user_id, take)
             return None
-        coins = take
-        if coins < frac_delta // 100:
+        if take < coins:
             logger.warning(
-                "salary: казна кончилась, выдано %s из %s",
-                coins, frac_delta // 100,
+                "salary: казна кончилась, выдано %s из %s (user=%s)",
+                take, coins, user_id,
             )
+        coins = take
+        # пересчитываем new_frac: остаток дробей уменьшается на недоплаченные целые
+        # (недоплаченные целые остаются в salary_frac, чтобы выдать позже)
+        new_frac = total - coins * 100
 
-    rs = await _exec(
+    rs2 = await _exec(
         """UPDATE users
            SET balance = COALESCE(balance, 10) + ?,
                salary_frac = ?,
@@ -796,9 +938,10 @@ async def pay_salary_from_treasury(
                    ELSE ?
                END
            WHERE user_id = ?""",
-        [coins, frac, day, day, coins, coins, user_id],
+        [coins, new_frac, day, day, coins, coins, user_id],
     )
-    if getattr(rs, "error", False):
+    if getattr(rs2, "error", False):
+        logger.warning("salary: UPDATE users failed (user=%s coins=%s)", user_id, coins)
         if coins > 0:
             await treasury_add(chat_id, coins)
         return None
