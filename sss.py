@@ -1,14 +1,4 @@
-"""ССС и суды.
-
-P1: +Суд ССС теперь с таймаутом (10 мин). Если не все проголосовали —
-финализируем по текущим голосам: любой «no» = оставить, иначе бан.
-
-P2: _resolve_target вынесен в utils.resolve_target.
-
-P1: cmd_sss_add / cmd_sss_remove сначала пишут в БД, и только при успехе
-обновляют in-memory SSS_MEMBERS — чтобы после рестарта состав не
-расходился с БД.
-"""
+"""ССС и суды."""
 import os
 import re
 import uuid
@@ -54,7 +44,6 @@ def _sss_all() -> set[int]:
 
 
 def is_sss_member(user_id: int) -> bool:
-    """Публичный хелпер — не дёргай _sss_all() из других модулей."""
     return user_id in _sss_all()
 
 
@@ -70,8 +59,6 @@ async def restore_sss_members() -> None:
             SSS_MEMBERS.add(uid)
     logger.info("sss: восстановлено участников: %s", len(SSS_MEMBERS))
 
-
-# ---------- состав ССС ----------
 
 async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -104,7 +91,6 @@ async def cmd_sss_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("⛔ Мест в ССС больше нет.")
         return
 
-    # Сначала пишем в БД, только при успехе — в память.
     if not await db.set_sss(uid, True):
         await msg.reply_text(
             "⚠️ Не удалось сохранить в БД. Попробуйте ещё раз."
@@ -139,7 +125,6 @@ async def cmd_sss_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text(f"{escape(name)} не в ССС.")
         return
 
-    # Сначала БД, потом память — чтобы не потерять состав при рестарте.
     if not await db.set_sss(uid, False):
         await msg.reply_text(
             "⚠️ Не удалось сохранить в БД. Попробуйте ещё раз."
@@ -169,8 +154,6 @@ async def cmd_sss_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
     )
 
-
-# ---------- +Суд ССС ----------
 
 async def cmd_sss_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -254,8 +237,6 @@ async def _sss_trial_finalize(context: ContextTypes.DEFAULT_TYPE, trial_id: str,
             logger.warning("sss trial finalize: %s", e)
         return
 
-    # force=True и никто не голосовал «no» — трактуем как «забанить»,
-    # только если есть хотя бы один «yes».
     if force and not any(v == "yes" for v in t["votes"].values()):
         try:
             await context.bot.send_message(
@@ -339,8 +320,6 @@ async def sss_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.answer("Голос учтён")
     await _sss_trial_finalize(context, trial_id)
 
-
-# ---------- обычный +Суд ----------
 
 async def cmd_public_trial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
