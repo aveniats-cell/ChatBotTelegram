@@ -1,4 +1,12 @@
-"""2.3 Топ чата + зарплата за активность из казны."""
+"""2.3 Топ чата + зарплата за активность из казны.
+
+Исправления:
+  - дробная зарплата копится в персистентной таблице pending_salary (в БД),
+    а не только в памяти — переживает рестарты Render;
+  - _flush больше не теряет батчи при рестарте;
+  - flush_job сначала флашит, потом проверяет казну на дефолт;
+  - добавлен cleanup_job для pending_salary (старше 2 дней).
+"""
 import asyncio
 import os
 import logging
@@ -24,6 +32,11 @@ SALARY_FRAC_PER_MSG = 20
 
 _USER_CACHE: dict[int, tuple[str, str]] = {}
 
+# _PENDING — счётчики сообщений для messages/messages_day (не критичны к потере:
+# при рестарте теряются только счётчики сообщений, не деньги).
+# _PENDING_SALARY — теперь только in-memory буфер перед записью в pending_salary;
+# деньги лежат в БД, потеря буфера при рестарте максимум потеряет «свежие»
+# <FLUSH_INTERVAL_SEC сообщений, но они всё равно не дошли бы до БД.
 _PENDING: dict[tuple[int, int, str], int] = defaultdict(int)
 _PENDING_SALARY: dict[tuple[int, int, str], int] = defaultdict(int)
 _flush_lock = asyncio.Lock()
@@ -90,6 +103,7 @@ async def _flush() -> None:
         _PENDING.clear()
         _PENDING_SALARY.clear()
 
+    # 1) messages (не критично: при потере — только счётчик топов)
     for (chat_id, user_id, day), delta in snap_msg.items():
         if delta <= 0:
             continue
@@ -109,24 +123,58 @@ async def _flush() -> None:
             )
             _requeue_msg(chat_id, user_id, day, delta)
 
+    # 2) зарплата: сначала фиксируем дроби в персистентной таблице,
+    #    потом пытаемся выплатить по этой таблице.
     for (chat_id, user_id, day), frac_delta in snap_sal.items():
         if frac_delta <= 0:
             continue
-        ok = False
+        # 2.1 фиксируем дроби в БД (переживёт рестарт)
+        saved = False
         for attempt in range(3):
-            coins = await db.pay_salary_from_treasury(
-                chat_id, user_id, day, frac_delta,
-            )
-            if coins is not None:
-                ok = True
+            saved = await db.add_pending_salary(chat_id, user_id, day, frac_delta)
+            if saved:
                 break
             await asyncio.sleep(0.5 * (attempt + 1))
-        if not ok:
+        if not saved:
             logger.warning(
-                "flush salary: казна пуста или ошибка (chat=%s user=%s)",
+                "flush salary: не удалось сохранить pending_salary "
+                "(chat=%s user=%s) — оставляем в памяти",
                 chat_id, user_id,
             )
             _requeue_sal(chat_id, user_id, day, frac_delta)
+            continue
+
+        # 2.2 выплачиваем из казны накопленное
+        await _pay_pending_salary(chat_id, user_id, day)
+
+
+async def _pay_pending_salary(chat_id: int, user_id: int, day: str) -> None:
+    """Пытается выплатить накопленное из pending_salary.
+    Если казна пуста — оставляет в pending_salary до следующего тика.
+    """
+    frac = await db.get_pending_salary(chat_id, user_id, day)
+    if frac <= 0:
+        return
+
+    # Снимаем не всё сразу, а только то, что реально выплатим, — берём
+    # frac, но pay_salary_from_treasury сам ограничит по казне.
+    taken = await db.take_pending_salary(chat_id, user_id, day, frac)
+    if taken <= 0:
+        return
+
+    coins = await db.pay_salary_from_treasury(chat_id, user_id, day, taken)
+    if coins is None:
+        # не удалось (казна пуста / ошибка) — возвращаем дроби в очередь
+        logger.info(
+            "salary: не выплачено, возврат в pending_salary (chat=%s user=%s frac=%s)",
+            chat_id, user_id, taken,
+        )
+        await db.return_pending_salary(chat_id, user_id, day, taken)
+    else:
+        logger.info(
+            "salary: выплачено coins=%s (chat=%s user=%s frac_was=%s)",
+            coins, chat_id, user_id, taken,
+        )
 
 
 async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,6 +182,17 @@ async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _flush()
     except Exception as e:
         logger.warning("flush_job: %s", e)
+
+    # Догоняем pending_salary за прошлые дни (если казна была пуста — до-платим)
+    try:
+        rs = await db._exec(
+            """SELECT DISTINCT chat_id, user_id, day FROM pending_salary
+               WHERE frac_delta > 0 AND day >= date('now')"""
+        )
+        for chat_id, user_id, day in rs.rows:
+            await _pay_pending_salary(chat_id, user_id, day)
+    except Exception as e:
+        logger.warning("flush_job catch-up: %s", e)
 
     try:
         import economy
@@ -152,6 +211,11 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
     except Exception as e:
         logger.warning("cleanup_job: %s", e)
+    try:
+        deleted_pending = await db.cleanup_pending_salary(keep_days=2)
+        logger.info("cleanup_job: удалено строк pending_salary: %s", deleted_pending)
+    except Exception as e:
+        logger.warning("cleanup_job pending_salary: %s", e)
 
 
 def _medal(i: int) -> str:
