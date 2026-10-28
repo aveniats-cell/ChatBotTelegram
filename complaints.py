@@ -1,11 +1,4 @@
-"""+Жалоба: любой участник жалуется на нарушителя — жалоба уходит в ЛС админу.
-
-Админ получает кнопки: Забанить / Выдать предупреждение / Отклонить.
-
-Импортируется модуль warns (а не warnings), чтобы не перекрывать
-стандартный модуль Python warnings — иначе падают pip/virtualenv/poetry
-на этапе сборки.
-"""
+"""+Жалоба: любой участник жалуется на нарушителя — жалоба уходит в ЛС админу."""
 import os
 import re
 import logging
@@ -33,7 +26,6 @@ USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
 
 async def cmd_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Жалоба @user (или реплай) — доступно всем. Уходит в ЛС админу."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -60,7 +52,6 @@ async def cmd_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("На админа жаловаться нельзя.")
         return
 
-    # message_id: сообщение нарушителя (реплай) либо сама команда.
     if msg.reply_to_message:
         message_id = msg.reply_to_message.message_id
     else:
@@ -176,13 +167,19 @@ async def complaint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "ban":
+        banned = False
         try:
             await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-            await db.add_punishment(target_id, chat_id, "ban", None, user.id)
-            await db.deactivate_warnings(chat_id, target_id)
+            banned = True
         except TelegramError as e:
             await q.answer(f"Ошибка бана: {e}", show_alert=True)
             return
+        if banned:
+            try:
+                await db.add_punishment(target_id, chat_id, "ban", None, user.id)
+                await db.deactivate_warnings(chat_id, target_id)
+            except Exception as e:
+                logger.warning("complaint ban db: %s", e)
         await db.resolve_complaint(cid, "banned", user.id)
         await q.answer("Забанен")
         try:
@@ -233,7 +230,6 @@ async def complaint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except TelegramError:
             pass
-        # Автобан, если лимит достигнут.
         if cnt >= warns_mod.WARN_LIMIT:
             await warns_mod._check_and_ban_if_needed(
                 context, chat_id, target_id, name,
