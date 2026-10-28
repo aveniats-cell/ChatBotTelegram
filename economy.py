@@ -1,5 +1,14 @@
-"""Экономика: кредит (+Кредит / -Кредит), выдача/списание монет админом,
-перевод с комиссией, казна, ежедневное начисление процентов на долг."""
+"""Экономика: кредит, монеты, перевод, казна, налог, зарплата, проценты.
+
+- +Кредит / -Кредит — кредит (1–100, раз в день), погашение.
+- +Монеты / -Монеты — админ начисляет/списывает.
+- Перевод — перевод с комиссией 3%.
+- Казна — баланс казны чата (админ).
+- +ВКассу — админ пополняет казну.
+- Налог дня — раз в день списывает 3% с баланса > 50 только у активных,
+  кладёт в казну, пишет отчёт в чат.
+- Зарплата за активность (0.2 монеты за сообщение) — считается в top.py.
+"""
 import os
 import re
 import logging
@@ -27,6 +36,11 @@ CREDIT_PERCENT_PER_DAY = 10
 TRANSFER_FEE_PCT = 3
 TRANSFER_MIN = 5
 TRANSFER_FEE_MIN = 1
+
+TAX_PCT = 3
+TAX_MIN_BALANCE = 50
+TAX_ACTIVE_DAYS = 1
+TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 TZ = timezone.utc
 
@@ -181,7 +195,6 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ---------- +Монеты / -Монеты (админ) ----------
 
 async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """+Монеты N @user — админ начисляет монеты (без лимита)."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -235,7 +248,6 @@ async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """-Монеты N @user — админ списывает монеты. Списание уходит в казну."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -295,7 +307,6 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------- Перевод ----------
 
 async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перевод N @user — перевод монет с комиссией 3% (мин. 1)."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -369,7 +380,6 @@ async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------- Казна ----------
 
 async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Казна — админ смотрит накопления комиссий в чате."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
@@ -382,13 +392,125 @@ async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await msg.reply_text(
         f"🏦 <b>Казна чата</b>\n"
         f"Накоплено: <b>{bal}</b> монет\n\n"
-        f"<i>Сюда идут комиссии казино, крестиков-ноликов, переводов "
-        f"и списаний через -Монеты.</i>",
+        f"<i>Сюда идут комиссии казино, крестиков-ноликов, переводов, "
+        f"налог и списания через -Монеты.</i>",
         parse_mode=ParseMode.HTML,
     )
 
 
-# ---------- Ежедневные проценты ----------
+async def cmd_treasury_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """+ВКассу N — админ пополняет казну."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только админ.")
+        return
+    m = re.search(r"\+ВКассу\s+(\d+)", msg.text or "", re.IGNORECASE)
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>+ВКассу 500</code>", parse_mode=ParseMode.HTML,
+        )
+        return
+    amount = int(m.group(1))
+    if amount <= 0:
+        await msg.reply_text("⛔ Сумма должна быть положительной.")
+        return
+
+    admin_row = await db.get_user(user.id)
+    admin_bal = (admin_row or {}).get("balance") or 0
+    if admin_bal >= amount:
+        ok = await db.take_balance_atomic(user.id, amount)
+        if not ok:
+            await msg.reply_text("⚠️ Не удалось списать с баланса.")
+            return
+
+    await db.treasury_add(chat.id, amount)
+    new_treasury = await db.treasury_get(chat.id)
+    await msg.reply_text(
+        f"🏦 В казну добавлено: <b>{amount}</b>\n"
+        f"Казна: <b>{new_treasury}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- Зарплата (инфо) ----------
+
+async def cmd_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    day = _today_utc()
+    coins = await db.get_salary_today(user.id, day)
+    frac = await db.get_salary_frac(user.id, day)
+    await msg.reply_text(
+        f"💼 <b>Зарплата за сегодня</b>\n"
+        f"Начислено: <b>{coins}.{frac:02d}</b> монет\n\n"
+        f"<i>1 сообщение ≥ 2 символов = 0.20 монеты. "
+        f"Дроби копятся, в баланс уходят целыми.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- Ежедневный налог ----------
+
+async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в день: списывает налог только с активных, кладёт в казну,
+    пишет отчёт в общий чат."""
+    try:
+        total = await db.tax_active_balances(
+            TAX_MIN_BALANCE, TAX_PCT, days=TAX_ACTIVE_DAYS,
+        )
+    except Exception as e:
+        logger.warning("tax_job: %s", e)
+        return
+
+    chat_id = TAX_REPORT_CHAT_ID
+
+    if total > 0 and chat_id:
+        try:
+            await db.treasury_add(chat_id, total)
+        except Exception as e:
+            logger.warning("tax_job treasury: %s", e)
+
+    new_treasury = await db.treasury_get(chat_id) if chat_id else 0
+
+    if not chat_id:
+        logger.warning("tax_job: CHAT_ID не задан, отчёт не отправлен")
+        return
+
+    if total <= 0:
+        text = (
+            f"🏦 <b>Налог дня</b>\n"
+            f"Сегодня платить некому: у активных баланс ≤ {TAX_MIN_BALANCE}.\n"
+            f"Казна: <b>{new_treasury}</b>"
+        )
+    else:
+        text = (
+            f"🏦 <b>Налог дня</b>\n"
+            f"Ставка: <b>{TAX_PCT}%</b> с баланса > {TAX_MIN_BALANCE}\n"
+            f"Платят только активные (писали за {TAX_ACTIVE_DAYS} дн.)\n"
+            f"Собрано в казну: <b>{total}</b> монет\n"
+            f"Казна: <b>{new_treasury}</b>\n\n"
+            f"<i>Неактивные не платят. Вернулся — баланс на месте.</i>"
+        )
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("tax_job send: %s", e)
+
+    logger.info(
+        "tax_job: списано %s, казна %s, чат %s",
+        total, new_treasury, chat_id,
+    )
+
+
+# ---------- Ежедневные проценты по кредиту ----------
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -400,10 +522,16 @@ async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def register_jobs(app) -> None:
     if not app.job_queue:
-        logger.warning("economy: job_queue нет, проценты по кредиту не будут начисляться")
+        logger.warning("economy: job_queue нет, джобы не будут начисляться")
         return
     app.job_queue.run_daily(
         daily_interest_job,
         time=dtime(hour=0, minute=10, tzinfo=TZ),
     )
-    logger.info("economy: ежедневное начисление %% на кредит запланировано (UTC)")
+    app.job_queue.run_daily(
+        tax_job,
+        time=dtime(hour=0, minute=40, tzinfo=TZ),
+    )
+    logger.info(
+        "economy: ежедневные проценты (UTC 00:10) и налог (UTC 00:40) запланированы"
+    )
