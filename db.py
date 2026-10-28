@@ -151,6 +151,12 @@ async def _create_tables() -> None:
         )
     """)
     await _exec("""
+        CREATE TABLE IF NOT EXISTS treasury_meta (
+            chat_id         INTEGER PRIMARY KEY,
+            last_default_at TEXT
+        )
+    """)
+    await _exec("""
         CREATE TABLE IF NOT EXISTS marriages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id      INTEGER NOT NULL,
@@ -219,6 +225,30 @@ async def _create_tables() -> None:
             created_at  TEXT DEFAULT (datetime('now'))
         )
     """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS purchases (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            item_id    TEXT NOT NULL,
+            price      INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS user_cosmetics (
+            user_id    INTEGER PRIMARY KEY,
+            prefix     TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS temp_roles (
+            user_id     INTEGER PRIMARY KEY,
+            role        TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            granted_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -236,6 +266,8 @@ async def _migrate_tables() -> None:
         ("users", "salary_today", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "salary_day", "TEXT"),
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "avatar_file_id", "TEXT"),
+        ("users", "top_bonus", "INTEGER NOT NULL DEFAULT 0"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
     ]
@@ -273,6 +305,10 @@ async def _migrate_tables() -> None:
         "ON aura(chat_id, value DESC)",
         "CREATE INDEX IF NOT EXISTS idx_awards_user "
         "ON awards(chat_id, user_id, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_purchases_user "
+        "ON purchases(user_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_temp_roles_expires "
+        "ON temp_roles(expires_at)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -396,7 +432,6 @@ async def take_balance_atomic(user_id: int, amount: int) -> bool:
 
 
 async def take_balance_any(user_id: int, amount: int) -> int:
-    """Списывает до amount, но не больше баланса. Возвращает списанное."""
     if amount <= 0:
         return 0
     rs = await _exec(
@@ -421,11 +456,6 @@ async def take_balance_any(user_id: int, amount: int) -> int:
 
 
 async def burn_balance(user_id: int, amount: int) -> int:
-    """Сжигает до amount монет у юзера (не больше баланса).
-
-    Никуда не начисляет — монеты исчезают из экономики.
-    Возвращает фактически сожжённое количество.
-    """
     return await take_balance_any(user_id, amount)
 
 
@@ -471,10 +501,6 @@ async def take_credit_daily_atomic(
         [amount, amount, today, user_id, balance_floor, today],
     )
     if getattr(rs, "error", False):
-        logger.error(
-            "take_credit_daily_atomic: ошибка UPDATE (user=%s amount=%s)",
-            user_id, amount,
-        )
         return False
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
@@ -533,7 +559,6 @@ async def treasury_reset(chat_id: int) -> int:
 
 
 async def treasury_withdraw(chat_id: int, amount: int) -> bool:
-    """Списывает amount из казны. False, если не хватает."""
     if amount <= 0:
         return True
     rs = await _exec(
@@ -547,7 +572,6 @@ async def treasury_withdraw(chat_id: int, amount: int) -> bool:
 
 
 async def burn_treasury(chat_id: int, amount: int) -> int:
-    """Сжигает до amount монет из казны. Возвращает сожжённое."""
     if amount <= 0:
         return 0
     cur = await treasury_get(chat_id)
@@ -562,7 +586,6 @@ async def burn_treasury(chat_id: int, amount: int) -> int:
 
 
 async def treasury_trim(chat_id: int, keep: int) -> int:
-    """Оставляет в казне keep монет, остальное сжигает. Возвращает сожжённое."""
     cur = await treasury_get(chat_id)
     if cur <= keep:
         return 0
@@ -574,15 +597,48 @@ async def treasury_trim(chat_id: int, keep: int) -> int:
     return burned
 
 
+async def treasury_default_collect(
+    chat_id: int, min_balance: int, pct: int,
+) -> int:
+    rs = await _exec(
+        """SELECT COALESCE(SUM(CAST(balance * ? / 100 AS INTEGER)), 0)
+           FROM users WHERE balance > ?""",
+        [pct, min_balance],
+    )
+    total = (rs.rows[0][0] if rs.rows else 0) or 0
+    if total <= 0:
+        return 0
+    await _exec(
+        """UPDATE users
+           SET balance = balance - CAST(balance * ? / 100 AS INTEGER)
+           WHERE balance > ?""",
+        [pct, min_balance],
+    )
+    return total
+
+
+async def set_last_default(chat_id: int, ts: str) -> None:
+    await _exec(
+        """INSERT INTO treasury_meta (chat_id, last_default_at)
+           VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET
+             last_default_at = excluded.last_default_at""",
+        [chat_id, ts],
+    )
+
+
+async def get_last_default(chat_id: int) -> Optional[str]:
+    rs = await _exec(
+        "SELECT last_default_at FROM treasury_meta WHERE chat_id = ?", [chat_id],
+    )
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
+
+
 # ---------- tax ----------
 
 async def tax_active_balances(min_balance: int, pct: int, days: int = 1) -> int:
-    """Списывает pct% с баланса > min_balance ТОЛЬКО у тех, кто писал
-    за последние `days` дней. Возвращает суммарно списанное.
-
-    Неактивные не платят — баланс сохраняется (Вася вернётся без долга).
-    В минус не уводит: WHERE balance > min_balance.
-    """
     rs = await _exec(
         f"""SELECT COALESCE(SUM(CAST(u.balance * ? / 100 AS INTEGER)), 0)
             FROM users u
@@ -614,10 +670,6 @@ async def tax_active_balances(min_balance: int, pct: int, days: int = 1) -> int:
 # ---------- transfers ----------
 
 async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bool:
-    """Атомарный перевод: списать amount с from_id, начислить (amount-fee) to_id.
-
-    Комиссию fee вызывающий код кладёт в казну через treasury_add.
-    """
     if amount <= 0 or to_id <= 0 or from_id == to_id:
         return False
     if fee < 0 or fee >= amount:
@@ -649,13 +701,9 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
     return True
 
 
-# ---------- salary (за активность) ----------
+# ---------- salary ----------
 
 async def add_salary_atomic(user_id: int, day: str, delta: int) -> bool:
-    """Прибавляет delta к salary_today и balance. Если день сменился — сбрасывает.
-
-    Возвращает True, если запись прошла.
-    """
     if delta <= 0:
         return True
     rs = await _exec(
@@ -684,10 +732,6 @@ async def add_salary_atomic(user_id: int, day: str, delta: int) -> bool:
 async def add_salary_frac_atomic(
     user_id: int, day: str, frac_delta: int,
 ) -> Optional[int]:
-    """Прибавляет frac_delta сотых к salary_frac. Накопленные 100 → 1 монета.
-
-    Возвращает число начисленных целых монет (0 или больше), None при ошибке.
-    """
     if frac_delta <= 0:
         return 0
 
@@ -733,6 +777,43 @@ async def add_salary_frac_atomic(
     return coins
 
 
+async def pay_salary_from_treasury(
+    chat_id: int, user_id: int, day: str, frac_delta: int,
+) -> Optional[int]:
+    if frac_delta <= 0:
+        return 0
+    coins = frac_delta // 100
+    frac = frac_delta % 100
+
+    if coins > 0:
+        cur = await treasury_get(chat_id)
+        if cur <= 0:
+            return None
+        take = min(coins, cur)
+        ok = await treasury_withdraw(chat_id, take)
+        if not ok:
+            return None
+        coins = take
+
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) + ?,
+               salary_frac = ?,
+               salary_day = ?,
+               salary_today = CASE
+                   WHEN salary_day = ? THEN COALESCE(salary_today, 0) + ?
+                   ELSE ?
+               END
+           WHERE user_id = ?""",
+        [coins, frac, day, day, coins, coins, user_id],
+    )
+    if getattr(rs, "error", False):
+        if coins > 0:
+            await treasury_add(chat_id, coins)
+        return None
+    return coins
+
+
 async def get_salary_today(user_id: int, day: str) -> int:
     rs = await _exec(
         "SELECT salary_today, salary_day FROM users WHERE user_id = ?",
@@ -757,6 +838,76 @@ async def get_salary_frac(user_id: int, day: str) -> int:
     if d != day:
         return 0
     return frac or 0
+
+
+# ---------- credit from treasury ----------
+
+async def take_credit_from_treasury(
+    chat_id: int, user_id: int, amount: int, today: str,
+) -> bool:
+    if amount <= 0:
+        return False
+    cur = await treasury_get(chat_id)
+    if cur < amount:
+        return False
+    ok = await treasury_withdraw(chat_id, amount)
+    if not ok:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) + ?,
+               balance = COALESCE(balance, 10) + ?,
+               credit_taken_day = ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 10) >= 0
+             AND COALESCE(credit, 0) = 0
+             AND (credit_taken_day IS NULL OR credit_taken_day != ?)""",
+        [amount, amount, today, user_id, today],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        await treasury_add(chat_id, amount)
+        return False
+    return True
+
+
+async def repay_credit_to_treasury(
+    chat_id: int, user_id: int, amount: int,
+) -> bool:
+    if amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) - ?,
+               balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 0) >= ?
+             AND COALESCE(credit, 0) >= ?""",
+        [amount, amount, user_id, amount, amount],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    await treasury_add(chat_id, amount)
+    return True
+
+
+async def apply_credit_interest_to_treasury(chat_id: int, percent: float) -> int:
+    rs = await _exec(
+        """SELECT COALESCE(SUM(CAST(credit * ? / 100 AS INTEGER)), 0)
+           FROM users WHERE credit > 0""",
+        [percent],
+    )
+    total = (rs.rows[0][0] if rs.rows else 0) or 0
+    if total <= 0:
+        return 0
+    rs2 = await _exec(
+        "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
+        "WHERE credit > 0",
+        [percent],
+    )
+    affected = getattr(rs2, "rows_affected", 0) or 0
+    if affected > 0:
+        await treasury_add(chat_id, total)
+    return affected
 
 
 # ---------- subscriptions ----------
@@ -935,9 +1086,7 @@ async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
         [chat_id, user_id],
     )
     if getattr(rs1, "error", False):
-        logger.error("inc_message: ошибка БД (chat=%s user=%s)", chat_id, user_id)
         return False
-
     rs2 = await _exec(
         """INSERT INTO messages_day (chat_id, user_id, day, count)
            VALUES (?, ?, ?, 1)
@@ -946,16 +1095,16 @@ async def inc_message_and_day(chat_id: int, user_id: int, day: str) -> bool:
         [chat_id, user_id, day],
     )
     if getattr(rs2, "error", False):
-        logger.error("inc_message_day: ошибка БД (chat=%s user=%s day=%s)",
-                     chat_id, user_id, day)
         return False
     return True
 
 
 async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
     rs = await _exec(
-        """SELECT user_id, count FROM messages
-           WHERE chat_id = ? ORDER BY count DESC LIMIT ?""",
+        """SELECT m.user_id, m.count
+           FROM messages m
+           WHERE m.chat_id = ?
+           ORDER BY m.count DESC LIMIT ?""",
         [chat_id, limit],
     )
     return [(r[0], r[1]) for r in rs.rows]
@@ -1218,7 +1367,6 @@ async def remove_last_active_warning(chat_id: int, user_id: int) -> int:
         [chat_id, user_id],
     )
     if getattr(rs, "error", False):
-        logger.error("remove_last_active_warning: ошибка БД (user=%s)", user_id)
         return 0
     return getattr(rs, "rows_affected", 0) or 0
 
@@ -1408,7 +1556,6 @@ async def remove_award_by_title(chat_id: int, user_id: int, title: str) -> int:
         [chat_id, user_id, title],
     )
     if getattr(rs, "error", False):
-        logger.error("remove_award_by_title: ошибка БД (user=%s)", user_id)
         return 0
     return getattr(rs, "rows_affected", 0) or 0
 
@@ -1447,3 +1594,120 @@ async def count_awards(chat_id: int, user_id: int) -> int:
     if not rs.rows:
         return 0
     return rs.rows[0][0] or 0
+
+
+# ---------- shop ----------
+
+async def log_purchase(user_id: int, item_id: str, price: int) -> None:
+    await _exec(
+        """INSERT INTO purchases (user_id, item_id, price)
+           VALUES (?, ?, ?)""",
+        [user_id, item_id, price],
+    )
+
+
+async def set_prefix(user_id: int, prefix: str) -> bool:
+    rs = await _exec(
+        """INSERT INTO user_cosmetics (user_id, prefix, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             prefix = excluded.prefix,
+             updated_at = datetime('now')""",
+        [user_id, prefix],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_prefix(user_id: int) -> Optional[str]:
+    rs = await _exec(
+        "SELECT prefix FROM user_cosmetics WHERE user_id = ?", [user_id],
+    )
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
+
+
+async def set_temp_role(user_id: int, role: str, expires_at: str) -> bool:
+    rs = await _exec(
+        """INSERT INTO temp_roles (user_id, role, expires_at, granted_at)
+           VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             role = excluded.role,
+             expires_at = excluded.expires_at,
+             granted_at = datetime('now')""",
+        [user_id, role, expires_at],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_temp_role(user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT role, expires_at FROM temp_roles
+           WHERE user_id = ? AND expires_at > datetime('now')""",
+        [user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {"role": r[0], "expires_at": r[1]}
+
+
+async def list_expired_temp_roles() -> List[tuple]:
+    rs = await _exec(
+        "SELECT user_id, role FROM temp_roles WHERE expires_at <= datetime('now')",
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def delete_temp_role(user_id: int) -> int:
+    rs = await _exec("DELETE FROM temp_roles WHERE user_id = ?", [user_id])
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def add_top_bonus(user_id: int, delta: int) -> bool:
+    rs = await _exec(
+        "UPDATE users SET top_bonus = COALESCE(top_bonus, 0) + ? WHERE user_id = ?",
+        [delta, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_top_bonus(user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(top_bonus, 0) FROM users WHERE user_id = ?", [user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def add_aura_bonus(chat_id: int, user_id: int, delta: int) -> bool:
+    if delta == 0:
+        return True
+    await _exec(
+        """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
+           VALUES (?, ?, ?, NULL)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             value = value + excluded.value""",
+        [chat_id, user_id, delta],
+    )
+    return True
+
+
+# ---------- avatar ----------
+
+async def set_avatar(user_id: int, file_id: Optional[str]) -> bool:
+    rs = await _exec(
+        "UPDATE users SET avatar_file_id = ? WHERE user_id = ?",
+        [file_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_avatar(user_id: int) -> Optional[str]:
+    rs = await _exec(
+        "SELECT avatar_file_id FROM users WHERE user_id = ?", [user_id],
+    )
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
