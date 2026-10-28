@@ -34,6 +34,8 @@ import actions
 import ai
 import help_menu
 import casino
+import shop
+import avatar
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -69,8 +71,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/check — подписка\n"
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
-        "Профиль — посмотреть профиль\n"
-        "Казино — мини-казино на монеты"
+        "Профиль — профиль\n"
+        "Магазин — товары\n"
+        "Казино — мини-казино"
     )
 
 
@@ -90,9 +93,8 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def _run_ai(user, msg, prompt: str) -> None:
     remain = ai.try_acquire(user.id)
     if remain > 0:
-        await msg.reply_text(f"⏳ Подожди {remain:.1f} сек. перед следующим запросом.")
+        await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
-
     thinking = await msg.reply_text("🤔 Думаю…")
     answer = await ai.ask_ai(prompt, user_id=user.id)
     if not answer:
@@ -101,10 +103,8 @@ async def _run_ai(user, msg, prompt: str) -> None:
         except Exception:
             pass
         return
-
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
-
     try:
         await thinking.edit_text(answer)
     except Exception:
@@ -119,28 +119,22 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
-
     text = (msg.text or "").strip()
-
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if msg.reply_to_message.from_user.id == context.bot.id:
             prompt = _AI_WORD.sub("", text).strip()
             if not prompt:
-                await msg.reply_text(
-                    "Напиши вопрос — сообщением или реплаем на моё сообщение."
-                )
+                await msg.reply_text("Напиши вопрос реплаем.")
                 return
             await _run_ai(user, msg, prompt)
             return
-
     m = _AI_WORD.match(text)
     if not m:
         return
     prompt = text[m.end():].strip()
     if not prompt:
         await msg.reply_text(
-            "Формат: <code>ИИ Привет</code> — вопрос после триггера, "
-            "или реплай на сообщение бота.",
+            "Формат: <code>ИИ Привет</code> или реплай на сообщение бота.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -158,35 +152,31 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Комиссар / -Комиссар @user\n"
         "• Список шерифы / Список комиссары\n"
         "• Поймать @user (шериф)\n"
-        "• +Мут 5ч Богохульство / -Мут @user\n"
+        "• +Мут 5ч Причина / -Мут @user\n"
         "• +Бан @user / -Бан @user\n"
-        "• +Жалоба / +жб @user (всем)\n"
-        "• +Предупреждение / +пред / -Пред @user\n"
+        "• +Жалоба / +жб @user\n"
+        "• +Пред / -Пред @user\n"
         "• +Награда Название / 5 @user\n"
         "• -Награда Название @user\n"
         "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
-        "• Топ все / Топ день / Мое место\n"
-        "• Шип @u1 @u2\n"
-        "• Сделать предложение @user / +Брак / -Брак\n"
-        "• Мой брак\n"
-        "• Профиль (базовый + кнопки разделов)\n"
-        "• хо @user 50 — крестики-нолики (комиссия 5%)\n"
-        "• +Кредит 50 / -Кредит 50\n"
-        "• +Монеты 100 @user / -Монеты 100 @user (админ)\n"
-        "• +Утил 100 @user / -Утил 100 @user (админ)\n"
-        "• +Утил 100 казна / -Утил 100 казна (админ)\n"
+        "• Топ все / Топ день / Топ богачи / Мое место\n"
+        "• Шип @u1 @u2 (с ИИ)\n"
+        "• Сделать предложение / +Брак / -Брак / Мой брак\n"
+        "• Профиль / Аватар\n"
+        "• хо @user 50 — крестики (комиссия 5%)\n"
+        "• +Кредит 50 / -Кредит 50 — из казны\n"
+        "• +Монеты / -Монеты @user\n"
+        "• +Утил / -Утил @user / казна\n"
         "• Перевод 50 @user — комиссия 3%\n"
-        "• Казна — баланс казны чата (админ)\n"
-        "• +ВКассу 500 — пополнить казну (админ)\n"
-        "• ОбрезатьКасну 5000 — сжечь излишек казны (админ)\n"
-        "• Зарплата — сколько начислено за сегодня\n"
-        "• +ССС @user / -ССС @user / Список ССС\n"
-        "• +Суд ССС @user / +Суд @user\n"
-        "• дроч / Аура / Топ аура — аурометр\n"
-        "• Казино монетка 50 / Казино кубик 4 50 / Казино слоты 50\n"
-        "• ИИ / Браини / Мозг / Brainy <запрос> — ИИ (или реплай)\n"
-        "• /restart — сбросить контекст ИИ\n"
-        "• /help — справка по ролям"
+        "• Казна / +ВКассу 500 / ОбрезатьКасну 15000\n"
+        "• Зарплата — инфо за сегодня\n"
+        "• Магазин — товары\n"
+        "• +ССС / -ССС / Список ССС\n"
+        "• +Суд ССС / +Суд\n"
+        "• дроч / Аура / Топ аура\n"
+        "• Казино монетка/кубик/слоты\n"
+        "• ИИ / Браини / Мозг <запрос>\n"
+        "• /restart /help"
     )
 
 
@@ -205,11 +195,8 @@ async def post_init(app: Application) -> None:
             interval=top.FLUSH_INTERVAL_SEC,
             first=top.FLUSH_INTERVAL_SEC,
         )
-        logger.info(
-            "JobQueue: cleanup + flush каждые %s сек запланированы",
-            top.FLUSH_INTERVAL_SEC,
-        )
         economy.register_jobs(app)
+        shop.register_jobs(app)
     else:
         logger.warning("JobQueue не инициализирован")
 
@@ -270,8 +257,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ВКассу(\s|$)"), economy.cmd_treasury_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^ОбрезатьКасну(\s|$)"), economy.cmd_treasury_trim))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Зарплата(\s|$)"), economy.cmd_salary))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+богачи(\s|$)"), economy.cmd_top_rich))
 
-    # -Утил / +Утил (казна — отдельным хендлером первым, чтобы перехватить)
+    # -Утил / +Утил
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
                                    economy.cmd_burn_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
@@ -280,6 +268,19 @@ def build_app() -> Application:
                                    economy.cmd_mint_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
                                    economy.cmd_mint_user))
+
+    # Магазин
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop))
+    app.add_handler(CallbackQueryHandler(shop.shop_callback, pattern=r"^shop:"))
+
+    # Аватар
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аватар(\s|$)"), avatar.cmd_avatar))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Аватар(\s|$)"), avatar.cmd_remove_avatar))
+    app.add_handler(CallbackQueryHandler(avatar.avatar_callback, pattern=r"^avatar:"))
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        avatar.handle_avatar_photo,
+    ))
 
     # Казино
     app.add_handler(MessageHandler(
