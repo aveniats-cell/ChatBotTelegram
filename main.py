@@ -180,6 +180,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• дроч / Аура / Топ аура\n"
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
+        "• /Defloult220099 — экстремальный дефолт (обнуление всех)\n"
+        "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
     )
 
@@ -233,6 +235,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
+    app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
+    app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
 
     app.add_handler(MessageHandler(filters.Regex(r"^\+Шериф(\s|$)"), roles.grant_sheriff))
     app.add_handler(MessageHandler(filters.Regex(r"^[-–−]Шериф(\s|$)"), roles.revoke_sheriff))
@@ -355,7 +359,6 @@ def build_app() -> Application:
             cmd_ai,
         ))
 
-    if CHAT_ID:
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
