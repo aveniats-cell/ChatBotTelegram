@@ -27,7 +27,7 @@ DICE_MULT = 5.5
 SLOT_TRIPLE_MULT = 13
 SLOT_PAIR_MULT = 1.4
 
-_RE_COIN = re.compile(r"(?i)^казино\s+монетка\s+(\d+)\s*$")
+_RE_COIN = re.compile(r"(?i)^казино\s+монетка\s+(орёл|орел|решка)\s+(\d+)\s*$")
 _RE_DICE = re.compile(r"(?i)^казино\s+кубик\s+([1-6])\s+(\d+)\s*$")
 _RE_SLOTS = re.compile(r"(?i)^казино\s+слоты\s+(\d+)\s*$")
 
@@ -62,7 +62,7 @@ async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "🎰 <b>Казино</b>\n"
             f"Ставка от {MIN_BET} до {MAX_BET} монет.\n\n"
             "Форматы:\n"
-            "<code>Казино монетка 50</code>\n"
+            "<code>Казино монетка орёл 50</code>\n"
             "<code>Казино кубик 4 50</code> — ставка на число 1–6\n"
             "<code>Казино слоты 50</code>",
             parse_mode=ParseMode.HTML, reply_markup=kb,
@@ -71,7 +71,8 @@ async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     m = _RE_COIN.match(text)
     if m:
-        await _play_coin(user, msg, int(m.group(1)))
+        side = m.group(1).casefold().replace("ё", "е")
+        await _play_coin(user, msg, side, int(m.group(2)))
         return
     m = _RE_DICE.match(text)
     if m:
@@ -83,7 +84,7 @@ async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     await msg.reply_text(
-        "Формат: <code>Казино монетка 50</code> / "
+        "Формат: <code>Казино монетка орёл 50</code> / "
         "<code>Казино кубик 4 50</code> / <code>Казино слоты 50</code>.",
         parse_mode=ParseMode.HTML,
     )
@@ -99,7 +100,7 @@ async def casino_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     kind = parts[2]
     if kind == "coin":
-        text = "🪙 <code>Казино монетка 50</code> — 50/50, выигрыш x1.92."
+        text = "🪙 <code>Казино монетка орёл 50</code> — 50/50, выигрыш x1.92."
     elif kind == "dice":
         text = "🎲 <code>Казино кубик 4 50</code> — ставка на число 1–6, выигрыш x5.5."
     elif kind == "slots":
@@ -127,10 +128,9 @@ async def _take_bet(user, msg, bet: int) -> bool:
 
 async def _finish(user, msg, chat_id: int, bet: int, win: int, detail: str) -> None:
     """Начисляет выигрыш, а не возвращённую ставку кладёт в казну."""
-    if win > 0:
-        await db.add_balance(user.id, win)
+    paid = win > 0 and await db.add_balance(user.id, win)
     profit_for_house = bet - win
-    if profit_for_house > 0:
+    if profit_for_house > 0 and paid:
         try:
             await db.treasury_add(chat_id, profit_for_house)
         except Exception as e:
@@ -138,6 +138,8 @@ async def _finish(user, msg, chat_id: int, bet: int, win: int, detail: str) -> N
 
     row = await db.get_user(user.id)
     bal = (row or {}).get("balance") or 0
+    if not paid and win > 0:
+        detail += "\n⚠️ Не удалось начислить выигрыш, обратитесь к админу."
     if win > bet:
         sign = "🏆"
     elif win == bet:
@@ -154,11 +156,11 @@ async def _finish(user, msg, chat_id: int, bet: int, win: int, detail: str) -> N
     )
 
 
-async def _play_coin(user, msg, bet: int) -> None:
+async def _play_coin(user, msg, side: str, bet: int) -> None:
     if not await _take_bet(user, msg, bet):
         return
     result = secrets.choice(["орёл", "решка"])
-    if result == "орёл":
+    if side == result.replace("ё", "е"):
         win = int(bet * COIN_MULT)
         await _finish(user, msg, msg.chat_id, bet, win,
                       f"Монетка: <b>{result}</b>. Ты угадал!")
