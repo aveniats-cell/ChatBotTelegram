@@ -420,6 +420,15 @@ async def take_balance_any(user_id: int, amount: int) -> int:
     return take
 
 
+async def burn_balance(user_id: int, amount: int) -> int:
+    """Сжигает до amount монет у юзера (не больше баланса).
+
+    Никуда не начисляет — монеты исчезают из экономики.
+    Возвращает фактически сожжённое количество.
+    """
+    return await take_balance_any(user_id, amount)
+
+
 async def add_credit(user_id: int, delta: int) -> None:
     await _exec(
         "UPDATE users SET credit = COALESCE(credit, 0) + ? WHERE user_id = ?",
@@ -535,6 +544,34 @@ async def treasury_withdraw(chat_id: int, amount: int) -> bool:
     if getattr(rs, "error", False):
         return False
     return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def burn_treasury(chat_id: int, amount: int) -> int:
+    """Сжигает до amount монет из казны. Возвращает сожжённое."""
+    if amount <= 0:
+        return 0
+    cur = await treasury_get(chat_id)
+    if cur <= 0:
+        return 0
+    take = min(amount, cur)
+    await _exec(
+        "UPDATE treasury SET balance = balance - ? WHERE chat_id = ?",
+        [take, chat_id],
+    )
+    return take
+
+
+async def treasury_trim(chat_id: int, keep: int) -> int:
+    """Оставляет в казне keep монет, остальное сжигает. Возвращает сожжённое."""
+    cur = await treasury_get(chat_id)
+    if cur <= keep:
+        return 0
+    burned = cur - keep
+    await _exec(
+        "UPDATE treasury SET balance = ? WHERE chat_id = ?",
+        [keep, chat_id],
+    )
+    return burned
 
 
 # ---------- tax ----------
@@ -920,6 +957,14 @@ async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
         """SELECT user_id, count FROM messages
            WHERE chat_id = ? ORDER BY count DESC LIMIT ?""",
         [chat_id, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def top_balances(limit: int = 20) -> List[tuple]:
+    rs = await _exec(
+        "SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT ?",
+        [limit],
     )
     return [(r[0], r[1]) for r in rs.rows]
 
