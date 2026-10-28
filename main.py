@@ -34,7 +34,6 @@ import actions
 import ai
 import help_menu
 import casino
-import shop
 import avatar
 
 logging.basicConfig(
@@ -72,7 +71,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
-        "Магазин — товары\n"
+        "Аватар — аватарка в профиле\n"
         "Казино — мини-казино"
     )
 
@@ -170,7 +169,6 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Перевод 50 @user — комиссия 3%\n"
         "• Казна / +ВКассу 500 / ОбрезатьКасну 15000\n"
         "• Зарплата — инфо за сегодня\n"
-        "• Магазин — товары\n"
         "• +ССС / -ССС / Список ССС\n"
         "• +Суд ССС / +Суд\n"
         "• дроч / Аура / Топ аура\n"
@@ -196,7 +194,6 @@ async def post_init(app: Application) -> None:
             first=top.FLUSH_INTERVAL_SEC,
         )
         economy.register_jobs(app)
-        shop.register_jobs(app)
     else:
         logger.warning("JobQueue не инициализирован")
 
@@ -268,10 +265,6 @@ def build_app() -> Application:
                                    economy.cmd_mint_treasury))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
                                    economy.cmd_mint_user))
-
-    # Магазин
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop))
-    app.add_handler(CallbackQueryHandler(shop.shop_callback, pattern=r"^shop:"))
 
     # Аватар
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аватар(\s|$)"), avatar.cmd_avatar))
