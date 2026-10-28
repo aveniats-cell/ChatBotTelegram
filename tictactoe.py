@@ -1,10 +1,9 @@
-"""Крестики-нолики 5×5 на монеты.
+"""Крестики-нолики 5×5 на монеты с комиссией 5% с банка.
 
-P0: эскроу ставок. При accept атомарно списываем bet у обоих
-(db.take_balance_atomic); при finish:
-- ничья: каждому +bet (возврат своей ставки)
-- победа: победителю +2*bet (своя + чужая), проигравший уже потерял свою.
-Никакого надувания экономики и ухода в минус.
+Эскроу: при accept атомарно списываем bet у обоих.
+Финал:
+- ничья: возврат по bet каждому (без комиссии);
+- победа: победитель получает bank - fee, fee = 5% от bank уходит в казну.
 """
 import os
 import re
@@ -34,6 +33,8 @@ BET_RE = re.compile(r"\b(\d+)\b")
 
 BOARD_SIZE = 5
 WIN_LEN = 5
+
+TTT_FEE_PCT = 5
 
 GAMES: dict[str, dict] = {}
 
@@ -164,7 +165,7 @@ async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.reply_text(
         f"🎮 <b>Вызов!</b>\n"
         f"{escape(GAMES[game_id]['p1_name'])} → {escape(opp_name)}\n"
-        f"Ставка: <b>{bet}</b> монет.\n\n"
+        f"Ставка: <b>{bet}</b> монет. Комиссия {TTT_FEE_PCT}% с банка.\n\n"
         f"<i>{escape(opp_name)}, вы принимаете вызов?</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
@@ -188,18 +189,28 @@ async def _finish_game(context: ContextTypes.DEFAULT_TYPE, game_id: str,
         await db.add_balance(p1, bet)
         await db.add_balance(p2, bet)
         text = f"🤝 Ничья! Ставки возвращены по <b>{bet}</b>."
-    elif winner_id == p1:
-        await db.add_balance(p1, bet * 2)
-        text = (
-            f"🏆 Победил <b>{escape(g['p1_name'])}</b>!\n"
-            f"Забрано: <b>{bet * 2}</b> (своя + чужая ставка)."
-        )
     else:
-        await db.add_balance(p2, bet * 2)
-        text = (
-            f"🏆 Победил <b>{escape(g['p2_name'])}</b>!\n"
-            f"Забрано: <b>{bet * 2}</b> (своя + чужая ставка)."
-        )
+        bank = bet * 2
+        fee = max(1, int(bank * TTT_FEE_PCT / 100))
+        payout = bank - fee
+        if winner_id == p1:
+            await db.add_balance(p1, payout)
+            text = (
+                f"🏆 Победил <b>{escape(g['p1_name'])}</b>!\n"
+                f"Банк: <b>{bank}</b> · комиссия <b>{fee}</b> ({TTT_FEE_PCT}%)\n"
+                f"Выплата: <b>{payout}</b>."
+            )
+        else:
+            await db.add_balance(p2, payout)
+            text = (
+                f"🏆 Победил <b>{escape(g['p2_name'])}</b>!\n"
+                f"Банк: <b>{bank}</b> · комиссия <b>{fee}</b> ({TTT_FEE_PCT}%)\n"
+                f"Выплата: <b>{payout}</b>."
+            )
+        try:
+            await db.treasury_add(g["chat_id"], fee)
+        except Exception as e:
+            logger.warning("ttt treasury_add: %s", e)
 
     try:
         if winner_id == p1:
@@ -271,14 +282,13 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
             return
 
-        # ACCEPT: эскроу — атомарно списываем ставку у обоих.
         bet = g["bet"]
         p1, p2 = g["p1_id"], g["p2_id"]
 
         if not await db.take_balance_atomic(p1, bet):
             g["state"] = "declined"
             GAMES.pop(game_id, None)
-            await q.answer("У вас не хватает монет.", show_alert=True)
+            await q.answer("У инициатора не хватает монет.", show_alert=True)
             try:
                 await q.edit_message_text(
                     (q.message.text or "") + "\n\n⚠️ <b>Отменено: "
@@ -290,7 +300,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if not await db.take_balance_atomic(p2, bet):
-            # вернуть ставку инициатору
             await db.add_balance(p1, bet)
             g["state"] = "declined"
             GAMES.pop(game_id, None)
