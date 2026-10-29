@@ -1,6 +1,15 @@
 """Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
 проценты в казну, дефолт (органический — процент, искусственный — всё),
-топ богачи, раздача всем (из казны)."""
+топ богачи, раздача всем (из казны).
+
+Исправления:
+  - tax_job / tax_active_balances: атомарно, сумма = реально списанное
+    (UPDATE ... RETURNING), а не «посчитали до UPDATE»;
+  - take_credit_from_treasury: сначала фиксируем долг юзера, потом выдаём
+    из казны; при сбое — компенсация. Никаких фантомных возвратов;
+  - daily_interest_job и tax_job обёрнуты в try/except целиком;
+  - register_jobs: проверяем, что job_queue есть, и логируем timezone.
+"""
 import os
 import re
 import logging
@@ -98,26 +107,20 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text("⛔ Вы уже брали кредит сегодня.")
         return
 
-    treasury = await db.treasury_get(chat.id)
-    logger.info("credit_take: chat.id=%s env_CHAT_ID=%s before=%s amount=%s",
-                chat.id, os.getenv("CHAT_ID"), treasury, amount)
-    if treasury < amount:
-        await msg.reply_text(
-            f"🏦 Банк пуст: в казне <b>{treasury}</b>, нужно <b>{amount}</b>.\n"
-            f"Кредиты временно недоступны.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     ok = await db.take_credit_from_treasury(chat.id, user.id, amount, _today_utc())
     if not ok:
-        await msg.reply_text("⚠️ Не удалось выдать кредит. Попробуйте позже.")
+        treasury = await db.treasury_get(chat.id)
+        await msg.reply_text(
+            f"🏦 Не удалось выдать кредит.\n"
+            f"В казне: <b>{treasury}</b>, нужно: <b>{amount}</b>.\n"
+            f"<i>Возможно, кредиты временно недоступны.</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     new_row = await db.get_user(user.id)
     new_credit = (new_row or {}).get("credit") or amount
     new_treasury = await db.treasury_get(chat.id)
-    logger.info("credit_take: after=%s", new_treasury)
     await msg.reply_text(
         f"💳 Взят кредит из казны: <b>{amount}</b>\n"
         f"Долг: <b>{new_credit}</b>\n"
