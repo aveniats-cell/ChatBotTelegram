@@ -48,6 +48,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
+if not ADMIN_ID:
+    logger.error(
+        "main: ADMIN_ID не задан — все админ-команды работать не будут!"
+    )
+
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
@@ -172,7 +177,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Опрос ССС / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
         "• Топ все / Топ день / Топ богачи / Мое место\n"
         "• Шип @u1 @u2 (с ИИ)\n"
-        "• Сделать предложение / +Брак / -Брак / Мой брак\n"
+        "• Сделать предложение / +Брак / -Брак / Мой брак / Топ браки\n"
         "• Профиль\n"
         "• хо @user 50 — крестики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50 — из казны\n"
@@ -311,6 +316,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Брак(\s|$)"), wedding.cmd_force_divorce_or_self))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+браки(\s|$)"), wedding.cmd_marriage_top))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
@@ -330,7 +336,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # --- правила чата (фильтр — filters.Regex, не re.Pattern) ---
+    # --- правила чата ---
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^правила(\s+чата)?\s*[.!?]*\s*$"),
         rules.cmd_rules,
