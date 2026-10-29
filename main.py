@@ -36,6 +36,10 @@ import help_menu
 import casino
 import polls
 import rules
+import coins
+import coin_market
+import coin_broker
+import coin_jobs
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -49,17 +53,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 
 if not ADMIN_ID:
-    logger.error(
-        "main: ADMIN_ID не задан — все админ-команды работать не будут!"
-    )
+    logger.error("main: ADMIN_ID не задан — админ-команды работать не будут!")
 
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
 
-_AI_WORD = re.compile(
-    r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"
-)
+_AI_WORD = re.compile(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)")
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,7 +80,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
-        "Казино — мини-казино"
+        "Казино — мини-казино\n"
+        "Коины — магазин коинов\n"
+        "Рынок — рынок коинов\n"
+        "Панель брокера — портфель"
     )
 
 
@@ -192,7 +195,8 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
-        "• /Defloult220099 — экстремальный дефолт (обнуление всех)\n"
+        "• Коины / Рынок / Панель брокера\n"
+        "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
     )
@@ -228,6 +232,16 @@ async def post_init(app: Application) -> None:
             first=60,
         )
         economy.register_jobs(app)
+        # коины: ежедневный доход в 01:00 UTC, история цен раз в час
+        app.job_queue.run_daily(
+            coin_jobs.daily_coin_income_job,
+            time=dtime(hour=1, minute=0, tzinfo=timezone.utc),
+        )
+        app.job_queue.run_repeating(
+            coin_jobs.hourly_price_history_job,
+            interval=3600,
+            first=300,
+        )
     else:
         logger.warning("JobQueue не инициализирован")
 
@@ -241,6 +255,18 @@ async def post_shutdown(app: Application) -> None:
     await ai.close_session()
     await db.close_db()
     logger.info("Bot stopped")
+
+
+async def _coins_input_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Маршрутизирует текстовый ввод для FSM создания/продажи коинов."""
+    if await coins.create_input(update, context):
+        return
+    if await coin_market.sell_price_input(update, context):
+        return
+
+
+async def _coins_photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await coins.photo_input(update, context)
 
 
 def build_app() -> Application:
@@ -336,13 +362,11 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    # --- правила чата ---
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^правила(\s+чата)?\s*[.!?]*\s*$"),
         rules.cmd_rules,
     ))
 
-    # --- опросы ---
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^Опрос\s+ССС(\s|/)"),
         polls.cmd_poll_sss,
@@ -424,10 +448,24 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
                                    actions.cmd_handshake))
 
+    # --- коины ---
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Коины(\s|$)"), coins.cmd_coins))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Рынок(\s|$)"), coin_market.cmd_market))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Панель\s+брокера(\s|$)"), coin_broker.cmd_broker))
+    app.add_handler(CallbackQueryHandler(coins.coin_callback, pattern=r"^coin:(view|buy|chart|mine|main):?"))
+    app.add_handler(CallbackQueryHandler(coins.tier_callback, pattern=r"^coin:tier:"))
+    app.add_handler(CallbackQueryHandler(coins.photo_decision_callback, pattern=r"^coin:photo_(ok|no)$"))
+    app.add_handler(CallbackQueryHandler(coin_market.market_callback, pattern=r"^cmkt:"))
+
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
+
+    # FSM коинов: текст и фото — раньше track_message, чтобы перехватить
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _coins_input_router), group=-2)
+    app.add_handler(MessageHandler(filters.PHOTO, _coins_photo_router), group=-2)
+
     if CHAT_ID:
         app.add_handler(MessageHandler(
             filters.REPLY & filters.Chat(chat_id=CHAT_ID),
