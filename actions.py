@@ -3,6 +3,9 @@
 
 Все тексты — в TEXTS_OLD и TEXTS_NEW. В коде — нейтральные имена команд.
 «Сделать 18+» реализовано нейтрально (плейсхолдер «...»), заполняется в TEXTS_NEW.
+
+Изменения: если цель действия — супруг(а) актора, начисляется XP браку
+(через marriage_xp.award_if_spouse).
 """
 from __future__ import annotations
 
@@ -20,21 +23,17 @@ from telegram.ext import ContextTypes
 
 import db
 import utils
+import marriage_xp
 
 logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-# Стоимость и кулдаун для новых действий (0 — бесплатно/без кулдауна)
 ACTION_COST = 0
 ACTION_COOLDOWN_SEC = 0
 _LAST_ACTION: dict[tuple[int, int, str], float] = {}
 
 
-# ===========================================================================
-# ТЕКСТЫ: старые действия (поправь под себя, если отличались)
-# Плейсхолдеры: {actor} — кто, {target} — над кем
-# ===========================================================================
 TEXTS_OLD: dict[str, str] = {
     "slap": "{actor} отвесил(а) леща {target} 💥",
     "kiss": "{actor} поцеловал(а) {target} 💋",
@@ -45,9 +44,6 @@ TEXTS_OLD: dict[str, str] = {
 }
 
 
-# ===========================================================================
-# ТЕКСТЫ: новые действия (слоты под 18+ заполняешь сам в ok18)
-# ===========================================================================
 TEXTS_NEW: dict[str, dict[str, str]] = {
     "kiss_deep": {
         "self": "Себе нельзя 🙂",
@@ -133,25 +129,28 @@ async def _resolve_actor_target(
     return user.id, actor_name, target_id, target_name
 
 
-# ===========================================================================
-# СТАРЫЕ ДЕЙСТВИЯ (логика та же, что была)
-# ===========================================================================
-
 async def _do_old(update: Update, context: ContextTypes.DEFAULT_TYPE,
                   key: str, clean_text: str) -> None:
     msg = update.effective_message
-    if not msg:
+    chat = update.effective_chat
+    if not msg or not chat:
         return
     resolved = await _resolve_actor_target(update, context, clean_text)
     if not resolved:
         await msg.reply_text("Нельзя применить это к себе 🙂")
         return
-    _, actor_name, _, target_name = resolved
+    actor_id, actor_name, target_id, target_name = resolved
     text = _fmt(TEXTS_OLD.get(key, "{actor} → {target}"), actor_name, target_name)
     try:
         await msg.reply_text(text, parse_mode=ParseMode.HTML)
     except TelegramError as e:
         logger.warning("actions old send: %s", e)
+        return
+
+    try:
+        await marriage_xp.award_if_spouse(chat.id, actor_id, target_id, key)
+    except Exception as e:
+        logger.warning("actions old marriage_xp: %s", e)
 
 
 def _clean(text: str, triggers: str) -> str:
@@ -187,10 +186,6 @@ async def cmd_pat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     t = (update.effective_message.text or "") if update.effective_message else ""
     await _do_old(update, context, "pat", _clean(t, r"погладить"))
 
-
-# ===========================================================================
-# НОВЫЕ ДЕЙСТВИЯ
-# ===========================================================================
 
 async def _do_new(update: Update, context: ContextTypes.DEFAULT_TYPE,
                   key: str, clean_text: str, admin_only: bool = False) -> None:
@@ -239,12 +234,17 @@ async def _do_new(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await msg.reply_text(text, parse_mode=ParseMode.HTML)
     except TelegramError as e:
         logger.warning("actions new send: %s", e)
+        return
 
-    # статистика (не критично, ошибки глотаем)
     try:
         await db.inc_action_stat(chat.id, actor_id, key, 1)
     except Exception as e:
         logger.warning("actions stat: %s", e)
+
+    try:
+        await marriage_xp.award_if_spouse(chat.id, actor_id, target_id, key)
+    except Exception as e:
+        logger.warning("actions new marriage_xp: %s", e)
 
 
 async def cmd_kiss_deep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
