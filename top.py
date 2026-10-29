@@ -7,7 +7,13 @@
   - flush_job БОЛЬШЕ НЕ ВЫЗЫВАЕТ дефолт (дефолт — только в
     economy.default_watchdog_job раз в час и в _check_default_after
     после +Кредит / -Утил казна) — это убирает лавину дефолтов каждые 15 сек;
-  - добавлен cleanup_job для pending_salary (старше 2 дней).
+  - cleanup_job для pending_salary (старше 2 дней);
+  - cleanup_old_days(keep_days=1): НЕ стираем вчерашний messages_day до налога
+    в 00:40 (иначе tax_active_balances всегда видел «некому платить»);
+  - flush_job catch-up: платим ВСЕ накопленные дроби (без day >= today),
+    иначе вчерашние долги висели мёртвым грузом;
+  - _flush при ошибке add_pending_salary больше не теряет батч в памяти:
+    retry + лог, а не тихий requeue.
 """
 import asyncio
 import os
@@ -34,11 +40,8 @@ SALARY_FRAC_PER_MSG = 20
 
 _USER_CACHE: dict[int, tuple[str, str]] = {}
 
-# _PENDING — счётчики сообщений для messages/messages_day (не критичны к потере:
-# при рестарте теряются только счётчики сообщений, не деньги).
-# _PENDING_SALARY — теперь только in-memory буфер перед записью в pending_salary;
-# деньги лежат в БД, потеря буфера при рестарте максимум потеряет «свежие»
-# <FLUSH_INTERVAL_SEC сообщений, но они всё равно не дошли бы до БД.
+# _PENDING — счётчики сообщений для messages/messages_day (не критичны к потере).
+# _PENDING_SALARY — in-memory буфер перед записью в pending_salary.
 _PENDING: dict[tuple[int, int, str], int] = defaultdict(int)
 _PENDING_SALARY: dict[tuple[int, int, str], int] = defaultdict(int)
 _flush_lock = asyncio.Lock()
@@ -130,7 +133,6 @@ async def _flush() -> None:
     for (chat_id, user_id, day), frac_delta in snap_sal.items():
         if frac_delta <= 0:
             continue
-        # 2.1 фиксируем дроби в БД (переживёт рестарт)
         saved = False
         for attempt in range(3):
             saved = await db.add_pending_salary(chat_id, user_id, day, frac_delta)
@@ -138,15 +140,14 @@ async def _flush() -> None:
                 break
             await asyncio.sleep(0.5 * (attempt + 1))
         if not saved:
-            logger.warning(
+            logger.error(
                 "flush salary: не удалось сохранить pending_salary "
-                "(chat=%s user=%s) — оставляем в памяти",
-                chat_id, user_id,
+                "(chat=%s user=%s day=%s delta=%s) — возвращаем в память для ретрая",
+                chat_id, user_id, day, frac_delta,
             )
             _requeue_sal(chat_id, user_id, day, frac_delta)
             continue
 
-        # 2.2 выплачиваем из казны накопленное
         await _pay_pending_salary(chat_id, user_id, day)
 
 
@@ -183,27 +184,26 @@ async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.warning("flush_job: %s", e)
 
-    # Догоняем pending_salary за прошлые дни (если казна была пуста — до-платим)
+    # Догоняем pending_salary за ВСЕ дни (если казна была пуста — до-платим).
+    # cleanup_job всё равно удалит строки старше 2 дней, так что не боимся
+    # бесконечного накопления.
     try:
         rs = await db._exec(
             """SELECT DISTINCT chat_id, user_id, day FROM pending_salary
-               WHERE frac_delta > 0 AND day >= date('now')"""
+               WHERE frac_delta > 0"""
         )
         for chat_id, user_id, day in rs.rows:
             await _pay_pending_salary(chat_id, user_id, day)
     except Exception as e:
         logger.warning("flush_job catch-up: %s", e)
 
-    # ВАЖНО: дефолт здесь НЕ вызываем.
-    # Дефолт запускается из economy.default_watchdog_job (раз в час)
-    # и из economy._check_default_after (после +Кредит / -Утил казна).
-    # Дублирование дефолта каждые 15 сек = лишние запросы к Turso
-    # и риск лавины дефолтов при рестарте Render.
+    # ВАЖНО: дефолт здесь НЕ вызываем (см. economy.default_watchdog_job).
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # keep_days=1: не стираем вчерашний messages_day до налога в 00:40.
     try:
-        deleted = await db.cleanup_old_days(keep_days=0)
+        deleted = await db.cleanup_old_days(keep_days=1)
         logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
     except Exception as e:
         logger.warning("cleanup_job: %s", e)
