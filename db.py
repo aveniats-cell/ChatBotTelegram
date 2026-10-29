@@ -1,17 +1,10 @@
 """Turso DB через HTTP-транспорт (libsql-client 0.3.1).
 
-Исправления:
-  - _exec: write-запросы получают 1 ретрай ТОЛЬКО для идемпотентных
-    шаблонов (INSERT ... ON CONFLICT / UPDATE с WHERE), иначе при сетевом
-    сбое теряем транзакцию. Для неидемпотентных (treasury_withdraw,
-    transfer_atomic) ретрай не делаем — компенсируем на уровне вызывающего.
-  - tax_active_balances: атомарно через UPDATE ... RETURNING, сумма =
-    реально списанное, а не «посчитали до UPDATE».
-  - pay_salary_from_treasury: суммирует users.salary_frac + pending_salary,
-    не перезаписывает salary_frac нулём/остатком.
-  - take_credit_from_treasury: сначала фиксируем долг юзера, потом
-    выдаём из казны; при сбое — компенсация.
-  - cleanup_old_days(keep_days=1) — вчерашний день жив до налога в 00:40.
+Изменения по сравнению с предыдущей версией:
+  + marriages.xp (миграция) — опыт брака;
+  + marriage_add_xp, marriage_get_xp, marriage_top, marriage_rank;
+  + сортировка marriage_top по эффективному уровню (дни + xp//50),
+    чтобы активная пара обгоняла пассивную старую.
 """
 import os
 import uuid
@@ -28,6 +21,8 @@ TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 _client: Optional[Any] = None
+
+XP_PER_LEVEL = 50
 
 
 class _EmptyResult:
@@ -54,10 +49,6 @@ def _is_read_only(sql: str) -> bool:
 
 
 def _is_idempotent_write(sql: str) -> bool:
-    """Write, который можно безопасно повторить при сетевом сбое:
-    INSERT ... ON CONFLICT DO UPDATE (upsert) и UPDATE с WHERE,
-    у которых результат не зависит от числа повторов.
-    """
     s = sql.lstrip().upper()
     if not (s.startswith("INSERT") or s.startswith("UPDATE") or s.startswith("DELETE")):
         return False
@@ -201,7 +192,8 @@ async def _create_tables() -> None:
             married_at   TEXT,
             active       INTEGER NOT NULL DEFAULT 0,
             forced       INTEGER NOT NULL DEFAULT 0,
-            client_token TEXT
+            client_token TEXT,
+            xp           INTEGER NOT NULL DEFAULT 0
         )
     """)
     await _exec("""
@@ -300,6 +292,7 @@ async def _migrate_tables() -> None:
         ("users", "avatar_file_id", "TEXT"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
+        ("marriages", "xp", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
     existing: dict = {}
@@ -587,7 +580,6 @@ async def treasury_reset(chat_id: int) -> int:
 async def treasury_withdraw(chat_id: int, amount: int) -> bool:
     if amount <= 0:
         return True
-    # Неидемпотентный write: ретрай запрещён, чтобы не списать дважды.
     rs = await _exec(
         """UPDATE treasury SET balance = balance - ?
            WHERE chat_id = ? AND balance >= ?""",
@@ -681,31 +673,8 @@ async def get_last_default(chat_id: int) -> Optional[str]:
 # ---------- tax ----------
 
 async def tax_active_balances(min_balance: int, pct: int, days: int = 1) -> int:
-    """Списывает налог с активных и возвращает РЕАЛЬНО списанную сумму.
-
-    Атомарность достигается тем, что сумма считается по RETURNING сразу
-    после UPDATE в одном SQL-стейтменте (SQLite поддерживает RETURNING
-    с 3.35; libsql/Turso — да).
-    """
     if pct <= 0:
         return 0
-    sql = f"""
-        UPDATE users
-           SET balance = balance - CAST(balance * ? / 100 AS INTEGER)
-         WHERE balance > ?
-           AND EXISTS (
-               SELECT 1 FROM messages_day m
-                WHERE m.user_id = users.user_id
-                  AND m.day >= date('now', '-{int(days)} days')
-           )
-        RETURNING CAST(balance * ? / 100 AS INTEGER)
-    """
-    # ВНИМАНИЕ: RETURNING вернёт уже уменьшенный balance, поэтому долю
-    # считаем от ИСХОДНОГО balance — но у нас в SET уже новое значение.
-    # Чтобы не мудрить, считаем налог отдельным SELECT до UPDATE, а
-    # сумму берём из rows_affected * среднее — нет, это ненадёжно.
-    # Правильный путь: RETURNING со старым значением невозможен,
-    # поэтому делаем два шага, но сверяем фактическое списание.
     rs_before = await _exec(
         f"""SELECT COALESCE(SUM(CAST(balance * ? / 100 AS INTEGER)), 0)
               FROM users
@@ -736,19 +705,6 @@ async def tax_active_balances(min_balance: int, pct: int, days: int = 1) -> int:
         logger.error("tax_active_balances: UPDATE failed — налог не списан")
         return 0
 
-    # Проверяем, что списали столько же, сколько ожидали. Если расхождение
-    # (например, конкурентный UPDATE) — возвращаем фактически списанное.
-    rs_after = await _exec(
-        f"""SELECT COALESCE(SUM(balance), 0)
-              FROM users
-             WHERE EXISTS (
-                   SELECT 1 FROM messages_day m
-                    WHERE m.user_id = users.user_id
-                      AND m.day >= date('now', '-{int(days)} days')
-               )""",
-    )
-    # Не идеально (нет baseline), поэтому просто доверяем rows_affected:
-    # если UPDATE не упал — считаем, что списали ровно total_expected.
     return total_expected
 
 
@@ -786,7 +742,7 @@ async def transfer_atomic(from_id: int, to_id: int, amount: int, fee: int) -> bo
     return True
 
 
-# ---------- pending_salary (персистентная очередь дробей) ----------
+# ---------- pending_salary ----------
 
 async def add_pending_salary(chat_id: int, user_id: int, day: str, frac_delta: int) -> bool:
     if frac_delta <= 0:
@@ -935,15 +891,6 @@ async def add_salary_frac_atomic(
 async def pay_salary_from_treasury(
     chat_id: int, user_id: int, day: str, frac_delta: int,
 ) -> Optional[int]:
-    """Выплачивает зарплату из казны.
-
-    ВАЖНО: frac_delta — это уже вынутая из pending_salary порция.
-    Дополнительно прибавляем users.salary_frac (там могут лежать дроби
-    с прошлых вызовов, когда казна была пуста и coins=0). Итог:
-    total_frac = users.salary_frac + frac_delta, coins = total_frac // 100,
-    new_frac = total_frac % 100. users.salary_frac перезаписывается на
-    new_frac (не теряя, а именно аккумулируя).
-    """
     logger.info("salary: chat=%s user=%s frac_in=%s", chat_id, user_id, frac_delta)
     if frac_delta <= 0:
         return 0
@@ -968,8 +915,6 @@ async def pay_salary_from_treasury(
         logger.info("salary: treasury_before=%s coins=%s", cur_treasury, coins)
         if cur_treasury <= 0:
             logger.info("salary: казна пуста, зарплата не платится")
-            # Возвращаем frac_delta в pending_salary — вызывающий
-            # (_pay_pending_salary) сам вернёт, если мы скажем None.
             return None
         take = min(coins, cur_treasury)
         ok = await treasury_withdraw(chat_id, take)
@@ -982,7 +927,6 @@ async def pay_salary_from_treasury(
                 "salary: казна кончилась, выдано %s из %s",
                 coins, total_frac // 100,
             )
-            # Остаток монет оставляем в salary_frac как дроби:
             new_frac = total_frac - coins * 100
         else:
             new_frac = total_frac % 100
@@ -1039,14 +983,6 @@ async def get_salary_frac(user_id: int, day: str) -> int:
 async def take_credit_from_treasury(
     chat_id: int, user_id: int, amount: int, today: str,
 ) -> bool:
-    """Сначала атомарно фиксируем долг юзера (credit += amount,
-    balance += amount, credit_taken_day = today) — только если у юзера
-    credit == 0 и balance >= 0 и сегодня ещё не брал. Потом списываем
-    из казны. Если казна не отдала — откатываем долг.
-
-    Такой порядок безопаснее: юзер не получит «кредит из воздуха»,
-    а казна не уйдёт в минус.
-    """
     logger.info("credit_from_treasury: chat=%s user=%s amount=%s",
                 chat_id, user_id, amount)
     if amount <= 0:
@@ -1058,7 +994,6 @@ async def take_credit_from_treasury(
         logger.info("credit_from_treasury: казна меньше нужного")
         return False
 
-    # 1) фиксируем долг (идемпотентно по условиям WHERE)
     rs = await _exec(
         """UPDATE users
            SET credit  = COALESCE(credit, 0) + ?,
@@ -1076,11 +1011,9 @@ async def take_credit_from_treasury(
         )
         return False
 
-    # 2) списываем из казны
     ok = await treasury_withdraw(chat_id, amount)
     logger.info("credit_from_treasury: withdraw ok=%s", ok)
     if not ok:
-        # откат долга
         await _exec(
             """UPDATE users
                SET credit  = COALESCE(credit, 0) - ?,
@@ -1389,11 +1322,6 @@ async def top_messages_day(chat_id: int, day: str, limit: int = 50) -> List[tupl
 
 
 async def cleanup_old_days(keep_days: int = 1) -> int:
-    """keep_days=1: оставляем вчерашний день — он нужен налогу в 00:40.
-
-    keep_days=0 удалял бы вчерашний messages_day в 00:05, из-за чего
-    tax_active_balances всегда видел «некому платить». Поэтому дефолт 1.
-    """
     if keep_days <= 0:
         rs = await _exec("DELETE FROM messages_day WHERE day < date('now')")
     else:
@@ -1531,6 +1459,97 @@ async def count_divorces(chat_id: int, user_id: int) -> int:
     if not rs.rows:
         return 0
     return rs.rows[0][0] or 0
+
+
+# ---------- marriage xp / top ----------
+
+async def marriage_add_xp(chat_id: int, user_id: int, xp: int) -> bool:
+    if xp <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE marriages
+           SET xp = COALESCE(xp, 0) + ?
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)""",
+        [xp, chat_id, user_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def marriage_get_xp(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """SELECT COALESCE(xp, 0) FROM marriages
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def marriage_top(chat_id: int, limit: int = 20) -> List[dict]:
+    """Топ активных браков по эффективному уровню (дни + xp/50)."""
+    rs = await _exec(
+        f"""SELECT id, user1_id, user2_id, married_at, created_at,
+                   COALESCE(xp, 0), forced
+            FROM marriages
+            WHERE chat_id = ? AND active = 1
+            ORDER BY
+              (
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+              ) DESC,
+              COALESCE(married_at, created_at) ASC
+            LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [
+        {
+            "id": r[0], "user1_id": r[1], "user2_id": r[2],
+            "married_at": r[3], "created_at": r[4],
+            "xp": r[5] or 0, "forced": bool(r[6]),
+        }
+        for r in rs.rows
+    ]
+
+
+async def marriage_rank(chat_id: int, user_id: int) -> Optional[tuple]:
+    rs = await _exec(
+        f"""SELECT
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+            FROM marriages
+            WHERE chat_id = ? AND active = 1
+              AND (user1_id = ? OR user2_id = ?)
+            ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    my_score = rs.rows[0][0] or 0.0
+
+    rs2 = await _exec(
+        f"""SELECT COUNT(*) FROM marriages
+            WHERE chat_id = ? AND active = 1
+              AND (
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+              ) > ?""",
+        [chat_id, my_score],
+    )
+    rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
+
+    rs3 = await _exec(
+        "SELECT COUNT(*) FROM marriages WHERE chat_id = ? AND active = 1",
+        [chat_id],
+    )
+    total = (rs3.rows[0][0] if rs3.rows else 0) or 0
+    return rank, total
 
 
 # ---------- warnings ----------
