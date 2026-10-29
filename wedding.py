@@ -1,4 +1,14 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение."""
+"""2.5 Свадьба: предложение, принятие/отклонение, расторжение.
+
+FIX:
+  - +Брак: админ может женить СЕБЯ (раньше блокировалось «Админа женить
+    нельзя»). Запрет остаётся только если админ — ЦЕЛЬ, но не инициатор
+    команды;
+  - -Брак: админ может развести даже forced-брак (раньше cmd_divorce
+    отказывал всем, включая админа, если брак forced);
+  - ADMIN_ID валидируется на старте с громким логом;
+  - мелкие защитные проверки и лог.
+"""
 import os
 import re
 import logging
@@ -21,11 +31,23 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
+if not ADMIN_ID:
+    logger.error(
+        "wedding: ADMIN_ID не задан — админ-команды (+Брак, -Брак @user) "
+        "работать не будут!"
+    )
+
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str):
     msg = update.effective_message
+    if not msg:
+        return None
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         return u.id, u.first_name or (u.username or str(u.id))
@@ -50,6 +72,8 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
 async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     targets = []
     msg = update.effective_message
+    if not msg:
+        return targets
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         targets.append((u.id, u.first_name or u.username or str(u.id)))
@@ -286,11 +310,14 @@ async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not m:
         await msg.reply_text("Вы не в браке.")
         return
-    if m["forced"]:
+
+    # FIX: админ может расторгнуть даже forced-брак.
+    if m["forced"] and not _is_admin(user.id):
         await msg.reply_text(
             "🔒 Этот брак принудительный. Расторгнуть его может только админ."
         )
         return
+
     affected = await db.delete_marriage(m["id"])
     if affected == 0:
         await msg.reply_text("Брак уже расторгнут.")
@@ -311,7 +338,8 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.effective_message
     if not user or not chat or not msg:
         return
-    if not ADMIN_ID or user.id != ADMIN_ID:
+
+    if not _is_admin(user.id):
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -324,16 +352,26 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     (id1, name1), (id2, name2) = targets[0], targets[1]
+
     if id1 == id2:
         await msg.reply_text("Это один и тот же человек 🙂")
         return
-    if id1 == ADMIN_ID or id2 == ADMIN_ID:
-        await msg.reply_text("Админа женить нельзя.")
+
+    # FIX: запрет «женить админа» оставлен ТОЛЬКО если админ — цель,
+    # но НЕ инициатор. Если админ сам себя женит (+Брак @admin @partner),
+    # это разрешено.
+    if _is_admin(id1) and id1 != user.id:
+        await msg.reply_text("Админа нельзя женить насильно против его воли.")
         return
+    if _is_admin(id2) and id2 != user.id:
+        await msg.reply_text("Админа нельзя женить насильно против его воли.")
+        return
+
     if await _is_bot(context, id1) or await _is_bot(context, id2):
         await msg.reply_text("Ботов женить нельзя 🤖")
         return
 
+    # Разводим текущие браки участников (если были)
     for uid in (id1, id2):
         m = await db.find_active_marriage(chat.id, uid)
         if m:
@@ -376,7 +414,8 @@ async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
     if not user or not chat or not msg:
         return
-    if not ADMIN_ID or user.id != ADMIN_ID:
+
+    if not _is_admin(user.id):
         await msg.reply_text("⛔ Только админ.")
         return
 
@@ -412,7 +451,7 @@ async def cmd_force_divorce_or_self(
         return
     text = msg.text or ""
     has_target = bool(msg.reply_to_message or USERNAME_RE.search(text))
-    if ADMIN_ID and user.id == ADMIN_ID and has_target:
+    if _is_admin(user.id) and has_target:
         return await cmd_force_divorce(update, context)
     return await cmd_divorce(update, context)
 
