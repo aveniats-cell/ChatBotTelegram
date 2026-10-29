@@ -1,10 +1,14 @@
 """Turso DB через HTTP-транспорт (libsql-client 0.3.1).
 
-Изменения по сравнению с предыдущей версией:
-  + marriages.xp (миграция) — опыт брака;
-  + marriage_add_xp, marriage_get_xp, marriage_top, marriage_rank;
-  + сортировка marriage_top по эффективному уровню (дни + xp//50),
-    чтобы активная пара обгоняла пассивную старую.
+Включает:
+  - базовые таблицы (users, subscriptions, roles, punishments, messages,
+    messages_day, messages_idempotency, treasury, treasury_meta, marriages,
+    marriage_history, warnings, complaints, aura, awards, action_stats,
+    pending_salary, user_cosmetics);
+  - coins, coin_holders, coin_price_history, coin_income_log,
+    coin_market_lots, coin_purchases;
+  - marriages.xp (уровень брака + XP);
+  - users.coins_created (сколько коинов создал юзер).
 """
 import os
 import uuid
@@ -272,6 +276,91 @@ async def _create_tables() -> None:
             PRIMARY KEY (chat_id, user_id, day)
         )
     """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS user_cosmetics (
+            user_id        INTEGER PRIMARY KEY,
+            title          TEXT,
+            badge          TEXT,
+            frame          TEXT,
+            color          TEXT,
+            action_prefix  TEXT,
+            custom_trigger TEXT
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coins (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id        INTEGER NOT NULL,
+            creator_id     INTEGER NOT NULL,
+            name           TEXT NOT NULL,
+            description    TEXT NOT NULL,
+            start_price    INTEGER NOT NULL,
+            total_supply   INTEGER NOT NULL,
+            sold           INTEGER NOT NULL DEFAULT 0,
+            yield_per_day  INTEGER NOT NULL DEFAULT 0,
+            photo_file_id  TEXT,
+            photo_hash     TEXT,
+            created_at     TEXT DEFAULT (datetime('now')),
+            active         INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    await _exec("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_coins_chat_name
+        ON coins(chat_id, name COLLATE NOCASE)
+    """)
+    await _exec("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_coins_chat_photo
+        ON coins(chat_id, photo_hash) WHERE photo_hash IS NOT NULL
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_holders (
+            coin_id   INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            quantity  INTEGER NOT NULL DEFAULT 0,
+            invested  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (coin_id, user_id)
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_price_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id      INTEGER NOT NULL,
+            ts           TEXT DEFAULT (datetime('now')),
+            price        INTEGER NOT NULL,
+            sold         INTEGER NOT NULL
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_income_log (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id  INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            day      TEXT NOT NULL,
+            amount   INTEGER NOT NULL,
+            ts       TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_market_lots (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id    INTEGER NOT NULL,
+            seller_id  INTEGER NOT NULL,
+            quantity   INTEGER NOT NULL,
+            price      INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            active     INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_purchases (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id     INTEGER NOT NULL,
+            buyer_id    INTEGER NOT NULL,
+            quantity    INTEGER NOT NULL,
+            price_paid  INTEGER NOT NULL,
+            ts          TEXT DEFAULT (datetime('now'))
+        )
+    """)
 
 
 async def _migrate_tables() -> None:
@@ -290,6 +379,7 @@ async def _migrate_tables() -> None:
         ("users", "salary_day", "TEXT"),
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "avatar_file_id", "TEXT"),
+        ("users", "coins_created", "INTEGER NOT NULL DEFAULT 0"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
         ("marriages", "xp", "INTEGER NOT NULL DEFAULT 0"),
@@ -332,6 +422,14 @@ async def _migrate_tables() -> None:
         "ON action_stats(chat_id, action, count DESC)",
         "CREATE INDEX IF NOT EXISTS idx_pending_salary_day "
         "ON pending_salary(day)",
+        "CREATE INDEX IF NOT EXISTS idx_coin_holders_user "
+        "ON coin_holders(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_coin_price_history_coin "
+        "ON coin_price_history(coin_id, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_coin_market_lots_coin "
+        "ON coin_market_lots(coin_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_coin_purchases_coin "
+        "ON coin_purchases(coin_id)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -398,6 +496,14 @@ async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
     await _exec(
         f"UPDATE users SET {field} = COALESCE({field}, 0) + ? WHERE user_id = ?",
         [delta, user_id],
+    )
+
+
+async def inc_user_counter_coin_created(user_id: int) -> None:
+    await _exec(
+        "UPDATE users SET coins_created = COALESCE(coins_created, 0) + 1 "
+        "WHERE user_id = ?",
+        [user_id],
     )
 
 
@@ -1490,7 +1596,6 @@ async def marriage_get_xp(chat_id: int, user_id: int) -> int:
 
 
 async def marriage_top(chat_id: int, limit: int = 20) -> List[dict]:
-    """Топ активных браков по эффективному уровню (дни + xp/50)."""
     rs = await _exec(
         f"""SELECT id, user1_id, user2_id, married_at, created_at,
                    COALESCE(xp, 0), forced
@@ -1890,3 +1995,266 @@ async def top_action_stats(chat_id: int, action: str,
         [chat_id, action, limit],
     )
     return [(r[0], r[1]) for r in rs.rows]
+
+
+# ---------- user_cosmetics ----------
+
+async def cosmetics_get(user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT title, badge, frame, color, action_prefix, custom_trigger
+           FROM user_cosmetics WHERE user_id = ?""",
+        [user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "title": r[0], "badge": r[1], "frame": r[2],
+        "color": r[3], "action_prefix": r[4], "custom_trigger": r[5],
+    }
+
+
+async def cosmetics_set(user_id: int, field: str, value: Optional[str]) -> bool:
+    allowed = {"title", "badge", "frame", "color", "action_prefix", "custom_trigger"}
+    if field not in allowed:
+        return False
+    rs = await _exec(
+        f"""INSERT INTO user_cosmetics (user_id, {field})
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET {field}=excluded.{field}""",
+        [user_id, value],
+    )
+    return not getattr(rs, "error", False)
+
+
+# ---------- coins ----------
+
+def _coin_row(r) -> dict:
+    return {
+        "id": r[0], "chat_id": r[1], "creator_id": r[2], "name": r[3],
+        "description": r[4], "start_price": r[5], "total_supply": r[6],
+        "sold": r[7], "yield_per_day": r[8], "photo_file_id": r[9],
+        "photo_hash": r[10], "created_at": r[11], "active": bool(r[12]),
+    }
+
+
+_COIN_SELECT = """SELECT id, chat_id, creator_id, name, description,
+                         start_price, total_supply, sold, yield_per_day,
+                         photo_file_id, photo_hash, created_at, active
+                  FROM coins"""
+
+
+async def coin_create(chat_id: int, creator_id: int, name: str,
+                      description: str, start_price: int, total_supply: int,
+                      yield_per_day: int, photo_file_id: Optional[str],
+                      photo_hash: Optional[str]) -> int:
+    rs = await _exec(
+        """INSERT INTO coins (chat_id, creator_id, name, description,
+             start_price, total_supply, yield_per_day, photo_file_id, photo_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [chat_id, creator_id, name, description, start_price,
+         total_supply, yield_per_day, photo_file_id, photo_hash],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND name=? COLLATE NOCASE LIMIT 1",
+        [chat_id, name],
+    )
+    return rs2.rows[0][0] if rs2.rows else 0
+
+
+async def coin_get(coin_id: int) -> Optional[dict]:
+    rs = await _exec(f"{_COIN_SELECT} WHERE id=?", [coin_id])
+    if not rs.rows:
+        return None
+    return _coin_row(rs.rows[0])
+
+
+async def coin_find_by_name(chat_id: int, name: str) -> Optional[int]:
+    rs = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND name=? COLLATE NOCASE LIMIT 1",
+        [chat_id, name],
+    )
+    return rs.rows[0][0] if rs.rows else None
+
+
+async def coin_find_by_photo_hash(chat_id: int, h: str) -> Optional[int]:
+    rs = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND photo_hash=? LIMIT 1",
+        [chat_id, h],
+    )
+    return rs.rows[0][0] if rs.rows else None
+
+
+async def coins_list_by_chat(chat_id: int) -> List[dict]:
+    rs = await _exec(
+        f"{_COIN_SELECT} WHERE chat_id=? AND active=1 ORDER BY id ASC",
+        [chat_id],
+    )
+    return [_coin_row(r) for r in rs.rows]
+
+
+async def coins_list_active_all() -> List[dict]:
+    rs = await _exec(f"{_COIN_SELECT} WHERE active=1")
+    return [_coin_row(r) for r in rs.rows]
+
+
+async def coins_by_creator(chat_id: int, creator_id: int) -> List[dict]:
+    rs = await _exec(
+        f"{_COIN_SELECT} WHERE chat_id=? AND creator_id=? AND active=1 "
+        f"ORDER BY id ASC",
+        [chat_id, creator_id],
+    )
+    return [_coin_row(r) for r in rs.rows]
+
+
+async def coin_buy_atomic(coin_id: int, buyer_id: int, price: int,
+                          to_creator: int) -> bool:
+    rs = await _exec(
+        """UPDATE coins SET sold = sold + 1
+           WHERE id=? AND sold < total_supply""",
+        [coin_id],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    await _exec(
+        """INSERT INTO coin_holders (coin_id, user_id, quantity, invested)
+           VALUES (?, ?, 1, ?)
+           ON CONFLICT(coin_id, user_id) DO UPDATE SET
+             quantity = coin_holders.quantity + 1,
+             invested = coin_holders.invested + excluded.invested""",
+        [coin_id, buyer_id, price],
+    )
+    await _exec(
+        """INSERT INTO coin_purchases (coin_id, buyer_id, quantity, price_paid)
+           VALUES (?, ?, 1, ?)""",
+        [coin_id, buyer_id, price],
+    )
+    return True
+
+
+async def coin_holders_by_user(chat_id: int, user_id: int) -> List[dict]:
+    rs = await _exec(
+        """SELECT h.coin_id, h.quantity, h.invested
+           FROM coin_holders h JOIN coins c ON c.id = h.coin_id
+           WHERE c.chat_id=? AND h.user_id=? AND h.quantity > 0
+           ORDER BY h.coin_id ASC""",
+        [chat_id, user_id],
+    )
+    return [{"coin_id": r[0], "quantity": r[1], "invested": r[2]} for r in rs.rows]
+
+
+async def coin_holder_get(coin_id: int, user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        "SELECT quantity, invested FROM coin_holders WHERE coin_id=? AND user_id=?",
+        [coin_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    return {"quantity": rs.rows[0][0], "invested": rs.rows[0][1]}
+
+
+async def coin_holders_list(coin_id: int) -> List[dict]:
+    rs = await _exec(
+        "SELECT user_id, quantity, invested FROM coin_holders WHERE coin_id=?",
+        [coin_id],
+    )
+    return [{"user_id": r[0], "quantity": r[1], "invested": r[2]} for r in rs.rows]
+
+
+async def coin_price_history_add(coin_id: int, price: int, sold: int) -> bool:
+    rs = await _exec(
+        """INSERT INTO coin_price_history (coin_id, price, sold)
+           VALUES (?, ?, ?)""",
+        [coin_id, price, sold],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def coin_price_history_get(coin_id: int, limit: int = 60) -> List[dict]:
+    rs = await _exec(
+        """SELECT ts, price, sold FROM coin_price_history
+           WHERE coin_id=? ORDER BY id DESC LIMIT ?""",
+        [coin_id, limit],
+    )
+    rows = [{"ts": r[0], "price": r[1], "sold": r[2]} for r in rs.rows]
+    rows.reverse()
+    return rows
+
+
+async def coin_income_log_add(coin_id: int, user_id: int, day: str,
+                              amount: int) -> None:
+    await _exec(
+        """INSERT INTO coin_income_log (coin_id, user_id, day, amount)
+           VALUES (?, ?, ?, ?)""",
+        [coin_id, user_id, day, amount],
+    )
+
+
+async def coin_market_lot_create(coin_id: int, seller_id: int,
+                                 quantity: int, price: int) -> bool:
+    rs = await _exec(
+        """UPDATE coin_holders SET quantity = quantity - ?
+           WHERE coin_id=? AND user_id=? AND quantity >= ?""",
+        [quantity, coin_id, seller_id, quantity],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    rs2 = await _exec(
+        """INSERT INTO coin_market_lots (coin_id, seller_id, quantity, price)
+           VALUES (?, ?, ?, ?)""",
+        [coin_id, seller_id, quantity, price],
+    )
+    return not getattr(rs2, "error", False)
+
+
+async def coin_market_lot_get(lot_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, coin_id, seller_id, quantity, price, active
+           FROM coin_market_lots WHERE id=?""",
+        [lot_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "coin_id": r[1], "seller_id": r[2],
+        "quantity": r[3], "price": r[4], "active": bool(r[5]),
+    }
+
+
+async def coin_lots_list(chat_id: int, limit: int = 20) -> List[dict]:
+    rs = await _exec(
+        """SELECT l.id, l.coin_id, l.seller_id, l.quantity, l.price, l.active
+           FROM coin_market_lots l JOIN coins c ON c.id = l.coin_id
+           WHERE c.chat_id=? AND l.active=1
+           ORDER BY l.id DESC LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [{
+        "id": r[0], "coin_id": r[1], "seller_id": r[2],
+        "quantity": r[3], "price": r[4], "active": bool(r[5]),
+    } for r in rs.rows]
+
+
+async def coin_market_buy_atomic(lot_id: int, buyer_id: int,
+                                 quantity: int, price: int) -> bool:
+    rs = await _exec(
+        "UPDATE coin_market_lots SET active=0 WHERE id=? AND active=1",
+        [lot_id],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    lot = await coin_market_lot_get(lot_id)
+    if not lot:
+        return False
+    await _exec(
+        """INSERT INTO coin_holders (coin_id, user_id, quantity, invested)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(coin_id, user_id) DO UPDATE SET
+             quantity = coin_holders.quantity + excluded.quantity,
+             invested = coin_holders.invested + excluded.invested""",
+        [lot["coin_id"], buyer_id, quantity, price],
+    )
+    return True
