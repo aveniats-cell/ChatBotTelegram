@@ -1,13 +1,8 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение.
+"""2.5 Свадьба: предложение, принятие/отклонение, расторжение, топ браков.
 
-FIX:
-  - +Брак: админ может женить СЕБЯ (раньше блокировалось «Админа женить
-    нельзя»). Запрет остаётся только если админ — ЦЕЛЬ, но не инициатор
-    команды;
-  - -Брак: админ может развести даже forced-брак (раньше cmd_divorce
-    отказывал всем, включая админа, если брак forced);
-  - ADMIN_ID валидируется на старте с громким логом;
-  - мелкие защитные проверки и лог.
+Уровень = дни_с_свадьбы + 1 + xp // XP_PER_LEVEL.
+XP даётся действиями пары (см. marriage_xp.py).
+Топ браки — по эффективному уровню (активные обгоняют пассивных старых).
 """
 import os
 import re
@@ -39,9 +34,29 @@ if not ADMIN_ID:
 
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 
+# Должно совпадать с marriage_xp.XP_PER_LEVEL и db.XP_PER_LEVEL.
+XP_PER_LEVEL = 50
+
 
 def _is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+def _marriage_level(married_at_str: str | None, xp: int = 0) -> int:
+    base = 1
+    if married_at_str:
+        try:
+            s = str(married_at_str).replace("Z", "+00:00")
+            if " " in s and "T" not in s:
+                s = s.replace(" ", "T", 1)
+            created = datetime.fromisoformat(s)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - created
+            base = max(1, delta.days + 1)
+        except Exception:
+            base = 1
+    return base + max(0, int(xp or 0)) // XP_PER_LEVEL
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str):
@@ -96,28 +111,20 @@ async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     return targets
 
 
-def _marriage_level(married_at_str: str | None) -> int:
-    if not married_at_str:
-        return 1
-    try:
-        s = str(married_at_str).replace("Z", "+00:00")
-        if " " in s and "T" not in s:
-            s = s.replace(" ", "T", 1)
-        created = datetime.fromisoformat(s)
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - created
-        return max(1, delta.days + 1)
-    except Exception:
-        return 1
-
-
 async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
     try:
         chat = await context.bot.get_chat(uid)
         return bool(getattr(chat, "is_bot", False))
     except TelegramError:
         return False
+
+
+async def _name_of(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
+    try:
+        c = await context.bot.get_chat(uid)
+        return c.first_name or c.username or str(uid)
+    except TelegramError:
+        return str(uid)
 
 
 async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -275,8 +282,10 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await q.answer("Брак заключён!")
 
     m_after = await db.get_marriage(mid)
+    xp = await db.marriage_get_xp(m["chat_id"], m["user1_id"])
     level = _marriage_level(
-        (m_after or {}).get("married_at") or (m_after or {}).get("created_at")
+        (m_after or {}).get("married_at") or (m_after or {}).get("created_at"),
+        xp,
     )
 
     try:
@@ -285,7 +294,8 @@ async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text=(
                 f"🎉 <b>Свадьба!</b>\n"
                 f"Поздравляем новую пару! 💍\n"
-                f"Уровень брака: <b>{level}</b> (растёт каждый день)"
+                f"Уровень брака: <b>{level}</b> "
+                f"(растёт от дней и от действий пары)"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -311,7 +321,6 @@ async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("Вы не в браке.")
         return
 
-    # FIX: админ может расторгнуть даже forced-брак.
     if m["forced"] and not _is_admin(user.id):
         await msg.reply_text(
             "🔒 Этот брак принудительный. Расторгнуть его может только админ."
@@ -357,9 +366,6 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("Это один и тот же человек 🙂")
         return
 
-    # FIX: запрет «женить админа» оставлен ТОЛЬКО если админ — цель,
-    # но НЕ инициатор. Если админ сам себя женит (+Брак @admin @partner),
-    # это разрешено.
     if _is_admin(id1) and id1 != user.id:
         await msg.reply_text("Админа нельзя женить насильно против его воли.")
         return
@@ -371,7 +377,6 @@ async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("Ботов женить нельзя 🤖")
         return
 
-    # Разводим текущие браки участников (если были)
     for uid in (id1, id2):
         m = await db.find_active_marriage(chat.id, uid)
         if m:
@@ -467,18 +472,47 @@ async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await msg.reply_text("Вы не в браке.")
         return
     partner_id = m["user1_id"] if m["user2_id"] == user.id else m["user2_id"]
-    name = str(partner_id)
-    try:
-        partner = await context.bot.get_chat(partner_id)
-        name = partner.first_name or partner.username or str(partner_id)
-    except TelegramError:
-        pass
-    level = _marriage_level(m.get("married_at") or m.get("created_at"))
+    name = await _name_of(context, partner_id)
+    xp = await db.marriage_get_xp(chat.id, user.id)
+    level = _marriage_level(m.get("married_at") or m.get("created_at"), xp)
+    rank = await db.marriage_rank(chat.id, user.id)
+    rank_line = ""
+    if rank:
+        r, total = rank
+        rank_line = f"\nМесто в топе браков: <b>{r}/{total}</b>"
     forced = " 🔒 (принудительный)" if m["forced"] else ""
     when = m.get("married_at") or m.get("created_at") or "—"
+    to_next = XP_PER_LEVEL - (xp % XP_PER_LEVEL)
     await msg.reply_text(
         f"💍 Ваш брак с <b>{escape(name)}</b>{forced}\n"
         f"Уровень: <b>{level}</b>\n"
-        f"Заключён: {escape(str(when))}",
+        f"Опыт: <b>{xp}</b> XP · до след. уровня: <b>{to_next}</b> XP\n"
+        f"Заключён: {escape(str(when))}"
+        f"{rank_line}",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_marriage_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
+        return
+
+    rows = await db.marriage_top(chat.id, limit=20)
+    if not rows:
+        await msg.reply_text("В этом чате пока нет активных браков.")
+        return
+
+    lines = ["💍 <b>Топ браки</b> (активные обгоняют старых)"]
+    for i, m in enumerate(rows, start=1):
+        n1 = await _name_of(context, m["user1_id"])
+        n2 = await _name_of(context, m["user2_id"])
+        level = _marriage_level(m.get("married_at") or m.get("created_at"), m["xp"])
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lock = " 🔒" if m["forced"] else ""
+        lines.append(
+            f"{medal} {escape(n1)} + {escape(n2)}{lock} — "
+            f"ур. <b>{level}</b> · <b>{m['xp']}</b> XP"
+        )
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
