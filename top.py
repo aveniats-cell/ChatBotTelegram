@@ -1,518 +1,309 @@
-"""2.5 Свадьба: предложение, принятие/отклонение, расторжение, топ браков.
+"""2.3 Топ чата + зарплата за активность из казны.
 
-Уровень = дни_с_свадьбы + 1 + xp // XP_PER_LEVEL.
-XP даётся действиями пары (см. marriage_xp.py).
-Топ браки — по эффективному уровню (активные обгоняют пассивных старых).
+Функции, которые регистрирует main.py:
+  - track_message       — считает сообщения/дроби зарплаты
+  - cmd_top_all         — Топ все
+  - cmd_top_day         — Топ день
+  - cmd_my_place        — Мое место
+  - flush_job           — периодический flush (interval из main)
+  - cleanup_job         — daily cleanup (00:05 UTC)
+  - _flush              — вызывается из post_shutdown
+  - FLUSH_INTERVAL_SEC  — интервал flush в main.py
+
+Исправления:
+  - дробная зарплата копится в pending_salary (в БД), переживает рестарты;
+  - _flush не теряет батчи при рестарте (3 ретрая + requeue);
+  - flush_job НЕ вызывает дефолт (дефолт — в economy.default_watchdog_job);
+  - cleanup_old_days(keep_days=1): не стираем вчерашний messages_day
+    до налога в 00:40;
+  - catch-up: flush_job выплачивает все накопленные дроби.
 """
-import os
-import re
+import asyncio
 import logging
+import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import resolver
 
 logger = logging.getLogger(__name__)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+FLUSH_INTERVAL_SEC = 15
+FLUSH_MAX_KEYS = 200
 
-if not ADMIN_ID:
-    logger.error(
-        "wedding: ADMIN_ID не задан — админ-команды (+Брак, -Брак @user) "
-        "работать не будут!"
-    )
+MIN_SALARY_LEN = 2
+SALARY_FRAC_PER_MSG = 20
 
-USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
+_USER_CACHE: dict[int, tuple[str, str]] = {}
 
-# Должно совпадать с marriage_xp.XP_PER_LEVEL и db.XP_PER_LEVEL.
-XP_PER_LEVEL = 50
-
-
-def _is_admin(user_id: int) -> bool:
-    return bool(ADMIN_ID) and user_id == ADMIN_ID
+# _PENDING — счётчики сообщений для messages/messages_day.
+# _PENDING_SALARY — in-memory буфер перед записью в pending_salary.
+_PENDING: dict[tuple[int, int, str], int] = defaultdict(int)
+_PENDING_SALARY: dict[tuple[int, int, str], int] = defaultdict(int)
+_flush_lock = asyncio.Lock()
 
 
-def _marriage_level(married_at_str: str | None, xp: int = 0) -> int:
-    base = 1
-    if married_at_str:
-        try:
-            s = str(married_at_str).replace("Z", "+00:00")
-            if " " in s and "T" not in s:
-                s = s.replace(" ", "T", 1)
-            created = datetime.fromisoformat(s)
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - created
-            base = max(1, delta.days + 1)
-        except Exception:
-            base = 1
-    return base + max(0, int(xp or 0)) // XP_PER_LEVEL
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, arg_text: str):
+async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg:
-        return None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        return u.id, u.first_name or (u.username or str(u.id))
-    m = USERNAME_RE.search(arg_text)
-    if not m:
-        return None
-    uname = m.group(1)
-    uid = await db.get_user_by_username(uname)
-    if uid:
-        return uid, uname
-    r = await resolver.resolve_username(uname)
-    if r:
-        return r
-    try:
-        chat = await context.bot.get_chat(f"@{uname}")
-        return chat.id, chat.first_name or uname
-    except TelegramError as e:
-        logger.warning("get_chat @%s: %s", uname, e)
-    return None
-
-
-async def _resolve_two(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    targets = []
-    msg = update.effective_message
-    if not msg:
-        return targets
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        targets.append((u.id, u.first_name or u.username or str(u.id)))
-    for uname in USERNAME_RE.findall(text):
-        if len(targets) >= 2:
-            break
-        uid = await db.get_user_by_username(uname)
-        if uid:
-            targets.append((uid, uname))
-            continue
-        r = await resolver.resolve_username(uname)
-        if r:
-            targets.append(r)
-            continue
-        try:
-            c = await context.bot.get_chat(f"@{uname}")
-            targets.append((c.id, c.first_name or uname))
-        except TelegramError as e:
-            logger.warning("get_chat @%s: %s", uname, e)
-    return targets
-
-
-async def _is_bot(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
-    try:
-        chat = await context.bot.get_chat(uid)
-        return bool(getattr(chat, "is_bot", False))
-    except TelegramError:
-        return False
-
-
-async def _name_of(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
-    try:
-        c = await context.bot.get_chat(uid)
-        return c.first_name or c.username or str(uid)
-    except TelegramError:
-        return str(uid)
-
-
-async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if not msg or not user or user.is_bot:
+        return
     chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg:
+    if not chat:
         return
-
-    existing = await db.find_active_marriage(chat.id, user.id)
-    if existing:
-        await msg.reply_text("💍 Вы уже в браке. Сначала расторгните текущий.")
-        return
-
-    target = await _resolve_target(update, context, msg.text or "")
-    if not target:
-        await msg.reply_text(
-            "Формат: <code>Сделать предложение @user</code> или реплай.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    target_id, target_name = target
-    if target_id == user.id:
-        await msg.reply_text("Себе предложение делать нельзя 🙂")
-        return
-    if await _is_bot(context, target_id):
-        await msg.reply_text("Ботам предложение делать нельзя 🤖")
-        return
-
-    other = await db.find_active_marriage(chat.id, target_id)
-    if other:
-        await msg.reply_text("💔 Этот пользователь уже в браке.")
-        return
-
-    mid = await db.create_proposal(chat.id, user.id, target_id)
-    if not mid:
-        logger.warning("cmd_propose: create_proposal вернул 0")
-        await msg.reply_text("⚠️ Не удалось создать предложение. Попробуйте ещё раз.")
-        return
-
-    logger.info("propose: chat=%s mid=%s user1=%s user2=%s",
-                chat.id, mid, user.id, target_id)
-
-    text = (
-        f"💐 <b>Минуточку внимания!</b>\n\n"
-        f"💍 {escape(user.first_name or str(user.id))} делает предложение "
-        f"{escape(target_name)}!\n\n"
-        f"Согласны ли вы, {escape(target_name)}, связать судьбу с "
-        f"{escape(user.first_name or 'этим человеком')}?\n\n"
-        f"<i>(решение принимает только {escape(target_name)})</i>"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Зарегистрировать", callback_data=f"wed:accept:{mid}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"wed:reject:{mid}"),
-    ]])
-    await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-async def wedding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    parts = (q.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "wed":
-        await q.answer()
-        return
-
-    _, action, mid_s = parts
     try:
-        mid = int(mid_s)
-    except ValueError:
-        await q.answer("Некорректный id.", show_alert=True)
+        cur = (user.username or "", user.first_name or "")
+        if _USER_CACHE.get(user.id) != cur:
+            await db.upsert_user(user.id, user.username, user.first_name)
+            _USER_CACHE[user.id] = cur
+
+        day = _today()
+        key = (chat.id, user.id, day)
+        _PENDING[key] += 1
+
+        text = (msg.text or "").strip()
+        is_cmd = text.startswith("/")
+        reply_to_bot = bool(
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.id == context.bot.id
+        )
+        if (
+            not is_cmd
+            and not reply_to_bot
+            and len(text) >= MIN_SALARY_LEN
+        ):
+            _PENDING_SALARY[key] += SALARY_FRAC_PER_MSG
+
+        if len(_PENDING) + len(_PENDING_SALARY) >= FLUSH_MAX_KEYS:
+            await _flush()
+    except Exception as e:
+        logger.warning("track_message: %s", e)
+
+
+def _requeue_msg(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta > 0:
+        _PENDING[(chat_id, user_id, day)] += delta
+
+
+def _requeue_sal(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta > 0:
+        _PENDING_SALARY[(chat_id, user_id, day)] += delta
+
+
+async def _flush() -> None:
+    async with _flush_lock:
+        if not _PENDING and not _PENDING_SALARY:
+            return
+        snap_msg = dict(_PENDING)
+        snap_sal = dict(_PENDING_SALARY)
+        _PENDING.clear()
+        _PENDING_SALARY.clear()
+
+    # 1) messages (не критично: при потере — только счётчик топов)
+    for (chat_id, user_id, day), delta in snap_msg.items():
+        if delta <= 0:
+            continue
+        key = uuid.uuid4().hex
+        ok = False
+        for attempt in range(3):
+            ok = await db.inc_message_batch_idempotent(
+                chat_id, user_id, day, delta, key,
+            )
+            if ok:
+                break
+            await asyncio.sleep(0.5 * (attempt + 1))
+        if not ok:
+            logger.error(
+                "flush msg: потерян батч (chat=%s user=%s day=%s delta=%s)",
+                chat_id, user_id, day, delta,
+            )
+            _requeue_msg(chat_id, user_id, day, delta)
+
+    # 2) зарплата: сначала фиксируем дроби в pending_salary,
+    #    потом пытаемся выплатить.
+    for (chat_id, user_id, day), frac_delta in snap_sal.items():
+        if frac_delta <= 0:
+            continue
+        saved = False
+        for attempt in range(3):
+            saved = await db.add_pending_salary(chat_id, user_id, day, frac_delta)
+            if saved:
+                break
+            await asyncio.sleep(0.5 * (attempt + 1))
+        if not saved:
+            logger.error(
+                "flush salary: не удалось сохранить pending_salary "
+                "(chat=%s user=%s day=%s delta=%s) — возвращаем в память",
+                chat_id, user_id, day, frac_delta,
+            )
+            _requeue_sal(chat_id, user_id, day, frac_delta)
+            continue
+
+        await _pay_pending_salary(chat_id, user_id, day)
+
+
+async def _pay_pending_salary(chat_id: int, user_id: int, day: str) -> None:
+    """Пытается выплатить накопленное из pending_salary.
+    Если казна пуста — оставляет в pending_salary до следующего тика.
+    """
+    frac = await db.get_pending_salary(chat_id, user_id, day)
+    if frac <= 0:
         return
 
-    logger.info("wed callback: data=%r mid=%r user=%s", q.data, mid, user.id)
-
-    m = await db.get_marriage(mid)
-    if not m:
-        await q.answer("Предложение не найдено или устарело.", show_alert=True)
+    taken = await db.take_pending_salary(chat_id, user_id, day, frac)
+    if taken <= 0:
         return
 
-    if q.message is None or not q.message.chat:
-        await q.answer("Сообщение устарело.", show_alert=True)
-        return
-    if q.message.chat.id != m["chat_id"]:
-        await q.answer("Это предложение из другого чата.", show_alert=True)
-        return
+    coins = await db.pay_salary_from_treasury(chat_id, user_id, day, taken)
+    if coins is None:
+        logger.info(
+            "salary: не выплачено, возврат в pending_salary (chat=%s user=%s frac=%s)",
+            chat_id, user_id, taken,
+        )
+        await db.return_pending_salary(chat_id, user_id, day, taken)
+    else:
+        logger.info(
+            "salary: выплачено coins=%s (chat=%s user=%s frac_was=%s)",
+            coins, chat_id, user_id, taken,
+        )
 
-    if user.id != m["user2_id"]:
-        await q.answer("Это предложение не вам.", show_alert=True)
-        return
 
-    if m["active"]:
-        await q.answer("Это предложение уже принято.", show_alert=True)
+async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await _flush()
+    except Exception as e:
+        logger.warning("flush_job: %s", e)
+
+    # Догоняем pending_salary за ВСЕ дни, если казна была пуста.
+    try:
+        rs = await db._exec(
+            """SELECT DISTINCT chat_id, user_id, day FROM pending_salary
+               WHERE frac_delta > 0"""
+        )
+        for chat_id, user_id, day in rs.rows:
+            await _pay_pending_salary(chat_id, user_id, day)
+    except Exception as e:
+        logger.warning("flush_job catch-up: %s", e)
+
+
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # keep_days=1: не стираем вчерашний messages_day до налога в 00:40.
+    try:
+        deleted = await db.cleanup_old_days(keep_days=1)
+        logger.info("cleanup_job: удалено строк messages_day: %s", deleted)
+    except Exception as e:
+        logger.warning("cleanup_job: %s", e)
+    try:
+        deleted_pending = await db.cleanup_pending_salary(keep_days=2)
+        logger.info("cleanup_job: удалено строк pending_salary: %s", deleted_pending)
+    except Exception as e:
+        logger.warning("cleanup_job pending_salary: %s", e)
+
+
+# ---------- Топ все / Топ день / Мое место ----------
+
+def _medal(i: int) -> str:
+    if i == 1:
+        return "🥇"
+    if i == 2:
+        return "🥈"
+    if i == 3:
+        return "🥉"
+    return f"{i}."
+
+
+async def _build_top_text(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, limit: int = 50,
+    title: str = "🏆 Топ чата",
+) -> str:
+    rows = await db.top_messages(chat_id, limit=limit)
+    if not rows:
+        return "Пока никто не писал — топ пуст."
+    lines = [f"<b>{escape(title)}</b>"]
+    for i, (uid, cnt) in enumerate(rows, start=1):
+        name = str(uid)
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            chat = await context.bot.get_chat(uid)
+            name = chat.first_name or chat.username or str(uid)
         except TelegramError:
             pass
-        return
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
+    return "\n".join(lines)
 
-    if action == "reject":
-        affected = await db.delete_marriage(mid)
-        if affected == 0:
-            await q.answer("Это предложение уже обработано.", show_alert=True)
-            return
-        await q.answer("Отклонено")
+
+async def _build_top_day_text(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, limit: int = 50,
+) -> str:
+    day = _today()
+    rows = await db.top_messages_day(chat_id, day, limit=limit)
+    if not rows:
+        return "Сегодня ещё никто не писал — топ дня пуст."
+    lines = [f"<b>🏆 Топ за день ({day})</b>"]
+    for i, (uid, cnt) in enumerate(rows, start=1):
+        name = str(uid)
         try:
-            await context.bot.send_message(
-                chat_id=m["chat_id"],
-                text=(
-                    f"💔 {escape(user.first_name or 'Пользователь')} отклонил(а) "
-                    f"предложение. Сердечко разбито."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e:
-            logger.warning("send reject msg: %s", e)
-        try:
-            await q.edit_message_text(
-                (q.message.text or "") + "\n\n❌ <b>Отклонено.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e:
-            logger.warning("edit reject msg: %s", e)
-        return
-
-    if action != "accept":
-        await q.answer()
-        return
-
-    affected = await db.accept_marriage(mid)
-    if affected == 0:
-        m2 = await db.get_marriage(mid)
-        if m2 and m2["active"]:
-            await q.answer("Это предложение уже принято.", show_alert=True)
-            try:
-                await q.edit_message_reply_markup(reply_markup=None)
-            except TelegramError:
-                pass
-        else:
-            await q.answer(
-                "Нельзя: у одного из вас уже есть активный брак.",
-                show_alert=True,
-            )
-        return
-
-    await db.log_marriage_event(
-        m["chat_id"], m["user1_id"], m["user2_id"], "married",
-        by_user_id=m["user2_id"],
-    )
-    await q.answer("Брак заключён!")
-
-    m_after = await db.get_marriage(mid)
-    xp = await db.marriage_get_xp(m["chat_id"], m["user1_id"])
-    level = _marriage_level(
-        (m_after or {}).get("married_at") or (m_after or {}).get("created_at"),
-        xp,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=m["chat_id"],
-            text=(
-                f"🎉 <b>Свадьба!</b>\n"
-                f"Поздравляем новую пару! 💍\n"
-                f"Уровень брака: <b>{level}</b> "
-                f"(растёт от дней и от действий пары)"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError as e:
-        logger.warning("send accept msg: %s", e)
-    try:
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n✅ <b>Зарегистрировано!</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError as e:
-        logger.warning("edit accept msg: %s", e)
+            chat = await context.bot.get_chat(uid)
+            name = chat.first_name or chat.username or str(uid)
+        except TelegramError:
+            pass
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
+    return "\n".join(lines)
 
 
-async def cmd_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg:
-        return
-    m = await db.find_active_marriage(chat.id, user.id)
-    if not m:
-        await msg.reply_text("Вы не в браке.")
-        return
-
-    if m["forced"] and not _is_admin(user.id):
-        await msg.reply_text(
-            "🔒 Этот брак принудительный. Расторгнуть его может только админ."
-        )
-        return
-
-    affected = await db.delete_marriage(m["id"])
-    if affected == 0:
-        await msg.reply_text("Брак уже расторгнут.")
-        return
-    await db.log_marriage_event(
-        chat.id, m["user1_id"], m["user2_id"], "divorced", by_user_id=user.id,
-    )
-    await msg.reply_text(
-        f"💔 Брак расторгнут. {escape(user.first_name or 'Пользователь')} "
-        f"снова свободен(а).",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_force_marriage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg:
-        return
-
-    if not _is_admin(user.id):
-        await msg.reply_text("⛔ Только админ.")
-        return
-
-    targets = await _resolve_two(update, context, msg.text or "")
-    if len(targets) < 2:
-        await msg.reply_text(
-            "Формат: <code>+Брак @u1 @u2</code> или реплай + "
-            "<code>+Брак @u2</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    (id1, name1), (id2, name2) = targets[0], targets[1]
-
-    if id1 == id2:
-        await msg.reply_text("Это один и тот же человек 🙂")
-        return
-
-    if _is_admin(id1) and id1 != user.id:
-        await msg.reply_text("Админа нельзя женить насильно против его воли.")
-        return
-    if _is_admin(id2) and id2 != user.id:
-        await msg.reply_text("Админа нельзя женить насильно против его воли.")
-        return
-
-    if await _is_bot(context, id1) or await _is_bot(context, id2):
-        await msg.reply_text("Ботов женить нельзя 🤖")
-        return
-
-    for uid in (id1, id2):
-        m = await db.find_active_marriage(chat.id, uid)
-        if m:
-            affected = await db.delete_marriage(m["id"])
-            if affected:
-                await db.log_marriage_event(
-                    chat.id, m["user1_id"], m["user2_id"], "forced_divorced",
-                    by_user_id=user.id,
-                )
-
-    mid = await db.create_proposal(chat.id, id1, id2, forced=True)
-    if not mid:
-        logger.warning("cmd_force_marriage: create_proposal вернул 0")
-        await msg.reply_text("⚠️ Не удалось создать брак. Попробуйте ещё раз.")
-        return
-
-    affected = await db.accept_marriage(mid)
-    if affected == 0:
-        logger.warning("cmd_force_marriage: accept_marriage(%s) вернул 0", mid)
-        await db.delete_marriage(mid)
-        await msg.reply_text(
-            "⚠️ Не удалось активировать брак (возможно, у одного из "
-            "участников уже есть активный брак)."
-        )
-        return
-
-    await db.log_marriage_event(chat.id, id1, id2, "forced_married", by_user_id=user.id)
-
-    await msg.reply_text(
-        f"💍 <b>Принудительная свадьба!</b>\n"
-        f"{escape(name1)} + {escape(name2)} = ❤️\n\n"
-        f"<i>Брак заключён волей админа. Уровень: 1</i>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_force_divorce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg:
-        return
-
-    if not _is_admin(user.id):
-        await msg.reply_text("⛔ Только админ.")
-        return
-
-    target = await _resolve_target(update, context, msg.text or "")
-    if not target:
-        await msg.reply_text("Укажите @username или сделайте реплай.")
-        return
-    uid, name = target
-    m = await db.find_active_marriage(chat.id, uid)
-    if not m:
-        await msg.reply_text("Этот пользователь не в браке.")
-        return
-    affected = await db.delete_marriage(m["id"])
-    if affected == 0:
-        await msg.reply_text("Брак уже расторгнут.")
-        return
-    await db.log_marriage_event(
-        chat.id, m["user1_id"], m["user2_id"], "forced_divorced",
-        by_user_id=user.id,
-    )
-    await msg.reply_text(
-        f"💔 Админ принудительно расторг брак. {escape(name)} снова свободен(а).",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_force_divorce_or_self(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
-        return
-    text = msg.text or ""
-    has_target = bool(msg.reply_to_message or USERNAME_RE.search(text))
-    if _is_admin(user.id) and has_target:
-        return await cmd_force_divorce(update, context)
-    return await cmd_divorce(update, context)
-
-
-async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg:
-        return
-    m = await db.find_active_marriage(chat.id, user.id)
-    if not m:
-        await msg.reply_text("Вы не в браке.")
-        return
-    partner_id = m["user1_id"] if m["user2_id"] == user.id else m["user2_id"]
-    name = await _name_of(context, partner_id)
-    xp = await db.marriage_get_xp(chat.id, user.id)
-    level = _marriage_level(m.get("married_at") or m.get("created_at"), xp)
-    rank = await db.marriage_rank(chat.id, user.id)
-    rank_line = ""
-    if rank:
-        r, total = rank
-        rank_line = f"\nМесто в топе браков: <b>{r}/{total}</b>"
-    forced = " 🔒 (принудительный)" if m["forced"] else ""
-    when = m.get("married_at") or m.get("created_at") or "—"
-    to_next = XP_PER_LEVEL - (xp % XP_PER_LEVEL)
-    await msg.reply_text(
-        f"💍 Ваш брак с <b>{escape(name)}</b>{forced}\n"
-        f"Уровень: <b>{level}</b>\n"
-        f"Опыт: <b>{xp}</b> XP · до след. уровня: <b>{to_next}</b> XP\n"
-        f"Заключён: {escape(str(when))}"
-        f"{rank_line}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_marriage_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_top_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     msg = update.effective_message
     if not chat or not msg:
         return
+    try:
+        await _flush()
+    except Exception:
+        pass
+    text = await _build_top_text(context, chat.id, limit=50, title="🏆 Топ за всё время")
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
-    rows = await db.marriage_top(chat.id, limit=20)
-    if not rows:
-        await msg.reply_text("В этом чате пока нет активных браков.")
+
+async def cmd_top_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
         return
+    try:
+        await _flush()
+    except Exception:
+        pass
+    text = await _build_top_day_text(context, chat.id, limit=50)
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
-    lines = ["💍 <b>Топ браки</b> (активные обгоняют старых)"]
-    for i, m in enumerate(rows, start=1):
-        n1 = await _name_of(context, m["user1_id"])
-        n2 = await _name_of(context, m["user2_id"])
-        level = _marriage_level(m.get("married_at") or m.get("created_at"), m["xp"])
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lock = " 🔒" if m["forced"] else ""
-        lines.append(
-            f"{medal} {escape(n1)} + {escape(n2)}{lock} — "
-            f"ур. <b>{level}</b> · <b>{m['xp']}</b> XP"
-        )
-    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    try:
+        await _flush()
+    except Exception:
+        pass
+    res = await db.user_rank(chat.id, user.id)
+    if not res:
+        await msg.reply_text("Вы ещё не писали в этом чате — места нет.")
+        return
+    count, rank, total = res
+    await msg.reply_text(
+        f"📊 Ваше место: <b>{rank}/{total}</b>\n"
+        f"Сообщений: <b>{count}</b>",
+        parse_mode=ParseMode.HTML,
+    )
