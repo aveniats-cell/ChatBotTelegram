@@ -1118,7 +1118,307 @@ async def pay_salary_from_treasury(
     if coins > 0:
         cur_treasury = await treasury_get(chat_id)
         logger.info("salary: treasury_before=%s coins=%s", cur_treasury, coins)
-        if cur_tВот обновленный код с добавленными таблицами магазина и соответствующими функциями:
+        if cur_treasury <= 0:
+            logger.info("salary: казна пуста, зарплата не платится")
+            return None
+        take = min(coins, cur_treasury)
+        ok = await treasury_withdraw(chat_id, take)
+        logger.info("salary: withdraw ok=%s take=%s", ok, take)
+        if not ok:
+            return None
+        coins = take
+        if coins < total_frac // 100:
+            logger.warning(
+                "salary: казна кончилась, выдано %s из %s",
+                coins, total_frac // 100,
+            )
+            new_frac = total_frac - coins * 100
+        else:
+            new_frac = total_frac % 100
+    else:
+        new_frac = total_frac
+
+    rs2 = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) + ?,
+               salary_frac = ?,
+               salary_day = ?,
+               salary_today = CASE
+                   WHEN salary_day = ? THEN COALESCE(salary_today, 0) + ?
+                   ELSE ?
+               END
+           WHERE user_id = ?""",
+        [coins, new_frac, day, day, coins, coins, user_id],
+    )
+    if getattr(rs2, "error", False):
+        if coins > 0:
+            await treasury_add(chat_id, coins)
+        return None
+    return coins
+
+
+async def get_salary_today(user_id: int, day: str) -> int:
+    rs = await _exec(
+        "SELECT salary_today, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if not rs.rows:
+        return 0
+    today_val, today_day = rs.rows[0]
+    if today_day != day:
+        return 0
+    return today_val or 0
+
+
+async def get_salary_frac(user_id: int, day: str) -> int:
+    rs = await _exec(
+        "SELECT salary_frac, salary_day FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if not rs.rows:
+        return 0
+    frac, d = rs.rows[0]
+    if d != day:
+        return 0
+    return frac or 0
+
+
+# ---------- credit from treasury ----------
+
+async def take_credit_from_treasury(
+    chat_id: int, user_id: int, amount: int, today: str,
+) -> bool:
+    logger.info("credit_from_treasury: chat=%s user=%s amount=%s",
+                chat_id, user_id, amount)
+    if amount <= 0:
+        return False
+
+    cur = await treasury_get(chat_id)
+    logger.info("credit_from_treasury: treasury_before=%s", cur)
+    if cur < amount:
+        logger.info("credit_from_treasury: казна меньше нужного")
+        return False
+
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) + ?,
+               balance = COALESCE(balance, 10) + ?,
+               credit_taken_day = ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 10) >= 0
+             AND COALESCE(credit, 0) = 0
+             AND (credit_taken_day IS NULL OR credit_taken_day != ?)""",
+        [amount, amount, today, user_id, today],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        logger.warning(
+            "credit_from_treasury: UPDATE users failed (условия не выполнены или ошибка)",
+        )
+        return False
+
+    ok = await treasury_withdraw(chat_id, amount)
+    logger.info("credit_from_treasury: withdraw ok=%s", ok)
+    if not ok:
+        await _exec(
+            """UPDATE users
+               SET credit  = COALESCE(credit, 0) - ?,
+                   balance = COALESCE(balance, 10) - ?,
+                   credit_taken_day = NULL
+               WHERE user_id = ?
+                 AND COALESCE(credit, 0) >= ?""",
+            [amount, amount, user_id, amount],
+        )
+        return False
+
+    logger.info("credit_from_treasury: успешно, казна=%s",
+                await treasury_get(chat_id))
+    return True
+
+
+async def repay_credit_to_treasury(
+    chat_id: int, user_id: int, amount: int,
+) -> bool:
+    if amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET credit  = COALESCE(credit, 0) - ?,
+               balance = COALESCE(balance, 10) - ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 0) >= ?
+             AND COALESCE(credit, 0) >= ?""",
+        [amount, amount, user_id, amount, amount],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    await treasury_add(chat_id, amount)
+    return True
+
+
+async def apply_credit_interest_to_treasury(chat_id: int, percent: float) -> int:
+    rs = await _exec(
+        """SELECT COALESCE(SUM(CAST(credit * ? / 100 AS INTEGER)), 0)
+           FROM users WHERE credit > 0""",
+        [percent],
+    )
+    total = (rs.rows[0][0] if rs.rows else 0) or 0
+    if total <= 0:
+        return 0
+    rs2 = await _exec(
+        "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
+        "WHERE credit > 0",
+        [percent],
+    )
+    affected = getattr(rs2, "rows_affected", 0) or 0
+    if affected > 0:
+        await treasury_add(chat_id, total)
+    return affected
+
+
+# ---------- subscriptions ----------
+
+async def set_subscription(user_id: int, is_subscribed: bool) -> None:
+    await _exec(
+        """INSERT INTO subscriptions (user_id, is_subscribed, checked_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             is_subscribed=excluded.is_subscribed,
+             checked_at=excluded.checked_at""",
+        [user_id, 1 if is_subscribed else 0],
+    )
+
+
+async def get_subscription(user_id: int) -> Optional[bool]:
+    rs = await _exec(
+        "SELECT is_subscribed FROM subscriptions WHERE user_id = ?", [user_id]
+    )
+    if not rs.rows:
+        return None
+    return bool(rs.rows[0][0])
+
+
+# ---------- roles ----------
+
+async def set_role(user_id: int, role: str, granted_by: int) -> None:
+    await _exec(
+        """INSERT INTO roles (user_id, role, granted_by, granted_at)
+           VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             role=excluded.role,
+             granted_by=excluded.granted_by,
+             granted_at=excluded.granted_at""",
+        [user_id, role, granted_by],
+    )
+
+
+async def remove_role(user_id: int) -> None:
+    await _exec("DELETE FROM roles WHERE user_id = ?", [user_id])
+
+
+async def get_role(user_id: int) -> Optional[str]:
+    rs = await _exec("SELECT role FROM roles WHERE user_id = ?", [user_id])
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
+
+
+async def list_roles(role: str) -> List[int]:
+    rs = await _exec(
+        "SELECT user_id FROM roles WHERE role = ? ORDER BY granted_at", [role]
+    )
+    return [row[0] for row in rs.rows]
+
+
+# ---------- punishments ----------
+
+async def add_punishment(user_id: int, chat_id: int, kind: str,
+                          until_ts: Optional[int], issued_by: int) -> None:
+    await _exec(
+        """INSERT INTO punishments (user_id, chat_id, kind, until_ts, issued_by)
+           VALUES (?, ?, ?, ?, ?)""",
+        [user_id, chat_id, kind, until_ts, issued_by],
+    )
+
+
+async def deactivate_punishment(user_id: int, chat_id: int, kind: str) -> int:
+    rs = await _exec(
+        """UPDATE punishments SET active = 0
+           WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1""",
+        [user_id, chat_id, kind],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def get_active_punishment(user_id: int, chat_id: int, kind: str) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, until_ts FROM punishments
+           WHERE user_id = ? AND chat_id = ? AND kind = ? AND active = 1
+           ORDER BY id DESC LIMIT 1""",
+        [user_id, chat_id, kind],
+    )
+    if not rs.rows:
+        return None
+    row = rs.rows[0]
+    return {"id": row[0], "until_ts": row[1]}
+
+
+# ---------- messages ----------
+
+async def inc_message(chat_id: int, user_id: int) -> None:
+    await _exec(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, 1)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + 1""",
+        [chat_id, user_id],
+    )
+
+
+async def inc_message_by(chat_id: int, user_id: int, delta: int) -> None:
+    if delta <= 0:
+        return
+    await _exec(
+        """INSERT INTO messages (chat_id, user_id, count)
+           VALUES (?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, delta],
+    )
+
+
+async def inc_message_day_by(chat_id: int, user_id: int, day: str, delta: int) -> None:
+    if delta <= 0:
+        return
+    await _exec(
+        """INSERT INTO messages_day (chat_id, user_id, day, count)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, day) DO UPDATE SET
+             count = count + excluded.count""",
+        [chat_id, user_id, day, delta],
+    )
+
+
+async def inc_message_batch_idempotent(
+    chat_id: int, user_id: int, day: str, delta: int, key: str,
+) -> bool:
+    if delta <= 0:
+        return True
+
+    rs = await _exec(
+        "INSERT OR IGNORE INTO messages_idempotency (key) VALUES (?)",
+        [key],
+    )
+    if getattr(rs, "error", False):
+        return False
+
+    inserted_now = (getattr(rs, "rows_affected", 0) or 0) > 0
+    if not inserted_now:
+        return True
+
+    rs1 = await _exec(
+        """INSERT INTO messages (chat_id,Вот полный исправленный код. В предыдущей версии произошла ошибка копирования, из-за которой текст ответа вставился прямо внутрь функции `pay_salary_from_treasury`.
+
+Ниже представлен чистый, готовый к деплою файл `db.py`:
 
 ```python
 """Turso DB через HTTP-транспорт (libsql-client 0.3.1).
@@ -2666,7 +2966,813 @@ def _new_client_token() -> str:
     return uuid.uuid4().hex
 
 
-async def create_proposal(chat_idВот обновленный код с добавленными таблицами магазина и соответствующими функциями:
+async def create_proposal(chat_id: int, user1_id: int, user2_id: int,
+                          forced: bool = False) -> int:
+    token = _new_client_token()
+    rs = await _exec(
+        """INSERT INTO marriages
+             (chat_id, user1_id, user2_id, active, forced, client_token)
+           SELECT ?, ?, ?, 0, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM marriages m2
+               WHERE m2.chat_id = ?
+                 AND m2.active = 1
+                 AND (
+                     m2.user1_id IN (?, ?)
+                     OR m2.user2_id IN (?, ?)
+                 )
+           )""",
+        [chat_id, user1_id, user2_id, 1 if forced else 0, token,
+         chat_id, user1_id, user2_id, user1_id, user2_id],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        "SELECT id FROM marriages WHERE client_token = ? LIMIT 1", [token],
+    )
+    if getattr(rs2, "error", False):
+        await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
+        return 0
+    if not rs2.rows:
+        await _exec("DELETE FROM marriages WHERE client_token = ?", [token])
+        return 0
+    return rs2.rows[0][0]
+
+
+async def accept_marriage(marriage_id: int) -> int:
+    rs = await _exec(
+        """UPDATE marriages SET active = 1, married_at = datetime('now')
+           WHERE id = ?
+             AND active = 0
+             AND NOT EXISTS (
+                 SELECT 1 FROM marriages m2
+                 WHERE m2.chat_id = marriages.chat_id
+                   AND m2.active = 1
+                   AND m2.id != marriages.id
+                   AND (
+                       m2.user1_id IN (marriages.user1_id, marriages.user2_id)
+                       OR m2.user2_id IN (marriages.user1_id, marriages.user2_id)
+                   )
+             )""",
+        [marriage_id],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def delete_marriage(marriage_id: int) -> int:
+    rs = await _exec("DELETE FROM marriages WHERE id = ?", [marriage_id])
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def get_marriage(marriage_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, chat_id, user1_id, user2_id, created_at, married_at,
+                  active, forced
+           FROM marriages WHERE id = ?""",
+        [marriage_id],
+    )
+    if getattr(rs, "error", False):
+        return None
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "user1_id": r[2],
+        "user2_id": r[3], "created_at": r[4], "married_at": r[5],
+        "active": bool(r[6]), "forced": bool(r[7]),
+    }
+
+
+async def find_active_marriage(chat_id: int, user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, chat_id, user1_id, user2_id, created_at, married_at,
+                  active, forced
+           FROM marriages
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "user1_id": r[2],
+        "user2_id": r[3], "created_at": r[4], "married_at": r[5],
+        "active": bool(r[6]), "forced": bool(r[7]),
+    }
+
+
+async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
+                             event: str, by_user_id: Optional[int] = None) -> bool:
+    rs = await _exec(
+        """INSERT INTO marriage_history (chat_id, user1_id, user2_id, event, by_user_id)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user1_id, user2_id, event, by_user_id],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return True
+
+
+async def count_divorces(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """SELECT COUNT(*) FROM marriage_history
+           WHERE chat_id = ? AND event IN ('divorced', 'forced_divorced')
+             AND (user1_id = ? OR user2_id = ?)""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+# ---------- marriage xp / top ----------
+
+async def marriage_add_xp(chat_id: int, user_id: int, xp: int) -> bool:
+    if xp <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE marriages
+           SET xp = COALESCE(xp, 0) + ?
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)""",
+        [xp, chat_id, user_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def marriage_get_xp(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """SELECT COALESCE(xp, 0) FROM marriages
+           WHERE chat_id = ? AND active = 1
+             AND (user1_id = ? OR user2_id = ?)
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def marriage_top(chat_id: int, limit: int = 20) -> List[dict]:
+    rs = await _exec(
+        f"""SELECT id, user1_id, user2_id, married_at, created_at,
+                   COALESCE(xp, 0), forced
+            FROM marriages
+            WHERE chat_id = ? AND active = 1
+            ORDER BY
+              (
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+              ) DESC,
+              COALESCE(married_at, created_at) ASC
+            LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [
+        {
+            "id": r[0], "user1_id": r[1], "user2_id": r[2],
+            "married_at": r[3], "created_at": r[4],
+            "xp": r[5] or 0, "forced": bool(r[6]),
+        }
+        for r in rs.rows
+    ]
+
+
+async def marriage_rank(chat_id: int, user_id: int) -> Optional[tuple]:
+    rs = await _exec(
+        f"""SELECT
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+            FROM marriages
+            WHERE chat_id = ? AND active = 1
+              AND (user1_id = ? OR user2_id = ?)
+            ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    my_score = rs.rows[0][0] or 0.0
+
+    rs2 = await _exec(
+        f"""SELECT COUNT(*) FROM marriages
+            WHERE chat_id = ? AND active = 1
+              AND (
+                julianday('now')
+                - julianday(COALESCE(married_at, created_at))
+                + COALESCE(xp, 0) / {float(XP_PER_LEVEL)}
+              ) > ?""",
+        [chat_id, my_score],
+    )
+    rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
+
+    rs3 = await _exec(
+        "SELECT COUNT(*) FROM marriages WHERE chat_id = ? AND active = 1",
+        [chat_id],
+    )
+    total = (rs3.rows[0][0] if rs3.rows else 0) or 0
+    return rank, total
+
+
+# ---------- warnings ----------
+
+async def add_warning(chat_id: int, user_id: int, issued_by: int,
+                      reason: Optional[str], expires_at: str) -> int:
+    rs = await _exec(
+        """INSERT INTO warnings (chat_id, user_id, issued_by, reason, expires_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user_id, issued_by, reason, expires_at],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        """SELECT id FROM warnings
+           WHERE chat_id = ? AND user_id = ? AND issued_by = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, issued_by],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def count_active_warnings(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """SELECT COUNT(*) FROM warnings
+           WHERE chat_id = ? AND user_id = ? AND active = 1
+             AND expires_at > datetime('now')""",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def count_warnings_total(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM warnings WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def remove_last_active_warning(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """UPDATE warnings SET active = 0
+           WHERE id = (
+               SELECT id FROM warnings
+               WHERE chat_id = ? AND user_id = ? AND active = 1
+                 AND expires_at > datetime('now')
+               ORDER BY id DESC LIMIT 1
+           )""",
+        [chat_id, user_id],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def deactivate_warnings(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        """UPDATE warnings SET active = 0
+           WHERE chat_id = ? AND user_id = ? AND active = 1""",
+        [chat_id, user_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+# ---------- complaints ----------
+
+async def add_complaint(chat_id: int, target_id: int, reporter_id: int,
+                        message_id: Optional[int]) -> int:
+    rs = await _exec(
+        """INSERT INTO complaints (chat_id, target_id, reporter_id, message_id)
+           VALUES (?, ?, ?, ?)""",
+        [chat_id, target_id, reporter_id, message_id],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        """SELECT id FROM complaints
+           WHERE chat_id = ? AND target_id = ? AND reporter_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, target_id, reporter_id],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def get_complaint(complaint_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT id, chat_id, target_id, reporter_id, message_id,
+                  created_at, status
+           FROM complaints WHERE id = ?""",
+        [complaint_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "id": r[0], "chat_id": r[1], "target_id": r[2],
+        "reporter_id": r[3], "message_id": r[4],
+        "created_at": r[5], "status": r[6],
+    }
+
+
+async def resolve_complaint(complaint_id: int, status: str,
+                            resolved_by: int) -> int:
+    rs = await _exec(
+        """UPDATE complaints
+           SET status = ?, resolved_by = ?, resolved_at = datetime('now')
+           WHERE id = ? AND status = 'pending'""",
+        [status, resolved_by, complaint_id],
+    )
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def count_complaints_by(chat_id: int, reporter_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND reporter_id = ?",
+        [chat_id, reporter_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def count_complaints_against(chat_id: int, target_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM complaints WHERE chat_id = ? AND target_id = ?",
+        [chat_id, target_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+# ---------- aura ----------
+
+async def aura_droch(chat_id: int, user_id: int) -> bool:
+    await _exec(
+        """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
+           VALUES (?, ?, 0, NULL)
+           ON CONFLICT(chat_id, user_id) DO NOTHING""",
+        [chat_id, user_id],
+    )
+    rs = await _exec(
+        """UPDATE aura
+           SET value = value + 1,
+               last_droch_at = datetime('now')
+           WHERE chat_id = ? AND user_id = ?
+             AND (last_droch_at IS NULL
+                  OR last_droch_at <= datetime('now', '-1 hour'))""",
+        [chat_id, user_id],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def aura_get(chat_id: int, user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT value, last_droch_at FROM aura
+           WHERE chat_id = ? AND user_id = ?""",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {"value": r[0] or 0, "last_droch_at": r[1]}
+
+
+async def aura_top(chat_id: int, limit: int = 10) -> List[tuple]:
+    rs = await _exec(
+        """SELECT user_id, value FROM aura
+           WHERE chat_id = ? AND value > 0
+           ORDER BY value DESC, user_id ASC
+           LIMIT ?""",
+        [chat_id, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+async def aura_rank(chat_id: int, user_id: int) -> Optional[tuple]:
+    rs = await _exec(
+        "SELECT value FROM aura WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return None
+    value = rs.rows[0][0] or 0
+    if value <= 0:
+        return None
+
+    rs2 = await _exec(
+        """SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > ?""",
+        [chat_id, value],
+    )
+    rank = ((rs2.rows[0][0] if rs2.rows else 0) or 0) + 1
+
+    rs3 = await _exec(
+        "SELECT COUNT(*) FROM aura WHERE chat_id = ? AND value > 0", [chat_id],
+    )
+    total = (rs3.rows[0][0] if rs3.rows else 0) or 0
+    return value, rank, total
+
+
+# ---------- awards ----------
+
+async def add_award(chat_id: int, user_id: int, title: str, stars: int,
+                    issued_by: int) -> int:
+    rs = await _exec(
+        """INSERT INTO awards (chat_id, user_id, title, stars, issued_by)
+           VALUES (?, ?, ?, ?, ?)""",
+        [chat_id, user_id, title, stars, issued_by],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        """SELECT id FROM awards
+           WHERE chat_id = ? AND user_id = ? AND title = ? AND issued_by = ?
+           ORDER BY id DESC LIMIT 1""",
+        [chat_id, user_id, title, issued_by],
+    )
+    if not rs2.rows:
+        return 0
+    return rs2.rows[0][0]
+
+
+async def remove_award_by_title(chat_id: int, user_id: int, title: str) -> int:
+    rs = await _exec(
+        """DELETE FROM awards
+           WHERE id = (
+               SELECT id FROM awards
+               WHERE chat_id = ? AND user_id = ? AND title = ?
+               ORDER BY id DESC LIMIT 1
+           )""",
+        [chat_id, user_id, title],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def list_awards(chat_id: int, user_id: int) -> List[dict]:
+    rs = await _exec(
+        """SELECT id, title, stars, issued_by, created_at
+           FROM awards
+           WHERE chat_id = ? AND user_id = ?
+           ORDER BY id DESC""",
+        [chat_id, user_id],
+    )
+    return [
+        {"id": r[0], "title": r[1], "stars": r[2],
+         "issued_by": r[3], "created_at": r[4]}
+        for r in rs.rows
+    ]
+
+
+async def award_total_stars(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(SUM(stars), 0) FROM awards "
+        "WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def count_awards(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM awards WHERE chat_id = ? AND user_id = ?",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+# ---------- avatar ----------
+
+async def set_avatar(user_id: int, file_id: Optional[str]) -> bool:
+    rs = await _exec(
+        "UPDATE users SET avatar_file_id = ? WHERE user_id = ?",
+        [file_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_avatar(user_id: int) -> Optional[str]:
+    rs = await _exec(
+        "SELECT avatar_file_id FROM users WHERE user_id = ?", [user_id],
+    )
+    if not rs.rows:
+        return None
+    return rs.rows[0][0]
+
+
+# ---------- action_stats ----------
+
+async def inc_action_stat(chat_id: int, user_id: int, action: str,
+                          delta: int = 1) -> bool:
+    if delta <= 0:
+        return True
+    rs = await _exec(
+        """INSERT INTO action_stats (chat_id, user_id, action, count)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, action) DO UPDATE SET
+             count = action_stats.count + excluded.count,
+             updated_at = datetime('now')""",
+        [chat_id, user_id, action, delta],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def get_action_stat(chat_id: int, user_id: int, action: str) -> int:
+    rs = await _exec(
+        """SELECT count FROM action_stats
+           WHERE chat_id = ? AND user_id = ? AND action = ?""",
+        [chat_id, user_id, action],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+async def top_action_stats(chat_id: int, action: str,
+                           limit: int = 10) -> List[tuple]:
+    rs = await _exec(
+        """SELECT user_id, count FROM action_stats
+           WHERE chat_id = ? AND action = ?
+           ORDER BY count DESC, user_id ASC LIMIT ?""",
+        [chat_id, action, limit],
+    )
+    return [(r[0], r[1]) for r in rs.rows]
+
+
+# ---------- user_cosmetics ----------
+
+async def cosmetics_get(user_id: int) -> Optional[dict]:
+    rs = await _exec(
+        """SELECT title, badge, frame, color, action_prefix, custom_trigger
+           FROM user_cosmetics WHERE user_id = ?""",
+        [user_id],
+    )
+    if not rs.rows:
+        return None
+    r = rs.rows[0]
+    return {
+        "title": r[0], "badge": r[1], "frame": r[2],
+        "color": r[3], "action_prefix": r[4], "custom_trigger": r[5],
+    }
+
+
+async def cosmetics_set(user_id: int, field: str, value: Optional[str]) -> bool:
+    allowed = {"title", "badge", "frame", "color", "action_prefix", "custom_trigger"}
+    if field not in allowed:
+        return False
+    rs = await _exec(
+        f"""INSERT INTO user_cosmetics (user_id, {field})
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET {field}=excluded.{field}""",
+        [user_id, value],
+    )
+    return not getattr(rs, "error", False)
+
+
+# ---------- coins ----------
+
+def _coin_row(r) -> dict:
+    """FIX #3: добавлены reserve, circulating, dividend_pool."""
+    return {
+        "id": r[0], "chat_id": r[1], "creator_id": r[2], "name": r[3],
+        "description": r[4], "start_price": r[5], "total_supply": r[6],
+        "sold": r[7], "yield_per_day": r[8], "photo_file_id": r[9],
+        "photo_hash": r[10], "created_at": r[11], "active": bool(r[12]),
+        "reserve": r[13] or 0,
+        "circulating": r[14] or 0,
+        "dividend_pool": r[15] or 0,
+    }
+
+
+# FIX #3: SELECT теперь с reserve, circulating, dividend_pool
+_COIN_SELECT = """SELECT id, chat_id, creator_id, name, description,
+                         start_price, total_supply, sold, yield_per_day,
+                         photo_file_id, photo_hash, created_at, active,
+                         reserve, circulating, dividend_pool
+                  FROM coins"""
+
+
+async def coin_create(chat_id: int, creator_id: int, name: str,
+                      description: str, start_price: int, total_supply: int,
+                      yield_per_day: int, photo_file_id: Optional[str],
+                      photo_hash: Optional[str]) -> int:
+    rs = await _exec(
+        """INSERT INTO coins (chat_id, creator_id, name, description,
+             start_price, total_supply, yield_per_day, photo_file_id, photo_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [chat_id, creator_id, name, description, start_price,
+         total_supply, yield_per_day, photo_file_id, photo_hash],
+    )
+    if getattr(rs, "error", False):
+        return 0
+    rs2 = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND name=? COLLATE NOCASE LIMIT 1",
+        [chat_id, name],
+    )
+    return rs2.rows[0][0] if rs2.rows else 0
+
+
+async def coin_get(coin_id: int) -> Optional[dict]:
+    rs = await _exec(f"{_COIN_SELECT} WHERE id=?", [coin_id])
+    if not rs.rows:
+        return None
+    return _coin_row(rs.rows[0])
+
+
+async def coin_find_by_name(chat_id: int, name: str) -> Optional[int]:
+    rs = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND name=? COLLATE NOCASE LIMIT 1",
+        [chat_id, name],
+    )
+    return rs.rows[0][0] if rs.rows else None
+
+
+async def coin_find_by_photo_hash(chat_id: int, h: str) -> Optional[int]:
+    rs = await _exec(
+        "SELECT id FROM coins WHERE chat_id=? AND photo_hash=? LIMIT 1",
+        [chat_id, h],
+    )
+    return rs.rows[0][0] if rs.rows else None
+
+
+async def coins_list_by_chat(chat_id: int) -> List[dict]:
+    rs = await _exec(
+        f"{_COIN_SELECT} WHERE chat_id=? AND active=1 ORDER BY id ASC",
+        [chat_id],
+    )
+    return [_coin_row(r) for r in rs.rows]
+
+
+async def coins_list_active_all() -> List[dict]:
+    rs = await _exec(f"{_COIN_SELECT} WHERE active=1")
+    return [_coin_row(r) for r in rs.rows]
+
+
+async def coins_by_creator(chat_id: int, creator_id: int) -> List[dict]:
+    rs = await _exec(
+        f"{_COIN_SELECT} WHERE chat_id=? AND creator_id=? AND active=1 "
+        f"ORDER BY id ASC",
+        [chat_id, creator_id],
+    )
+    return [_coin_row(r) for r in rs.rows]
+
+
+# ── FIX #3: эмитенты
+
+async def emitter_is_allowed(chat_id: int, user_id: int) -> bool:
+    rs = await _exec(
+        "SELECT 1 FROM coin_emitters WHERE chat_id=? AND user_id=? AND active=1 LIMIT 1",
+        [chat_id, user_id],
+    )
+    return bool(rs.rows)
+
+
+async def emitter_add(chat_id: int, user_id: int, granted_by: int) -> bool:
+    rs = await _exec(
+        """INSERT INTO coin_emitters (chat_id, user_id, granted_by, active)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             granted_by = excluded.granted_by,
+             granted_at = datetime('now'),
+             active = 1""",
+        [chat_id, user_id, granted_by],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def emitter_remove(chat_id: int, user_id: int) -> bool:
+    rs = await _exec(
+        "UPDATE coin_emitters SET active=0 WHERE chat_id=? AND user_id=?",
+        [chat_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def emitter_list(chat_id: int) -> List[int]:
+    rs = await _exec(
+        "SELECT user_id FROM coin_emitters WHERE chat_id=? AND active=1 "
+        "ORDER BY granted_at",
+        [chat_id],
+    )
+    return [r[0] for r in rs.rows]
+
+
+async def user_active_coin_count(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM coins WHERE chat_id=? AND creator_id=? AND active=1",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+# ── FIX #3: резерв / оборот / дивиденды
+
+async def coin_reserve_add(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        "UPDATE coins SET reserve = COALESCE(reserve, 0) + ? WHERE id = ?",
+        [amount, coin_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def coin_reserve_take(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE coins SET reserve = reserve - ?
+           WHERE id = ? AND reserve >= ?""",
+        [amount, coin_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def coin_circulating_change(coin_id: int, delta: int) -> bool:
+    rs = await _exec(
+        """UPDATE coins SET circulating = COALESCE(circulating, 0) + ?
+           WHERE id = ? AND COALESCE(circulating, 0) + ? >= 0""",
+        [delta, coin_id, delta],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def coin_dividend_add(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        "UPDATE coins SET dividend_pool = COALESCE(dividend_pool, 0) + ? "
+        "WHERE id = ?",
+        [amount, coin_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def coin_dividend_take(coin_id: int) -> int:
+    """Атомарно забрать весь пул дивидендов и обнулить. Возвращает сумму."""
+    rs = await _exec(
+        "SELECT COALESCE(dividend_pool, 0) FROM coins WHERE id = ?", [coin_id],
+    )
+    if not rs.rows:
+        return 0
+    cur = rs.rows[0][0] or 0
+    if cur <= 0:
+        return 0
+    rs2 = await _exec(
+        "UPDATE coins SET dividend_pool = 0 WHERE id = ? AND dividend_pool = ?",
+        [coin_id, cur],
+    )
+    if getattr(rs2, "error", False):
+        return 0
+    if (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        # гонка: кто-то ещё забрал — прочитаем остаток и вернём его
+        rs3 = await _exec(
+            "SELECT COALESCE(dividend_pool, 0) FROM coins WHERE id = ?",
+            [coin_id],
+        )
+        return 0
+    return cur
+
+
+# ── FIX #3: покупка на первичке (в резерв, не создателю)
+
+async def coin_buy_atomic(coin_id: int, buyer_id: int, price: int,
+                          to_reserve: int) -> bool:
+    """Покупка на первичке. to_reserve идёт в резерв монеты, не создателю.
+
+    circulating += 1, sold += 1, holder.invested += price.
+    """
+    rs = await _exec(
+        """UPDATE coins SET sold = sold + 1, circulating = COALESCE(circulating, 0) + 1
+           WHERE idВот полный исправленный код. В предыдущей версии произошла ошибка копирования, из-за которой текст ответа вставился прямо внутрь функции `pay_salary_from_treasury`.
+
+Ниже представлен чистый, готовый к деплою файл `db.py`:
 
 ```python
 """Turso DB через HTTP-транспорт (libsql-client 0.3.1).
