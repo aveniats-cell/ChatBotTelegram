@@ -197,6 +197,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Правила — текст правил чата\n"
         "• Коины / Рынок / Панель брокера\n"
         "• +Эмитент / -Эмитент @user / Эмитенты\n"
+        "• УдалитьМонету <имя> — архивировать монету\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help /cancel"
@@ -455,6 +456,12 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Эмитент(\s|$)"), coins.cmd_emitter_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Эмитент(\s|$)"), coins.cmd_emitter_remove))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Эмитенты(\s|$)"), coins.cmd_emitters))
+
+    # архивирование монеты
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^УдалитьМонету(\s|$)"),
+        coins.cmd_coin_archive,
+    ))
 
     app.add_handler(CallbackQueryHandler(
         coins.coin_callback,
