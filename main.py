@@ -1,8 +1,4 @@
-"""Точка входа: webhook-версия для Render Web Service (Free).
-
-FIX #2: добавлен CommandHandler("cancel", coins.cancel_create),
-чтобы владелец FSM мог выйти из создания монеты.
-"""
+"""Точка входа: webhook-версия для Render Web Service (Free)."""
 import os
 import re
 import logging
@@ -200,9 +196,10 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
         "• Коины / Рынок / Панель брокера\n"
+        "• +Эмитент / -Эмитент @user / Эмитенты\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
-        "• /restart /help"
+        "• /restart /help /cancel"
     )
 
 
@@ -237,7 +234,7 @@ async def post_init(app: Application) -> None:
         )
         economy.register_jobs(app)
         app.job_queue.run_daily(
-            coin_jobs.daily_coin_income_job,
+            coin_jobs.daily_dividend_distribution_job,
             time=dtime(hour=1, minute=0, tzinfo=timezone.utc),
         )
         app.job_queue.run_repeating(
@@ -261,7 +258,6 @@ async def post_shutdown(app: Application) -> None:
 
 
 async def _coins_input_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Маршрутизирует текстовый ввод для FSM создания/продажи коинов."""
     if await coins.create_input(update, context):
         return
     if await coin_market.sell_price_input(update, context):
@@ -289,7 +285,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_menu.cmd_help))
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
-    # ── FIX #2: /cancel для выхода из FSM создания монеты
     app.add_handler(CommandHandler("cancel", coins.cancel_create))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
@@ -411,7 +406,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
                                    awards.cmd_unaward))
 
-    # --- старые действия ---
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
                                    actions.cmd_slap))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"),
@@ -425,7 +419,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
                                    actions.cmd_pat))
 
-    # --- новые действия ---
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Засос(\s|$)"),
                                    actions.cmd_kiss_deep))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расстрел(\s|$)"),
@@ -458,10 +451,14 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Рынок(\s|$)"), coin_market.cmd_market))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Панель\s+брокера(\s|$)"), coin_broker.cmd_broker))
 
-    # coin:view / buy / chart / mine / main / new — один роутер
+    # эмитенты
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Эмитент(\s|$)"), coins.cmd_emitter_add))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Эмитент(\s|$)"), coins.cmd_emitter_remove))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Эмитенты(\s|$)"), coins.cmd_emitters))
+
     app.add_handler(CallbackQueryHandler(
         coins.coin_callback,
-        pattern=r"^coin:(view|buy|chart|mine|main|new)(:|$)",
+        pattern=r"^coin:(view|buy|chart|mine|main|new|sell_reserve)(:|$)",
     ))
     app.add_handler(CallbackQueryHandler(coins.tier_callback, pattern=r"^coin:tier:"))
     app.add_handler(CallbackQueryHandler(coins.photo_decision_callback, pattern=r"^coin:photo_(ok|no)$"))
@@ -472,7 +469,6 @@ def build_app() -> Application:
         cmd_ai,
     ))
 
-    # FSM коинов: текст и фото — раньше track_message, чтобы перехватить
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _coins_input_router), group=-2)
     app.add_handler(MessageHandler(filters.PHOTO, _coins_photo_router), group=-2)
 
