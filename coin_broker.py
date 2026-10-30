@@ -1,8 +1,4 @@
-"""Панель брокера: портфель + кнопка «Создать монету» (только создатель/ССС).
-
-FIX #2: кнопка «Создать монету» скрывается, если у юзера уже есть
-активная сессия создания (_PENDING_CREATE).
-"""
+"""Панель брокера: портфель + кнопка «Создать монету»."""
 import os
 import logging
 from html import escape
@@ -29,13 +25,6 @@ def _is_admin(uid: int) -> bool:
     return bool(ADMIN_ID) and uid == ADMIN_ID
 
 
-def _is_sss(uid: int) -> bool:
-    try:
-        return _is_admin(uid) or sss.is_sss_member(uid)
-    except Exception:
-        return _is_admin(uid)
-
-
 async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -43,7 +32,6 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not user or not chat or not msg:
         return
 
-    # ПРИВАТ: панель брокера только для создателя (ADMIN_ID).
     if not _is_admin(user.id):
         try:
             await msg.reply_text("⛔ Панель брокера доступна только создателю.")
@@ -73,7 +61,7 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             sign = "📈" if pnl >= 0 else "📉"
             lines.append(
                 f"• {escape(coin['name'])}: <b>{qty}</b> шт · "
-                f"цена <b>{cp}</b>💰 · стоимость <b>{val}</b>💰 · "
+                f"NAV <b>{cp}</b>💰 · стоимость <b>{val}</b>💰 · "
                 f"{sign} P&L <b>{pnl:+d}</b>💰"
             )
     pnl_total = total_value - total_invested
@@ -83,8 +71,13 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"P&L: <b>{pnl_total:+d}</b>💰")
 
     rows = [[InlineKeyboardButton("🎒 Мои коины", callback_data="coin:mine")]]
-    # ── FIX #2: не показываем «Создать», если сессия уже идёт
-    if _is_sss(user.id) and not coins._PENDING_CREATE.get(user.id):
+    allowed = await db.emitter_is_allowed(chat.id, user.id)
+    active = await db.user_active_coin_count(chat.id, user.id)
+    if (
+        allowed
+        and active < coins.MAX_ACTIVE_COINS_PER_USER
+        and not coins._PENDING_CREATE.get(user.id)
+    ):
         rows.append([InlineKeyboardButton("➕ Создать монету", callback_data="coin:new")])
     rows.append([InlineKeyboardButton("🪙 Магазин коинов", callback_data="coin:main")])
 
