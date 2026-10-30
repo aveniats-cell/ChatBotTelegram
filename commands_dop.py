@@ -19,7 +19,7 @@ CREATE_BUY("Выбить зубы", "user1 выбил(а) зубы user2", pocke
 CREATE_BUY("Ударить топором", "user1 ударил(а) топором user2", pocket=71)
 CREATE_BUY("Пытать", "user1 пытает user2", pocket=71)
 CREATE_BUY("Разбить лицо", "user1 разбил(а) нос user2", pocket=71)
-CREATE_POCKET("Кенты", price=666, id=73)
+CREATE_POCKET("Кенты", price=340, id=73)
 CREATE_BUY("Похлопать по спине", "user1 похлопал(а) по спине user2", pocket=71)
 CREATE_BUY("Курить", "user1 закурил(а) с  user2", pocket=71)
 CREATE_BUY("Сходить в бар", "user1 сходил(а) в бар с user2", pocket=71)
