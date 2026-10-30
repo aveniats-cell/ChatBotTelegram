@@ -232,7 +232,6 @@ async def post_init(app: Application) -> None:
             first=60,
         )
         economy.register_jobs(app)
-        # коины: ежедневный доход в 01:00 UTC, история цен раз в час
         app.job_queue.run_daily(
             coin_jobs.daily_coin_income_job,
             time=dtime(hour=1, minute=0, tzinfo=timezone.utc),
@@ -452,7 +451,12 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Коины(\s|$)"), coins.cmd_coins))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Рынок(\s|$)"), coin_market.cmd_market))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Панель\s+брокера(\s|$)"), coin_broker.cmd_broker))
-    app.add_handler(CallbackQueryHandler(coins.coin_callback, pattern=r"^coin:(view|buy|chart|mine|main):?"))
+
+    # coin:view / buy / chart / mine / main / new — один роутер
+    app.add_handler(CallbackQueryHandler(
+        coins.coin_callback,
+        pattern=r"^coin:(view|buy|chart|mine|main|new)(:|$)",
+    ))
     app.add_handler(CallbackQueryHandler(coins.tier_callback, pattern=r"^coin:tier:"))
     app.add_handler(CallbackQueryHandler(coins.photo_decision_callback, pattern=r"^coin:photo_(ok|no)$"))
     app.add_handler(CallbackQueryHandler(coin_market.market_callback, pattern=r"^cmkt:"))
