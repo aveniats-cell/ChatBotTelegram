@@ -19,3 +19,5 @@ CREATE_BUY("Выбить зубы", "user1 выбил(а) зубы user2", pocke
 CREATE_BUY("Ударить топором", "user1 ударил(а) топором user2", pocket=71)
 CREATE_BUY("Пытать", "user1 пытает user2", pocket=71)
 CREATE_BUY("Разбить лицо", "user1 разбил(а) нос user2", pocket=71)
+CREATE_POCKET("Секретно", price=10000000, id=79)
+CREATE_BUY("Секретное оружие", "user1  Сделал предложение user2 с рубиновым кольцом", pocket=79)
