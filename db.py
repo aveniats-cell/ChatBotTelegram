@@ -9,6 +9,18 @@
     coin_market_lots, coin_purchases;
   - marriages.xp (уровень брака + XP);
   - users.coins_created (сколько коинов создал юзер).
+
+FIX #3 (монеты как активы):
+  - +coin_emitters          — whitelist эмитентов (админ + 3 ССС);
+  - +coins.reserve          — денежный резерв монеты;
+  - +coins.circulating      — сколько монет реально в обороте;
+  - +coins.dividend_pool    — накопленные дивиденды к распределению;
+  - +emitter_* / user_active_coin_count / coin_reserve_* /
+    coin_circulating_change / coin_dividend_* / coin_sell_to_reserve_atomic;
+  - coin_buy_atomic: to_creator → to_reserve, reserve +=, circulating +=;
+  - coin_market_buy_atomic: invested больше не растёт (вторичка);
+  - _coin_row / _COIN_SELECT знают про reserve, circulating, dividend_pool;
+  - бэкфилл: circulating = sold, reserve = start_price * sold.
 """
 import os
 import uuid
@@ -287,6 +299,17 @@ async def _create_tables() -> None:
             custom_trigger TEXT
         )
     """)
+    # ── FIX #3: whitelist эмитентов
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS coin_emitters (
+            chat_id    INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            granted_by INTEGER,
+            granted_at TEXT DEFAULT (datetime('now')),
+            active     INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
     await _exec("""
         CREATE TABLE IF NOT EXISTS coins (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -383,6 +406,10 @@ async def _migrate_tables() -> None:
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
         ("marriages", "xp", "INTEGER NOT NULL DEFAULT 0"),
+        # ── FIX #3: новые колонки coins
+        ("coins", "reserve", "INTEGER NOT NULL DEFAULT 0"),
+        ("coins", "circulating", "INTEGER NOT NULL DEFAULT 0"),
+        ("coins", "dividend_pool", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
     existing: dict = {}
@@ -430,11 +457,46 @@ async def _migrate_tables() -> None:
         "ON coin_market_lots(coin_id, active)",
         "CREATE INDEX IF NOT EXISTS idx_coin_purchases_coin "
         "ON coin_purchases(coin_id)",
+        # ── FIX #3
+        "CREATE INDEX IF NOT EXISTS idx_coin_emitters_chat "
+        "ON coin_emitters(chat_id, active)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
         if getattr(rs, "error", False):
             logger.warning("migrate: не удалось выполнить: %s", sql)
+
+    # ── FIX #3: бэкфилл reserve/circulating для старых монет
+    await _backfill_coin_assets()
+
+
+async def _backfill_coin_assets() -> None:
+    """Заполнить reserve/circulating у монет, созданных до FIX #3.
+
+    circulating == 0 и sold > 0 → значит миграция ещё не проставляла.
+    reserve = start_price * sold (грубая оценка, чтобы не было нуля).
+    """
+    rs = await _exec(
+        """SELECT id, start_price, sold, reserve, circulating
+           FROM coins
+           WHERE (circulating IS NULL OR circulating = 0) AND sold > 0"""
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return
+    for r in rs.rows:
+        coin_id = r[0]
+        start_price = int(r[1] or 0)
+        sold = int(r[2] or 0)
+        reserve = int(r[3] or 0)
+        circ = int(r[4] or 0)
+        new_circ = sold
+        new_reserve = reserve if reserve > 0 else max(0, start_price * sold)
+        await _exec(
+            """UPDATE coins SET circulating = ?, reserve = ?
+               WHERE id = ?""",
+            [new_circ, new_reserve, coin_id],
+        )
+    logger.info("backfill coins: обработано %d монет", len(rs.rows))
 
 
 async def close_db() -> None:
@@ -2030,17 +2092,23 @@ async def cosmetics_set(user_id: int, field: str, value: Optional[str]) -> bool:
 # ---------- coins ----------
 
 def _coin_row(r) -> dict:
+    """FIX #3: добавлены reserve, circulating, dividend_pool."""
     return {
         "id": r[0], "chat_id": r[1], "creator_id": r[2], "name": r[3],
         "description": r[4], "start_price": r[5], "total_supply": r[6],
         "sold": r[7], "yield_per_day": r[8], "photo_file_id": r[9],
         "photo_hash": r[10], "created_at": r[11], "active": bool(r[12]),
+        "reserve": r[13] or 0,
+        "circulating": r[14] or 0,
+        "dividend_pool": r[15] or 0,
     }
 
 
+# FIX #3: SELECT теперь с reserve, circulating, dividend_pool
 _COIN_SELECT = """SELECT id, chat_id, creator_id, name, description,
                          start_price, total_supply, sold, yield_per_day,
-                         photo_file_id, photo_hash, created_at, active
+                         photo_file_id, photo_hash, created_at, active,
+                         reserve, circulating, dividend_pool
                   FROM coins"""
 
 
@@ -2109,15 +2177,149 @@ async def coins_by_creator(chat_id: int, creator_id: int) -> List[dict]:
     return [_coin_row(r) for r in rs.rows]
 
 
-async def coin_buy_atomic(coin_id: int, buyer_id: int, price: int,
-                          to_creator: int) -> bool:
+# ── FIX #3: эмитенты
+
+async def emitter_is_allowed(chat_id: int, user_id: int) -> bool:
     rs = await _exec(
-        """UPDATE coins SET sold = sold + 1
+        "SELECT 1 FROM coin_emitters WHERE chat_id=? AND user_id=? AND active=1 LIMIT 1",
+        [chat_id, user_id],
+    )
+    return bool(rs.rows)
+
+
+async def emitter_add(chat_id: int, user_id: int, granted_by: int) -> bool:
+    rs = await _exec(
+        """INSERT INTO coin_emitters (chat_id, user_id, granted_by, active)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             granted_by = excluded.granted_by,
+             granted_at = datetime('now'),
+             active = 1""",
+        [chat_id, user_id, granted_by],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def emitter_remove(chat_id: int, user_id: int) -> bool:
+    rs = await _exec(
+        "UPDATE coin_emitters SET active=0 WHERE chat_id=? AND user_id=?",
+        [chat_id, user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def emitter_list(chat_id: int) -> List[int]:
+    rs = await _exec(
+        "SELECT user_id FROM coin_emitters WHERE chat_id=? AND active=1 "
+        "ORDER BY granted_at",
+        [chat_id],
+    )
+    return [r[0] for r in rs.rows]
+
+
+async def user_active_coin_count(chat_id: int, user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COUNT(*) FROM coins WHERE chat_id=? AND creator_id=? AND active=1",
+        [chat_id, user_id],
+    )
+    if not rs.rows:
+        return 0
+    return rs.rows[0][0] or 0
+
+
+# ── FIX #3: резерв / оборот / дивиденды
+
+async def coin_reserve_add(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        "UPDATE coins SET reserve = COALESCE(reserve, 0) + ? WHERE id = ?",
+        [amount, coin_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def coin_reserve_take(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        """UPDATE coins SET reserve = reserve - ?
+           WHERE id = ? AND reserve >= ?""",
+        [amount, coin_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def coin_circulating_change(coin_id: int, delta: int) -> bool:
+    rs = await _exec(
+        """UPDATE coins SET circulating = COALESCE(circulating, 0) + ?
+           WHERE id = ? AND COALESCE(circulating, 0) + ? >= 0""",
+        [delta, coin_id, delta],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def coin_dividend_add(coin_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        "UPDATE coins SET dividend_pool = COALESCE(dividend_pool, 0) + ? "
+        "WHERE id = ?",
+        [amount, coin_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def coin_dividend_take(coin_id: int) -> int:
+    """Атомарно забрать весь пул дивидендов и обнулить. Возвращает сумму."""
+    rs = await _exec(
+        "SELECT COALESCE(dividend_pool, 0) FROM coins WHERE id = ?", [coin_id],
+    )
+    if not rs.rows:
+        return 0
+    cur = rs.rows[0][0] or 0
+    if cur <= 0:
+        return 0
+    rs2 = await _exec(
+        "UPDATE coins SET dividend_pool = 0 WHERE id = ? AND dividend_pool = ?",
+        [coin_id, cur],
+    )
+    if getattr(rs2, "error", False):
+        return 0
+    if (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        # гонка: кто-то ещё забрал — прочитаем остаток и вернём его
+        rs3 = await _exec(
+            "SELECT COALESCE(dividend_pool, 0) FROM coins WHERE id = ?",
+            [coin_id],
+        )
+        return 0
+    return cur
+
+
+# ── FIX #3: покупка на первичке (в резерв, не создателю)
+
+async def coin_buy_atomic(coin_id: int, buyer_id: int, price: int,
+                          to_reserve: int) -> bool:
+    """Покупка на первичке. to_reserve идёт в резерв монеты, не создателю.
+
+    circulating += 1, sold += 1, holder.invested += price.
+    """
+    rs = await _exec(
+        """UPDATE coins SET sold = sold + 1, circulating = COALESCE(circulating, 0) + 1
            WHERE id=? AND sold < total_supply""",
         [coin_id],
     )
     if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
         return False
+    if to_reserve > 0:
+        await _exec(
+            "UPDATE coins SET reserve = COALESCE(reserve, 0) + ? WHERE id = ?",
+            [to_reserve, coin_id],
+        )
     await _exec(
         """INSERT INTO coin_holders (coin_id, user_id, quantity, invested)
            VALUES (?, ?, 1, ?)
@@ -2185,12 +2387,50 @@ async def coin_price_history_get(coin_id: int, limit: int = 60) -> List[dict]:
 
 async def coin_income_log_add(coin_id: int, user_id: int, day: str,
                               amount: int) -> None:
+    """Legacy: оставлено для истории, в новой модели не используется."""
     await _exec(
         """INSERT INTO coin_income_log (coin_id, user_id, day, amount)
            VALUES (?, ?, ?, ?)""",
         [coin_id, user_id, day, amount],
     )
 
+
+# ── FIX #3: продажа в резерв (buyback)
+
+async def coin_sell_to_reserve_atomic(coin_id: int, user_id: int,
+                                      quantity: int, price: int) -> bool:
+    """Продажа монет обратно в резерв.
+
+    reserve -= price * quantity, circulating -= quantity,
+    holder.quantity -= quantity. price — уже итоговая сумма за всё кол-во.
+    """
+    if quantity <= 0 or price <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE coin_holders SET quantity = quantity - ?
+           WHERE coin_id=? AND user_id=? AND quantity >= ?""",
+        [quantity, coin_id, user_id, quantity],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return False
+    rs2 = await _exec(
+        """UPDATE coins SET reserve = reserve - ?,
+                           circulating = COALESCE(circulating, 0) - ?
+           WHERE id = ? AND reserve >= ? AND COALESCE(circulating, 0) >= ?""",
+        [price, quantity, coin_id, price, quantity],
+    )
+    if getattr(rs2, "error", False) or (getattr(rs2, "rows_affected", 0) or 0) == 0:
+        # откат холдера
+        await _exec(
+            """UPDATE coin_holders SET quantity = quantity + ?
+               WHERE coin_id=? AND user_id=?""",
+            [quantity, coin_id, user_id],
+        )
+        return False
+    return True
+
+
+# ── рынок лотов
 
 async def coin_market_lot_create(coin_id: int, seller_id: int,
                                  quantity: int, price: int) -> bool:
@@ -2240,6 +2480,7 @@ async def coin_lots_list(chat_id: int, limit: int = 20) -> List[dict]:
 
 async def coin_market_buy_atomic(lot_id: int, buyer_id: int,
                                  quantity: int, price: int) -> bool:
+    """FIX #3: invested НЕ растёт (это вторичка, не эмиссия)."""
     rs = await _exec(
         "UPDATE coin_market_lots SET active=0 WHERE id=? AND active=1",
         [lot_id],
@@ -2251,10 +2492,9 @@ async def coin_market_buy_atomic(lot_id: int, buyer_id: int,
         return False
     await _exec(
         """INSERT INTO coin_holders (coin_id, user_id, quantity, invested)
-           VALUES (?, ?, ?, ?)
+           VALUES (?, ?, ?, 0)
            ON CONFLICT(coin_id, user_id) DO UPDATE SET
-             quantity = coin_holders.quantity + excluded.quantity,
-             invested = coin_holders.invested + excluded.invested""",
-        [lot["coin_id"], buyer_id, quantity, price],
+             quantity = coin_holders.quantity + excluded.quantity""",
+        [lot["coin_id"], buyer_id, quantity],
     )
     return True
