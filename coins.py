@@ -8,9 +8,7 @@
 Команда «Коины» — список кнопок.
 
 FIX #1: покупка монеты с ценой 0 больше не ломается.
-  - take_balance_atomic не вызывается при price == 0;
-  - fee = 0 при price == 0, to_creator = 0 (не уходит в минус);
-  - при откате возвращаем ровно то, что списали/начислили.
+FIX #2: FSM создания привязан к владельцу (owner_id + актуальные права ССС).
 """
 import os
 import re
@@ -67,6 +65,15 @@ def _is_sss(uid: int) -> bool:
         return _is_admin(uid)
 
 
+def _fsm_owner_ok(user_id: int, st: dict | None) -> bool:
+    """FSM принадлежит этому юзеру и он всё ещё имеет право создавать."""
+    if not st:
+        return False
+    if st.get("owner_id") != user_id:
+        return False
+    return _is_sss(user_id)
+
+
 def _current_price(coin: dict) -> int:
     """Bonding curve: +1 к цене за каждые 10% тиража."""
     total = max(1, int(coin["total_supply"]))
@@ -81,14 +88,13 @@ def _tier_fee(total_supply: int) -> int:
 
 def _total_fee(user: dict, total_supply: int) -> int:
     base = FEE_BASE + _tier_fee(total_supply)
-    # coins_created может отсутствовать в старых схемах — не падаем
     created = user.get("coins_created") if isinstance(user, dict) else None
     if created is not None and int(created) >= 1:
         base += SECOND_COIN_FEE
     return base
 
 
-# FSM-состояние создания: user_id -> dict(step, chat_id, ...)
+# FSM-состояние создания: user_id -> dict(step, chat_id, owner_id, ...)
 _PENDING_CREATE: dict[int, dict] = {}
 
 
@@ -204,7 +210,6 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action == "new":
-        # ВАЖНО: оборачиваем в try/except, чтобы сбой не "терялся" молча
         try:
             await _start_create(q, user)
         except Exception as e:
@@ -357,7 +362,6 @@ async def _render_my_coins(q, user) -> None:
 # ---------- создание ----------
 
 async def _start_create(q, user) -> None:
-    # 1) проверка прав — ДО любых правок сообщения
     if not _is_sss(user.id):
         logger.info("coin create DENY: user_id=%s not in SSS", user.id)
         try:
@@ -366,9 +370,9 @@ async def _start_create(q, user) -> None:
             logger.warning("coin create deny answer: %s", e)
         return
 
-    logger.info("coin create START: user_id=%s chat=%s", user.id, q.message.chat_id if q.message else "?")
+    logger.info("coin create START: user_id=%s chat=%s",
+                user.id, q.message.chat_id if q.message else "?")
 
-    # 2) определим chat_id безопасно
     chat_id = q.message.chat_id if q.message else None
     if chat_id is None:
         try:
@@ -377,16 +381,33 @@ async def _start_create(q, user) -> None:
             pass
         return
 
-    _PENDING_CREATE[user.id] = {"step": "name", "chat_id": chat_id}
+    # ── FIX #2: не начинаем вторую сессию поверх активной
+    existing = _PENDING_CREATE.get(user.id)
+    if existing is not None:
+        try:
+            await q.answer(
+                "⚠️ У тебя уже идёт создание монеты. Заверши или отмени его (/cancel).",
+                show_alert=True,
+            )
+        except TelegramError:
+            pass
+        return
 
-    # 3) шлём шаг 1 — и всегда даём ответ на callback
+    # ── FIX #2: owner_id в состоянии
+    _PENDING_CREATE[user.id] = {
+        "step": "name",
+        "chat_id": chat_id,
+        "owner_id": user.id,
+    }
+
     sent_ok = False
     try:
         await q.bot.send_message(
             chat_id=chat_id,
             text=(
                 "🪙 <b>Создание монеты</b>\n\n"
-                "Шаг 1/6: напиши название (3–16 символов, A-Za-z0-9_)."
+                "Шаг 1/6: напиши название (3–16 символов, A-Za-z0-9_).\n"
+                "<i>Отмена: /cancel</i>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -394,13 +415,11 @@ async def _start_create(q, user) -> None:
     except TelegramError as e:
         logger.warning("coin create send: %s", e)
 
-    # 4) убираем кнопки у исходного сообщения (не критично)
     try:
         await q.edit_message_reply_markup(reply_markup=None)
     except TelegramError as e:
         logger.info("coin create edit markup: %s", e)
 
-    # 5) отвечаем на callback — обязательно
     try:
         if sent_ok:
             await q.answer()
@@ -417,7 +436,8 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if not user or not msg:
         return False
     st = _PENDING_CREATE.get(user.id)
-    if not st:
+    # ── FIX #2: реагируем только на свой FSM и только с правом
+    if not _fsm_owner_ok(user.id, st):
         return False
 
     text = (msg.text or "").strip()
@@ -425,7 +445,6 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     logger.info("coin create input: user_id=%s step=%s text=%r",
                 user.id, step, text[:40])
 
-    # если пользователь прервал FSM командой — сбрасываем
     if text.startswith("/"):
         _PENDING_CREATE.pop(user.id, None)
         return False
@@ -485,6 +504,19 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     return False
 
 
+async def cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """FIX #2: /cancel — сбросить свою сессию создания."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    st = _PENDING_CREATE.get(user.id)
+    if not _fsm_owner_ok(user.id, st):
+        return
+    _PENDING_CREATE.pop(user.id, None)
+    await msg.reply_text("❌ Создание монеты отменено.")
+
+
 async def tier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     user = update.effective_user
@@ -494,13 +526,16 @@ async def tier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if len(parts) != 3 or parts[0] != "coin" or parts[1] != "tier":
         await q.answer()
         return
+
+    # ── FIX #2: кнопку тиража может нажать только владелец FSM и только ССС
+    st = _PENDING_CREATE.get(user.id)
+    if not _fsm_owner_ok(user.id, st):
+        await q.answer("⛔ Это не твоя сессия создания.", show_alert=True)
+        return
+
     t = int(parts[2])
     if t not in TIER_FEE:
         await q.answer("Неверный тираж.", show_alert=True)
-        return
-    st = _PENDING_CREATE.get(user.id)
-    if not st:
-        await q.answer("Сессия создания истекла.", show_alert=True)
         return
     st["total_supply"] = t
     st["step"] = "yield"
@@ -525,7 +560,8 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     if not user or not msg:
         return False
     st = _PENDING_CREATE.get(user.id)
-    if not st or st.get("step") != "photo":
+    # ── FIX #2: только свой FSM, только ССС, только шаг photo
+    if not _fsm_owner_ok(user.id, st) or st.get("step") != "photo":
         return False
     photo = msg.photo[-1] if msg.photo else None
     if not photo:
@@ -581,6 +617,13 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     if not q or not user:
         return
+
+    # ── FIX #2: только владелец FSM и только ССС
+    st = _PENDING_CREATE.get(user.id)
+    if not _fsm_owner_ok(user.id, st):
+        await q.answer("⛔ Это не твоя сессия создания.", show_alert=True)
+        return
+
     if q.data == "coin:photo_no":
         _PENDING_CREATE.pop(user.id, None)
         try:
@@ -597,10 +640,6 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
         await q.answer()
         return
     if q.data == "coin:photo_ok":
-        st = _PENDING_CREATE.get(user.id)
-        if not st:
-            await q.answer("Сессия истекла.", show_alert=True)
-            return
         row = await db.get_user(user.id)
         bal = (row or {}).get("balance") or 0
         total_fee = _total_fee(row or {}, st["total_supply"])
