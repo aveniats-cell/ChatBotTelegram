@@ -1,4 +1,8 @@
-"""Точка входа: webhook-версия для Render Web Service (Free)."""
+"""Точка входа: webhook-версия для Render Web Service (Free).
+
+FIX #2: добавлен CommandHandler("cancel", coins.cancel_create),
+чтобы владелец FSM мог выйти из создания монеты.
+"""
 import os
 import re
 import logging
@@ -285,6 +289,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_menu.cmd_help))
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    # ── FIX #2: /cancel для выхода из FSM создания монеты
+    app.add_handler(CommandHandler("cancel", coins.cancel_create))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
     app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
