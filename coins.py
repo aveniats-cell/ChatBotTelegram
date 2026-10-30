@@ -8,21 +8,13 @@ FSM создания (только лицензированные эмитент
   - yield_per_day = 0 (доход = дивиденды от комиссий торговли);
   - цена = NAV = max(1, reserve // circulating).
 
-Покупка на первичке:
-  - цена = NAV;
-  - fee = 0 при price <= 1, иначе max(1, price*6//100);
-  - to_reserve = price - fee идёт в резерв монеты (НЕ создателю);
-  - fee → казна чата;
-  - circulating += 1, sold += 1.
-
-Продажа в резерв (buyback):
-  - sell_price = max(1, NAV * (100 - 3) // 100) за 1 шт;
-  - списываем qty у холдера, reserve -= total, circulating -= qty;
-  - игроку + total.
+Покупка на первичке: fee (6%) в казну, to_reserve в резерв монеты.
+Продажа в резерв: sell_price = NAV * (100 - 3) // 100.
 
 FIX #1: покупка монеты с ценой 0 больше не ломается.
 FIX #2: FSM создания привязан к владельцу (owner_id + актуальные права).
 FIX #3: whitelist эмитентов, лимит 1 активная монета, NAV, резерв, дивиденды.
+FIX #4: команда «УдалитьМонету <имя>» — архивирует монету (только админ).
 """
 import os
 import re
@@ -49,18 +41,17 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-# ── FIX #3: лимиты и ставки
 MAX_ACTIVE_COINS_PER_USER = 1
-MARKET_FEE_PCT = 6           # комиссия первички
-SELL_DISCOUNT_PCT = 3        # дисконт при продаже в резерв
-NAV_MIN = 1                  # минимальная цена (номинал)
+MARKET_FEE_PCT = 6
+SELL_DISCOUNT_PCT = 3
+NAV_MIN = 1
 
 PHOTO_SIZE = (512, 512)
 PHOTO_QUALITY = 85
 NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 DESC_MAX = 300
 
-TIER_LIST = [10, 20, 100, 1000]   # только варианты тиража, без платы
+TIER_LIST = [10, 20, 100, 1000]
 
 
 def _is_admin(uid: int) -> bool:
@@ -76,23 +67,19 @@ def _is_sss(uid: int) -> bool:
 
 
 def _fsm_owner_ok(user_id: int, st: dict | None) -> bool:
-    """FSM принадлежит этому юзеру и он всё ещё имеет право создавать."""
     if not st:
         return False
     if st.get("owner_id") != user_id:
         return False
-    # FIX #3: право = быть в whitelist эмитентов (а не просто ССС)
     return True
 
 
 def _current_price(coin: dict) -> int:
-    """FIX #3: NAV = reserve / circulating, минимум 1."""
     circ = max(1, int(coin.get("circulating") or 0))
     reserve = int(coin.get("reserve") or 0)
     return max(NAV_MIN, reserve // circ)
 
 
-# ── FSM-состояние создания: user_id -> dict(step, chat_id, owner_id, ...)
 _PENDING_CREATE: dict[int, dict] = {}
 
 
@@ -249,7 +236,6 @@ async def _buy_coin(q, user, cid: int) -> None:
     row = await db.get_user(user.id)
     bal = (row or {}).get("balance") or 0
 
-    # FIX #1: цена 0 — списывать нечего, покупка разрешена
     if price > 0:
         if bal < price:
             await q.answer(f"⛔ Нужно {price}, у тебя {bal}.", show_alert=True)
@@ -259,7 +245,6 @@ async def _buy_coin(q, user, cid: int) -> None:
             await q.answer("⛔ Не удалось списать.", show_alert=True)
             return
 
-    # FIX #1 + FIX #3: комиссия и резерв не уходят в минус
     if price <= 1:
         fee = 0
         to_reserve = price
@@ -277,7 +262,6 @@ async def _buy_coin(q, user, cid: int) -> None:
 
     ok2 = await db.coin_buy_atomic(cid, user.id, price, to_reserve)
     if not ok2:
-        # корректный откат
         if price > 0:
             await db.add_balance(user.id, price)
         if fee > 0:
@@ -302,7 +286,6 @@ async def _buy_coin(q, user, cid: int) -> None:
 
 
 async def _sell_to_reserve(q, user, cid: int) -> None:
-    """FIX #3: продажа в резерв монеты (buyback)."""
     coin = await db.coin_get(cid)
     if not coin:
         await q.answer("Монета не найдена.", show_alert=True)
@@ -359,7 +342,7 @@ async def _send_chart(q, context, cid: int) -> None:
         coin["name"],
         [(h["ts"], h["price"], h["sold"]) for h in hist],
         _current_price(coin),
-        0,  # yield_per_day больше не показываем
+        0,
     )
     if not png:
         await q.answer("Нет данных для графика.", show_alert=True)
@@ -419,7 +402,6 @@ async def _start_create(q, user) -> None:
             pass
         return
 
-    # FIX #3: только лицензированные эмитенты
     if not await db.emitter_is_allowed(chat_id, user.id):
         logger.info("coin create DENY: user_id=%s not in emitters", user.id)
         try:
@@ -431,7 +413,6 @@ async def _start_create(q, user) -> None:
             logger.warning("coin create deny answer: %s", e)
         return
 
-    # FIX #3: не больше 1 активной монеты
     active = await db.user_active_coin_count(chat_id, user.id)
     if active >= MAX_ACTIVE_COINS_PER_USER:
         try:
@@ -444,7 +425,6 @@ async def _start_create(q, user) -> None:
             pass
         return
 
-    # FIX #2: не начинаем вторую сессию поверх активной
     existing = _PENDING_CREATE.get(user.id)
     if existing is not None:
         try:
@@ -458,7 +438,6 @@ async def _start_create(q, user) -> None:
 
     logger.info("coin create START: user_id=%s chat=%s", user.id, chat_id)
 
-    # FIX #2: owner_id в состоянии
     _PENDING_CREATE[user.id] = {
         "step": "name",
         "chat_id": chat_id,
@@ -496,13 +475,11 @@ async def _start_create(q, user) -> None:
 
 
 async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Возвращает True, если сообщение было обработано как шаг создания."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return False
     st = _PENDING_CREATE.get(user.id)
-    # FIX #2: реагируем только на свой FSM
     if not _fsm_owner_ok(user.id, st):
         return False
 
@@ -551,7 +528,6 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 
 async def cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """FIX #2: /cancel — сбросить свою сессию создания."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -596,7 +572,6 @@ async def tier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Ловит фото в шаге photo, сжимает 512x512 JPEG, показывает превью."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -680,7 +655,6 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
         await q.answer()
         return
     if q.data == "coin:photo_ok":
-        # FIX #3: повторная проверка лимита (на случай гонки)
         active = await db.user_active_coin_count(st["chat_id"], user.id)
         if active >= MAX_ACTIVE_COINS_PER_USER:
             _PENDING_CREATE.pop(user.id, None)
@@ -690,7 +664,6 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
                 show_alert=True,
             )
             return
-        # повторная проверка whitelist (могли снять права в процессе)
         if not await db.emitter_is_allowed(st["chat_id"], user.id):
             _PENDING_CREATE.pop(user.id, None)
             await q.answer(
@@ -710,9 +683,9 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
             pass
         cid = await db.coin_create(
             st["chat_id"], user.id, st["name"], st["description"],
-            1,                # start_price = 1 (номинал)
+            1,
             st["total_supply"],
-            0,                # yield_per_day = 0 (доход = дивиденды)
+            0,
             file_id, st["photo_hash"],
         )
         _PENDING_CREATE.pop(user.id, None)
@@ -818,4 +791,57 @@ async def cmd_emitter_remove(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await msg.reply_text(
         f"✅ {escape(str(name))} больше не эмитент.", parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- архивирование монеты (админ) ----------
+
+async def cmd_coin_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удалить (архивировать) монету по имени. Только админ."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Только админ.")
+        return
+
+    m = re.search(r"(?i)^УдалитьМонету\s+(\S+)", msg.text or "")
+    if not m:
+        await msg.reply_text(
+            "Формат: <code>УдалитьМонету ivangey</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    name = m.group(1)
+
+    cid = await db.coin_find_by_name(chat.id, name)
+    if not cid:
+        await msg.reply_text(
+            f"⚠️ Монета <b>{escape(name)}</b> не найдена.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    rs = await db._exec(
+        "UPDATE coins SET active = 0 WHERE id = ? AND chat_id = ?",
+        [cid, chat.id],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        await msg.reply_text("⚠️ Не удалось архивировать.")
+        return
+
+    try:
+        await db._exec(
+            "UPDATE coin_market_lots SET active = 0 WHERE coin_id = ? AND active = 1",
+            [cid],
+        )
+    except Exception as e:
+        logger.warning("archive lots %s: %s", cid, e)
+
+    await msg.reply_text(
+        f"✅ Монета <b>{escape(name)}</b> архивирована (active=0).\n"
+        f"<i>История сохранена, в списках и на рынке её больше нет.</i>",
+        parse_mode=ParseMode.HTML,
     )
