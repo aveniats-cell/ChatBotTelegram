@@ -36,6 +36,10 @@ import help_menu
 import casino
 import polls
 import rules
+import command_registry   # noqa: F401 — должен идти до commands_dop
+import commands_dop       # noqa: F401 — регистрирует команды в реестре
+import commands_dop_handlers
+import shop
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -76,7 +80,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
-        "Казино — мини-казино"
+        "Казино — мини-казино\n"
+        "Магазин — пакеты команд"
     )
 
 
@@ -188,6 +193,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
+        "• Магазин — пакеты команд\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
@@ -207,6 +213,7 @@ async def post_init(app: Application) -> None:
     await db.init_db()
     await sss.restore_sss_members()
     await resolver.start_client()
+    await commands_dop_handlers.sync_to_db()
 
     if app.job_queue:
         app.job_queue.run_daily(
@@ -420,6 +427,17 @@ def build_app() -> Application:
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
+
+    # ── магазин
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop,
+    ))
+    app.add_handler(CallbackQueryHandler(
+        shop.shop_callback, pattern=r"^shop:",
+    ))
+
+    # ── динамические команды из commands_dop.py
+    commands_dop_handlers.register(app)
 
     if CHAT_ID:
         app.add_handler(MessageHandler(
