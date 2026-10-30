@@ -1,14 +1,7 @@
-"""Экономика: кредит из казны, монеты, перевод, казна, налог, зарплата,
-проценты в казну, дефолт (органический — процент, искусственный — всё),
-топ богачи, раздача всем (из казны).
+"""Экономика: кредит, монеты, перевод, казна, налог, зарплата, дефолт, топ.
 
-Исправления:
-  - tax_job / tax_active_balances: атомарно, сумма = реально списанное
-    (UPDATE ... RETURNING), а не «посчитали до UPDATE»;
-  - take_credit_from_treasury: сначала фиксируем долг юзера, потом выдаём
-    из казны; при сбое — компенсация. Никаких фантомных возвратов;
-  - daily_interest_job и tax_job обёрнуты в try/except целиком;
-  - register_jobs: проверяем, что job_queue есть, и логируем timezone.
+FIX #3: убран SECOND_COIN_FEE; эмитенты управляются через +Эмитент /
+-Эмитент / Эмитенты (обработчики в coins.py, регистрируются в main.py).
 """
 import os
 import re
@@ -58,8 +51,6 @@ def _num_after(text: str, keyword: str) -> int | None:
     m = re.search(rf"(?i){re.escape(keyword)}\s+(\d+)", text)
     return int(m.group(1)) if m else None
 
-
-# ---------- Кредит из казны ----------
 
 async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -189,8 +180,6 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-# ---------- +Монеты / -Монеты ----------
-
 async def cmd_admin_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
@@ -291,8 +280,6 @@ async def cmd_admin_coins_minus(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-# ---------- Перевод ----------
-
 async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -362,8 +349,6 @@ async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-# ---------- Казна ----------
-
 async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -374,8 +359,6 @@ async def cmd_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("⛔ Только админ.")
         return
     bal = await db.treasury_get(chat.id)
-    logger.info("cmd_treasury: chat.id=%s env_CHAT_ID=%s bal=%s",
-                chat.id, os.getenv("CHAT_ID"), bal)
     await msg.reply_text(
         f"🏦 <b>Казна чата</b>\n"
         f"Накоплено: <b>{bal}</b> монет\n"
@@ -436,8 +419,6 @@ async def cmd_treasury_trim(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parse_mode=ParseMode.HTML,
     )
 
-
-# ---------- -Утил / +Утил ----------
 
 async def cmd_burn_treasury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -571,26 +552,22 @@ async def cmd_mint_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-# ---------- Зарплата (инфо) ----------
-
 async def cmd_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return
     day = _today_utc()
-    coins = await db.get_salary_today(user.id, day)
+    coins_val = await db.get_salary_today(user.id, day)
     frac = await db.get_salary_frac(user.id, day)
     await msg.reply_text(
         f"💼 <b>Зарплата за сегодня</b>\n"
-        f"Начислено: <b>{coins}.{frac:02d}</b> монет\n\n"
+        f"Начислено: <b>{coins_val}.{frac:02d}</b> монет\n\n"
         f"<i>1 сообщение ≥ 2 символов = 0.20 монеты. "
         f"Дроби копятся, в баланс уходят целыми.</i>",
         parse_mode=ParseMode.HTML,
     )
 
-
-# ---------- Топ богачи ----------
 
 async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -614,8 +591,6 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(f"{medal} {escape(name)} — <b>{bal}</b>")
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-
-# ---------- Сбор балансов ----------
 
 async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
     if pct <= 0:
@@ -667,8 +642,6 @@ async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
     return real, users_count
 
 
-# ---------- Дефолт ----------
-
 async def _run_default(context, chat_id: int, force: bool = False) -> bool:
     if chat_id in _default_in_progress:
         logger.info("default: уже выполняется для chat=%s, skip", chat_id)
@@ -679,7 +652,6 @@ async def _run_default(context, chat_id: int, force: bool = False) -> bool:
 
         if not force:
             last = await db.get_last_default(chat_id)
-            logger.info("default: last=%s", last)
             if last:
                 try:
                     last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
@@ -691,7 +663,6 @@ async def _run_default(context, chat_id: int, force: bool = False) -> bool:
 
         pct = 100 if force else DEFAULT_PCT
         total, users_count = await _collect_balances(chat_id, pct)
-        logger.info("default: collected=%s users=%s pct=%s", total, users_count, pct)
         if total <= 0:
             logger.info("default: собирать нечего")
             return False
@@ -736,7 +707,6 @@ async def _check_default_after(context, chat_id: int) -> None:
     except Exception as e:
         logger.warning("_check_default_after: %s", e)
         return
-    logger.info("_check_default_after: bal=%s", bal)
     if bal > 0:
         return
     await _run_default(context, chat_id, force=False)
@@ -754,8 +724,6 @@ async def default_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if bal <= 0:
         await _run_default(context, chat_id, force=False)
 
-
-# ---------- Искусственный дефолт ----------
 
 async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -785,8 +753,6 @@ async def cmd_force_default(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except TelegramError:
             pass
 
-
-# ---------- /ALLMONEY — раздача всем ИЗ КАЗНЫ ----------
 
 async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -837,8 +803,6 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     total_minted = amount * total_users
     treasury_before = await db.treasury_get(chat.id)
-    logger.info("all_money: chat.id=%s env_CHAT_ID=%s before=%s need=%s users=%s",
-                chat.id, os.getenv("CHAT_ID"), treasury_before, total_minted, total_users)
     if treasury_before < total_minted:
         await context.bot.send_message(
             chat_id=chat.id,
@@ -885,7 +849,6 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     treasury_after = await db.treasury_get(chat.id)
-    logger.info("all_money: after=%s", treasury_after)
 
     try:
         await context.bot.send_message(
@@ -903,8 +866,6 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except TelegramError as e:
         logger.warning("cmd_all_money send: %s", e)
 
-
-# ---------- Налог ----------
 
 async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -948,8 +909,6 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError as e:
         logger.warning("tax_job send: %s", e)
 
-
-# ---------- Проценты по кредиту ----------
 
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(os.getenv("CHAT_ID", "0") or "0")
