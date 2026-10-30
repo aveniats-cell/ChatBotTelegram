@@ -1,6 +1,7 @@
 from command_registry import CREATE_POCKET, CREATE_BUY, CREATE_FREE
 
 CREATE_FREE("Пнуть", "user1 пнул(а) user2")
+CREATE_FREE("реп", "user1 ппослал(а) респект user2")
 CREATE_POCKET("Романтика 18+", price=150, id=70)
 CREATE_BUY("Трахнуть", "user1 трахнул(а) user2 💋", pocket=70)
 CREATE_BUY("Облизать", "user1 облизал(а) user2 🤗", pocket=70)
