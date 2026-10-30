@@ -6,6 +6,11 @@
 
 Покупка: цена bonding curve, 6% в казну, 94% создателю.
 Команда «Коины» — список кнопок.
+
+FIX #1: покупка монеты с ценой 0 больше не ломается.
+  - take_balance_atomic не вызывается при price == 0;
+  - fee = 0 при price == 0, to_creator = 0 (не уходит в минус);
+  - при откате возвращаем ровно то, что списали/начислили.
 """
 import os
 import re
@@ -228,38 +233,54 @@ async def _buy_coin(q, user, cid: int) -> None:
     price = _current_price(coin)
     row = await db.get_user(user.id)
     bal = (row or {}).get("balance") or 0
-    if bal < price:
-        await q.answer(f"⛔ Нужно {price}, у тебя {bal}.", show_alert=True)
-        return
 
-    ok = await db.take_balance_atomic(user.id, price)
-    if not ok:
-        await q.answer("⛔ Не удалось списать.", show_alert=True)
-        return
+    # ── FIX #1: цена 0 — списывать нечего, покупка разрешена
+    if price > 0:
+        if bal < price:
+            await q.answer(f"⛔ Нужно {price}, у тебя {bal}.", show_alert=True)
+            return
+        ok = await db.take_balance_atomic(user.id, price)
+        if not ok:
+            await q.answer("⛔ Не удалось списать.", show_alert=True)
+            return
 
-    fee = max(1, price * MARKET_FEE_PCT // 100)
-    to_creator = price - fee
+    # ── FIX #1: комиссия и доля создателя не уходят в минус при price == 0
+    if price <= 0:
+        fee = 0
+        to_creator = 0
+    else:
+        fee = max(1, price * MARKET_FEE_PCT // 100)
+        to_creator = price - fee
 
-    try:
-        await db.add_balance(coin["creator_id"], to_creator)
-    except Exception as e:
-        logger.warning("coin creator payout: %s", e)
+    if to_creator > 0:
+        try:
+            await db.add_balance(coin["creator_id"], to_creator)
+        except Exception as e:
+            logger.warning("coin creator payout: %s", e)
 
-    try:
-        await db.treasury_add(q.message.chat.id, fee)
-    except Exception as e:
-        logger.warning("coin treasury: %s", e)
+    if fee > 0:
+        try:
+            await db.treasury_add(q.message.chat.id, fee)
+        except Exception as e:
+            logger.warning("coin treasury: %s", e)
 
     ok2 = await db.coin_buy_atomic(cid, user.id, price, to_creator)
     if not ok2:
-        await db.add_balance(user.id, price)
-        await db.add_balance(coin["creator_id"], -to_creator)
+        # ── FIX #1: корректный откат ровно того, что успели начислить
+        if price > 0:
+            await db.add_balance(user.id, price)
+        if to_creator > 0:
+            await db.add_balance(coin["creator_id"], -to_creator)
+        if fee > 0:
+            await db.treasury_add(q.message.chat.id, -fee)
         await q.answer("⚠️ Покупка не удалась, монеты возвращены.", show_alert=True)
         return
 
     coin2 = await db.coin_get(cid)
     try:
-        await db.coin_price_history_add(cid, _current_price(coin2 or coin), int((coin2 or coin)["sold"]))
+        await db.coin_price_history_add(
+            cid, _current_price(coin2 or coin), int((coin2 or coin)["sold"])
+        )
     except Exception as e:
         logger.warning("coin history: %s", e)
 
