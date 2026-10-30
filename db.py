@@ -2787,38 +2787,19 @@ async def shop_user_has_pocket(chat_id: int, user_id: int, pocket_id: int) -> bo
 
 async def shop_purchase_add(chat_id: int, user_id: int, pocket_id: int,
                             price: int) -> bool:
-    """сначала списываем деньги, потом пишем покупку.
-    При сбое — возвращаем деньги. UNIQUE защищает от двойной покупки."""
+    """Только записывает покупку. Списание выполняется в shop.py."""
     if price < 0:
         return False
 
-    # если уже куплено — не списываем
-    if await shop_user_has_pocket(chat_id, user_id, pocket_id):
-        return False
-
-    # 1. списываем деньги (если цена > 0)
-    if price > 0:
-        rs_bal = await _exec(
-            """UPDATE users
-               SET balance = COALESCE(balance, 10) - ?
-               WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
-            [price, user_id, price],
-        )
-        if getattr(rs_bal, "error", False) or (getattr(rs_bal, "rows_affected", 0) or 0) == 0:
-            return False
-
-    # 2. пишем покупку (INSERT OR IGNORE — UNIQUE по (chat,user,pocket))
+    # UNIQUE(chat_id, user_id, pocket_id) защищает от повторной покупки.
     rs = await _exec(
-        "INSERT OR IGNORE INTO shop_purchases "
-        "(chat_id, user_id, pocket_id, price_paid) VALUES (?, ?, ?, ?)",
+        """INSERT OR IGNORE INTO shop_purchases
+           (chat_id, user_id, pocket_id, price_paid)
+           VALUES (?, ?, ?, ?)""",
         [chat_id, user_id, pocket_id, price],
     )
-    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
-        # откат денег (если списывали)
-        if price > 0:
-            await _exec(
-                "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
-                [price, user_id],
-            )
+
+    if getattr(rs, "error", False):
         return False
-    return True
+
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
