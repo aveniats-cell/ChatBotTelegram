@@ -12,9 +12,7 @@ import re
 import io
 import hashlib
 import logging
-from datetime import datetime, timezone
 from html import escape
-from typing import Optional
 
 from PIL import Image
 from telegram import (
@@ -57,7 +55,11 @@ def _is_admin(uid: int) -> bool:
 
 
 def _is_sss(uid: int) -> bool:
-    return _is_admin(uid) or sss.is_sss_member(uid)
+    try:
+        return _is_admin(uid) or sss.is_sss_member(uid)
+    except Exception as e:
+        logger.warning("is_sss check failed for %s: %s", uid, e)
+        return _is_admin(uid)
 
 
 def _current_price(coin: dict) -> int:
@@ -74,7 +76,9 @@ def _tier_fee(total_supply: int) -> int:
 
 def _total_fee(user: dict, total_supply: int) -> int:
     base = FEE_BASE + _tier_fee(total_supply)
-    if (user.get("coins_created") or 0) >= 1:
+    # coins_created может отсутствовать в старых схемах — не падаем
+    created = user.get("coins_created") if isinstance(user, dict) else None
+    if created is not None and int(created) >= 1:
         base += SECOND_COIN_FEE
     return base
 
@@ -195,7 +199,18 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action == "new":
-        await _start_create(q, user)
+        # ВАЖНО: оборачиваем в try/except, чтобы сбой не "терялся" молча
+        try:
+            await _start_create(q, user)
+        except Exception as e:
+            logger.exception("coin create start CRASH: %s", e)
+            try:
+                await q.answer(
+                    "⚠️ Ошибка запуска создания. Попробуй ещё раз.",
+                    show_alert=True,
+                )
+            except TelegramError:
+                pass
         return
 
     await q.answer()
@@ -321,31 +336,57 @@ async def _render_my_coins(q, user) -> None:
 # ---------- создание ----------
 
 async def _start_create(q, user) -> None:
+    # 1) проверка прав — ДО любых правок сообщения
     if not _is_sss(user.id):
         logger.info("coin create DENY: user_id=%s not in SSS", user.id)
-        await q.answer("Только члены ССС могут создавать коины.", show_alert=True)
+        try:
+            await q.answer("Только члены ССС могут создавать коины.", show_alert=True)
+        except TelegramError as e:
+            logger.warning("coin create deny answer: %s", e)
         return
 
-    logger.info("coin create START: user_id=%s chat=%s", user.id, q.message.chat_id)
-    _PENDING_CREATE[user.id] = {"step": "name", "chat_id": q.message.chat_id}
+    logger.info("coin create START: user_id=%s chat=%s", user.id, q.message.chat_id if q.message else "?")
 
+    # 2) определим chat_id безопасно
+    chat_id = q.message.chat_id if q.message else None
+    if chat_id is None:
+        try:
+            await q.answer("Не удалось определить чат.", show_alert=True)
+        except TelegramError:
+            pass
+        return
+
+    _PENDING_CREATE[user.id] = {"step": "name", "chat_id": chat_id}
+
+    # 3) шлём шаг 1 — и всегда даём ответ на callback
+    sent_ok = False
     try:
         await q.bot.send_message(
-            chat_id=q.message.chat_id,
+            chat_id=chat_id,
             text=(
                 "🪙 <b>Создание монеты</b>\n\n"
                 "Шаг 1/6: напиши название (3–16 символов, A-Za-z0-9_)."
             ),
             parse_mode=ParseMode.HTML,
         )
+        sent_ok = True
     except TelegramError as e:
         logger.warning("coin create send: %s", e)
 
+    # 4) убираем кнопки у исходного сообщения (не критично)
     try:
         await q.edit_message_reply_markup(reply_markup=None)
-    except TelegramError:
-        pass
-    await q.answer()
+    except TelegramError as e:
+        logger.info("coin create edit markup: %s", e)
+
+    # 5) отвечаем на callback — обязательно
+    try:
+        if sent_ok:
+            await q.answer()
+        else:
+            await q.answer("⚠️ Не удалось отправить сообщение. Проверь права бота.", show_alert=True)
+    except TelegramError as e:
+        logger.warning("coin create answer: %s", e)
 
 
 async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -362,6 +403,11 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     step = st["step"]
     logger.info("coin create input: user_id=%s step=%s text=%r",
                 user.id, step, text[:40])
+
+    # если пользователь прервал FSM командой — сбрасываем
+    if text.startswith("/"):
+        _PENDING_CREATE.pop(user.id, None)
+        return False
 
     if step == "name":
         if not NAME_RE.match(text):
@@ -385,9 +431,7 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             return True
         st["description"] = text
         st["step"] = "price"
-        await msg.reply_text(
-            "Шаг 3/6: цена (целое 0–10 монет)."
-        )
+        await msg.reply_text("Шаг 3/6: цена (целое 0–10 монет).")
         return True
 
     if step == "price":
@@ -441,12 +485,15 @@ async def tier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     st["step"] = "yield"
     row = await db.get_user(user.id)
     fee = _total_fee(row or {}, t)
-    await q.edit_message_text(
-        f"Тираж: <b>{t}</b>\n"
-        f"Полная плата: <b>{fee}</b>💰 (в казну)\n\n"
-        f"Шаг 5/6: доход в сутки (целое 0–{YIELD_MAX}).",
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        await q.edit_message_text(
+            f"Тираж: <b>{t}</b>\n"
+            f"Полная плата: <b>{fee}</b>💰 (в казну)\n\n"
+            f"Шаг 5/6: доход в сутки (целое 0–{YIELD_MAX}).",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("tier edit: %s", e)
     await q.answer()
 
 
@@ -464,8 +511,14 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         await msg.reply_text("Пришли именно фото.")
         return True
 
-    f = await context.bot.get_file(photo.file_id)
-    raw = await f.download_as_bytearray()
+    try:
+        f = await context.bot.get_file(photo.file_id)
+        raw = await f.download_as_bytearray()
+    except TelegramError as e:
+        logger.warning("coin photo download: %s", e)
+        await msg.reply_text("⚠️ Не удалось скачать фото.")
+        return True
+
     try:
         img = Image.open(io.BytesIO(bytes(raw))).convert("RGB")
         img = img.resize(PHOTO_SIZE, Image.LANCZOS)
@@ -485,16 +538,20 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     st["photo_bytes"] = jpeg
     st["photo_hash"] = h
 
-    sent = await context.bot.send_photo(
-        chat_id=msg.chat_id,
-        photo=InputFile(io.BytesIO(jpeg), filename="coin.jpg"),
-        caption="Превью 512×512 JPEG. Принять?",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Принять", callback_data="coin:photo_ok"),
-            InlineKeyboardButton("❌ Отказать", callback_data="coin:photo_no"),
-        ]]),
-    )
-    st["preview_msg_id"] = sent.message_id
+    try:
+        sent = await context.bot.send_photo(
+            chat_id=msg.chat_id,
+            photo=InputFile(io.BytesIO(jpeg), filename="coin.jpg"),
+            caption="Превью 512×512 JPEG. Принять?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Принять", callback_data="coin:photo_ok"),
+                InlineKeyboardButton("❌ Отказать", callback_data="coin:photo_no"),
+            ]]),
+        )
+        st["preview_msg_id"] = sent.message_id
+    except TelegramError as e:
+        logger.warning("coin photo preview: %s", e)
+        await msg.reply_text("⚠️ Не удалось отправить превью.")
     return True
 
 
