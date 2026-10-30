@@ -36,10 +36,6 @@ import help_menu
 import casino
 import polls
 import rules
-import coins
-import coin_market
-import coin_broker
-import coin_jobs
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -80,10 +76,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — жив?\n"
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
-        "Казино — мини-казино\n"
-        "Коины — магазин коинов\n"
-        "Рынок — рынок коинов\n"
-        "Панель брокера — портфель"
+        "Казино — мини-казино"
     )
 
 
@@ -195,12 +188,9 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Казино монетка/кубик/слоты\n"
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
-        "• Коины / Рынок / Панель брокера\n"
-        "• +Эмитент / -Эмитент @user / Эмитенты\n"
-        "• УдалитьМонету <имя> — архивировать монету\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
-        "• /restart /help /cancel"
+        "• /restart /help"
     )
 
 
@@ -234,15 +224,6 @@ async def post_init(app: Application) -> None:
             first=60,
         )
         economy.register_jobs(app)
-        app.job_queue.run_daily(
-            coin_jobs.daily_dividend_distribution_job,
-            time=dtime(hour=1, minute=0, tzinfo=timezone.utc),
-        )
-        app.job_queue.run_repeating(
-            coin_jobs.hourly_price_history_job,
-            interval=3600,
-            first=300,
-        )
     else:
         logger.warning("JobQueue не инициализирован")
 
@@ -256,17 +237,6 @@ async def post_shutdown(app: Application) -> None:
     await ai.close_session()
     await db.close_db()
     logger.info("Bot stopped")
-
-
-async def _coins_input_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await coins.create_input(update, context):
-        return
-    if await coin_market.sell_price_input(update, context):
-        return
-
-
-async def _coins_photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await coins.photo_input(update, context)
 
 
 def build_app() -> Application:
@@ -286,7 +256,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_menu.cmd_help))
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("cancel", coins.cancel_create))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
     app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
@@ -447,37 +416,10 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
                                    actions.cmd_handshake))
 
-    # --- коины ---
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Коины(\s|$)"), coins.cmd_coins))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Рынок(\s|$)"), coin_market.cmd_market))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Панель\s+брокера(\s|$)"), coin_broker.cmd_broker))
-
-    # эмитенты
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Эмитент(\s|$)"), coins.cmd_emitter_add))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Эмитент(\s|$)"), coins.cmd_emitter_remove))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Эмитенты(\s|$)"), coins.cmd_emitters))
-
-    # архивирование монеты
-    app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^УдалитьМонету(\s|$)"),
-        coins.cmd_coin_archive,
-    ))
-
-    app.add_handler(CallbackQueryHandler(
-        coins.coin_callback,
-        pattern=r"^coin:(view|buy|chart|mine|main|new|sell_reserve)(:|$)",
-    ))
-    app.add_handler(CallbackQueryHandler(coins.tier_callback, pattern=r"^coin:tier:"))
-    app.add_handler(CallbackQueryHandler(coins.photo_decision_callback, pattern=r"^coin:photo_(ok|no)$"))
-    app.add_handler(CallbackQueryHandler(coin_market.market_callback, pattern=r"^cmkt:"))
-
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _coins_input_router), group=-2)
-    app.add_handler(MessageHandler(filters.PHOTO, _coins_photo_router), group=-2)
 
     if CHAT_ID:
         app.add_handler(MessageHandler(
