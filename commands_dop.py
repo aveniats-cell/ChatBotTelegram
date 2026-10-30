@@ -20,11 +20,11 @@ CREATE_BUY("Ударить топором", "user1 ударил(а) топоро
 CREATE_BUY("Пытать", "user1 пытает user2", pocket=71)
 CREATE_BUY("Разбить лицо", "user1 разбил(а) нос user2", pocket=71)
 CREATE_POCKET("Кенты", price=340, id=73)
-CREATE_BUY("Похлопать по спине", "user1 похлопал(а) по спине user2", pocket=71)
-CREATE_BUY("Курить", "user1 закурил(а) с  user2", pocket=71)
-CREATE_BUY("Сходить в бар", "user1 сходил(а) в бар с user2", pocket=71)
-CREATE_BUY("Поговорить по душам", "user1 и user2 говорят по душам", pocket=71)
-CREATE_BUY("Выпить вино", "user1  выпил(а) вино с user2", pocket=71)
-CREATE_BUY("Сходить в клуб", "user1 и user2 пошли в клуб", pocket=71)
+CREATE_BUY("Похлопать по спине", "user1 похлопал(а) по спине user2", pocket=73)
+CREATE_BUY("Курить", "user1 закурил(а) с  user2", pocket=73)
+CREATE_BUY("Сходить в бар", "user1 сходил(а) в бар с user2", pocket=73)
+CREATE_BUY("Поговорить по душам", "user1 и user2 говорят по душам", pocket=73)
+CREATE_BUY("Выпить вино", "user1  выпил(а) вино с user2", pocket=73)
+CREATE_BUY("Сходить в клуб", "user1 и user2 пошли в клуб", pocket=73)
 
 
