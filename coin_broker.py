@@ -1,4 +1,9 @@
-"""Панель брокера: портфель + кнопка «Создать монету»."""
+"""Панель брокера: портфель + кнопка «Создать монету».
+
+Доступ: админ ИЛИ эмитент (coin_emitters.active=1).
+Кнопка «Создать монету» показывается только эмитенту без активной монеты
+и без активной FSM.
+"""
 import os
 import logging
 from html import escape
@@ -13,7 +18,6 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
-import sss
 import coins
 
 logger = logging.getLogger(__name__)
@@ -32,9 +36,11 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not user or not chat or not msg:
         return
 
-    if not _is_admin(user.id):
+    # доступ: админ ИЛИ эмитент
+    allowed = _is_admin(user.id) or await db.emitter_is_allowed(chat.id, user.id)
+    if not allowed:
         try:
-            await msg.reply_text("⛔ Панель брокера доступна только создателю.")
+            await msg.reply_text("⛔ Панель брокера доступна только эмитентам.")
         except TelegramError:
             pass
         logger.info("broker DENY: user_id=%s chat=%s", user.id, chat.id)
@@ -71,13 +77,12 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"P&L: <b>{pnl_total:+d}</b>💰")
 
     rows = [[InlineKeyboardButton("🎒 Мои коины", callback_data="coin:mine")]]
-    allowed = await db.emitter_is_allowed(chat.id, user.id)
-    active = await db.user_active_coin_count(chat.id, user.id)
-    if (
-        allowed
-        and active < coins.MAX_ACTIVE_COINS_PER_USER
+    can_create = (
+        await db.emitter_is_allowed(chat.id, user.id)
+        and await db.user_active_coin_count(chat.id, user.id) < coins.MAX_ACTIVE_COINS_PER_USER
         and not coins._PENDING_CREATE.get(user.id)
-    ):
+    )
+    if can_create:
         rows.append([InlineKeyboardButton("➕ Создать монету", callback_data="coin:new")])
     rows.append([InlineKeyboardButton("🪙 Магазин коинов", callback_data="coin:main")])
 
