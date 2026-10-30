@@ -1,8 +1,5 @@
-"""Ежедневный доход коинов + часовая запись истории цен.
-
-Доход: min(yield_per_day, казна_доступно) делится между холдерами
-пропорционально их доле. Платятся только целые монеты. Источник — казна.
-Если в казне меньше — платим сколько есть (или 0, если меньше 1).
+"""Фоновые задачи по монетам.
+да
 """
 import logging
 from datetime import datetime, timezone
@@ -18,56 +15,82 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-async def daily_coin_income_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def daily_dividend_distribution_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в сутки раздать dividend_pool каждой активной монеты."""
     coins = await db.coins_list_active_all()
     if not coins:
         return
     for coin in coins:
         try:
-            await _payout_coin(coin)
+            await _distribute_dividends(coin)
         except Exception as e:
-            logger.warning("coin income %s: %s", coin.get("id"), e)
+            logger.warning("dividend %s: %s", coin.get("id"), e)
 
 
-async def _payout_coin(coin: dict) -> None:
-    chat_id = coin["chat_id"]
+async def _distribute_dividends(coin: dict) -> None:
     coin_id = coin["id"]
-    ypd = int(coin["yield_per_day"] or 0)
-    if ypd <= 0:
-        return
-    holders = await db.coin_holders_list(coin_id)
-    total_qty = sum(int(h["quantity"]) for h in holders)
-    if total_qty <= 0:
-        return
-    available = await db.treasury_get(chat_id)
-    pool = min(ypd, max(0, available))
+    pool = int(coin.get("dividend_pool") or 0)
     if pool <= 0:
         return
-    ok = await db.treasury_withdraw(chat_id, pool)
-    if not ok:
+
+    holders = await db.coin_holders_list(coin_id)
+    # исключаем создателя из получателей дивидендов
+    creator_id = int(coin["creator_id"])
+    holders = [
+        h for h in holders
+        if int(h["user_id"]) != creator_id and int(h["quantity"]) > 0
+    ]
+    total_qty = sum(int(h["quantity"]) for h in holders)
+    if total_qty <= 0:
+        # некому платить — пул остаётся
         return
-    day = _today()
+
+    # атомарно забираем весь пул; если кто-то успел — вернёт 0
+    taken = await db.coin_dividend_take(coin_id)
+    if taken <= 0:
+        return
+
     paid_total = 0
     for h in holders:
         qty = int(h["quantity"])
-        share = pool * qty // total_qty
+        share = taken * qty // total_qty
         if share <= 0:
             continue
-        ok2 = await db.add_balance(h["user_id"], share)
-        if ok2:
+        ok = await db.add_balance(h["user_id"], share)
+        if ok:
             paid_total += share
-            await db.coin_income_log_add(coin_id, h["user_id"], day, share)
-    leftover = pool - paid_total
+            try:
+                await db.coin_income_log_add(
+                    coin_id, h["user_id"], _today(), share,
+                )
+            except Exception as e:
+                logger.warning("dividend log %s/%s: %s",
+                               coin_id, h["user_id"], e)
+
+    leftover = taken - paid_total
     if leftover > 0:
-        await db.treasury_add(chat_id, leftover)
+        # возвращаем округлительный остаток в пул
+        try:
+            await db.coin_dividend_add(coin_id, leftover)
+        except Exception as e:
+            logger.warning("dividend leftover %s: %s", coin_id, e)
+
+    logger.info(
+        "dividend coin=%s pool=%s paid=%s leftover=%s holders=%s",
+        coin_id, taken, paid_total, leftover, len(holders),
+    )
 
 
 async def hourly_price_history_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Записать NAV-цену и оборот в историю (раз в час)."""
     import coins as coins_mod
     rows = await db.coins_list_active_all()
     for c in rows:
         try:
             price = coins_mod._current_price(c)
-            await db.coin_price_history_add(c["id"], price, int(c["sold"] or 0))
+            # в истории поле sold остаётся как есть (для графика),
+            # но пишем circulating, чтобы график отражал оборот
+            sold_or_circ = int(c.get("circulating") or c.get("sold") or 0)
+            await db.coin_price_history_add(c["id"], price, sold_or_circ)
         except Exception as e:
             logger.warning("price history %s: %s", c.get("id"), e)
