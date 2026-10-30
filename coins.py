@@ -1,14 +1,28 @@
-"""Магазин коинов.
+"""Магазин коинов (монеты как активы).
 
-Создание (только ССС/админ) — FSM на _PENDING_CREATE:
-  имя → описание → цена (0..10) → тираж (10/20/100/1000) → доход (0..100)
-  → фото (сжатие 512x512 JPEG) → Принять/Отказать → оплата → создание.
+FSM создания (только лицензированные эмитенты):
+  имя → описание → тираж (10/20/100/1000) → фото → принять → создать.
 
-Покупка: цена bonding curve, 6% в казну, 94% создателю.
-Команда «Коины» — список кнопок.
+Цена и доход НЕ вводятся:
+  - start_price = 1 (номинал);
+  - yield_per_day = 0 (доход = дивиденды от комиссий торговли);
+  - цена = NAV = max(1, reserve // circulating).
+
+Покупка на первичке:
+  - цена = NAV;
+  - fee = 0 при price <= 1, иначе max(1, price*6//100);
+  - to_reserve = price - fee идёт в резерв монеты (НЕ создателю);
+  - fee → казна чата;
+  - circulating += 1, sold += 1.
+
+Продажа в резерв (buyback):
+  - sell_price = max(1, NAV * (100 - 3) // 100) за 1 шт;
+  - списываем qty у холдера, reserve -= total, circulating -= qty;
+  - игроку + total.
 
 FIX #1: покупка монеты с ценой 0 больше не ломается.
-FIX #2: FSM создания привязан к владельцу (owner_id + актуальные права ССС).
+FIX #2: FSM создания привязан к владельцу (owner_id + актуальные права).
+FIX #3: whitelist эмитентов, лимит 1 активная монета, NAV, резерв, дивиденды.
 """
 import os
 import re
@@ -35,22 +49,18 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-FEE_REG = 10
-FEE_NAME = 5
-FEE_DESC = 2
-FEE_PHOTO = 5
-FEE_BASE = FEE_REG + FEE_NAME + FEE_DESC + FEE_PHOTO  # 22
-SECOND_COIN_FEE = 1000
+# ── FIX #3: лимиты и ставки
+MAX_ACTIVE_COINS_PER_USER = 1
+MARKET_FEE_PCT = 6           # комиссия первички
+SELL_DISCOUNT_PCT = 3        # дисконт при продаже в резерв
+NAV_MIN = 1                  # минимальная цена (номинал)
 
-TIER_FEE = {10: 0, 20: 1, 100: 10, 1000: 100}
-TIER_LIST = [10, 20, 100, 1000]
-
-MARKET_FEE_PCT = 6
 PHOTO_SIZE = (512, 512)
 PHOTO_QUALITY = 85
 NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 DESC_MAX = 300
-YIELD_MAX = 100
+
+TIER_LIST = [10, 20, 100, 1000]   # только варианты тиража, без платы
 
 
 def _is_admin(uid: int) -> bool:
@@ -71,30 +81,18 @@ def _fsm_owner_ok(user_id: int, st: dict | None) -> bool:
         return False
     if st.get("owner_id") != user_id:
         return False
-    return _is_sss(user_id)
+    # FIX #3: право = быть в whitelist эмитентов (а не просто ССС)
+    return True
 
 
 def _current_price(coin: dict) -> int:
-    """Bonding curve: +1 к цене за каждые 10% тиража."""
-    total = max(1, int(coin["total_supply"]))
-    step = max(1, total // 10)
-    sold = int(coin["sold"] or 0)
-    return int(coin["start_price"]) + sold // step
+    """FIX #3: NAV = reserve / circulating, минимум 1."""
+    circ = max(1, int(coin.get("circulating") or 0))
+    reserve = int(coin.get("reserve") or 0)
+    return max(NAV_MIN, reserve // circ)
 
 
-def _tier_fee(total_supply: int) -> int:
-    return TIER_FEE.get(total_supply, 0)
-
-
-def _total_fee(user: dict, total_supply: int) -> int:
-    base = FEE_BASE + _tier_fee(total_supply)
-    created = user.get("coins_created") if isinstance(user, dict) else None
-    if created is not None and int(created) >= 1:
-        base += SECOND_COIN_FEE
-    return base
-
-
-# FSM-состояние создания: user_id -> dict(step, chat_id, owner_id, ...)
+# ── FSM-состояние создания: user_id -> dict(step, chat_id, owner_id, ...)
 _PENDING_CREATE: dict[int, dict] = {}
 
 
@@ -129,17 +127,24 @@ async def _render_coin_card(coin: dict) -> tuple[str, InlineKeyboardMarkup]:
     cp = _current_price(coin)
     sold = int(coin["sold"] or 0)
     total = int(coin["total_supply"] or 0)
+    circ = int(coin.get("circulating") or 0)
+    reserve = int(coin.get("reserve") or 0)
+    div_pool = int(coin.get("dividend_pool") or 0)
     left = max(0, total - sold)
     text = (
         f"🪙 <b>{escape(coin['name'])}</b>\n"
         f"{escape(coin['description'])}\n\n"
-        f"Цена: <b>{cp}</b> 💰\n"
-        f"Куплено: <b>{sold}/{total}</b> (осталось <b>{left}</b>)\n"
-        f"Доход: <b>{coin['yield_per_day']}</b> 💰/сутки"
+        f"Цена (NAV): <b>{cp}</b> 💰\n"
+        f"Эмиссия: <b>{sold}/{total}</b> (осталось <b>{left}</b>)\n"
+        f"В обороте: <b>{circ}</b> шт\n"
+        f"Резерв монеты: <b>{reserve}</b> 💰\n"
+        f"Дивидендный пул: <b>{div_pool}</b> 💰"
     )
     rows = [
         [InlineKeyboardButton("💰 Купить", callback_data=f"coin:buy:{coin['id']}")],
-        [InlineKeyboardButton("📈 Посмотреть доход", callback_data=f"coin:chart:{coin['id']}")],
+        [InlineKeyboardButton("💵 Продать в резерв",
+                              callback_data=f"coin:sell_reserve:{coin['id']}")],
+        [InlineKeyboardButton("📈 График", callback_data=f"coin:chart:{coin['id']}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="coin:main")],
     ]
     return text, InlineKeyboardMarkup(rows)
@@ -200,6 +205,11 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _buy_coin(q, user, cid)
         return
 
+    if action == "sell_reserve" and len(parts) == 3:
+        cid = int(parts[2])
+        await _sell_to_reserve(q, user, cid)
+        return
+
     if action == "chart" and len(parts) == 3:
         cid = int(parts[2])
         await _send_chart(q, context, cid)
@@ -239,7 +249,7 @@ async def _buy_coin(q, user, cid: int) -> None:
     row = await db.get_user(user.id)
     bal = (row or {}).get("balance") or 0
 
-    # ── FIX #1: цена 0 — списывать нечего, покупка разрешена
+    # FIX #1: цена 0 — списывать нечего, покупка разрешена
     if price > 0:
         if bal < price:
             await q.answer(f"⛔ Нужно {price}, у тебя {bal}.", show_alert=True)
@@ -249,19 +259,15 @@ async def _buy_coin(q, user, cid: int) -> None:
             await q.answer("⛔ Не удалось списать.", show_alert=True)
             return
 
-    # ── FIX #1: комиссия и доля создателя не уходят в минус при price == 0
-    if price <= 0:
+    # FIX #1 + FIX #3: комиссия и резерв не уходят в минус
+    if price <= 1:
         fee = 0
-        to_creator = 0
+        to_reserve = price
     else:
         fee = max(1, price * MARKET_FEE_PCT // 100)
-        to_creator = price - fee
-
-    if to_creator > 0:
-        try:
-            await db.add_balance(coin["creator_id"], to_creator)
-        except Exception as e:
-            logger.warning("coin creator payout: %s", e)
+        to_reserve = price - fee
+        if to_reserve < 0:
+            to_reserve = 0
 
     if fee > 0:
         try:
@@ -269,13 +275,11 @@ async def _buy_coin(q, user, cid: int) -> None:
         except Exception as e:
             logger.warning("coin treasury: %s", e)
 
-    ok2 = await db.coin_buy_atomic(cid, user.id, price, to_creator)
+    ok2 = await db.coin_buy_atomic(cid, user.id, price, to_reserve)
     if not ok2:
-        # ── FIX #1: корректный откат ровно того, что успели начислить
+        # корректный откат
         if price > 0:
             await db.add_balance(user.id, price)
-        if to_creator > 0:
-            await db.add_balance(coin["creator_id"], -to_creator)
         if fee > 0:
             await db.treasury_add(q.message.chat.id, -fee)
         await q.answer("⚠️ Покупка не удалась, монеты возвращены.", show_alert=True)
@@ -297,6 +301,50 @@ async def _buy_coin(q, user, cid: int) -> None:
         pass
 
 
+async def _sell_to_reserve(q, user, cid: int) -> None:
+    """FIX #3: продажа в резерв монеты (buyback)."""
+    coin = await db.coin_get(cid)
+    if not coin:
+        await q.answer("Монета не найдена.", show_alert=True)
+        return
+    held = await db.coin_holder_get(cid, user.id)
+    qty = int((held or {}).get("quantity") or 0)
+    if qty <= 0:
+        await q.answer("У тебя нет этой монеты.", show_alert=True)
+        return
+    cp = _current_price(coin)
+    sell_unit = max(NAV_MIN, cp * (100 - SELL_DISCOUNT_PCT) // 100)
+    total = sell_unit * qty
+    reserve = int(coin.get("reserve") or 0)
+    if reserve < total:
+        await q.answer(
+            f"⛔ В резерве недостаточно денег: нужно {total}, есть {reserve}.",
+            show_alert=True,
+        )
+        return
+
+    ok = await db.coin_sell_to_reserve_atomic(cid, user.id, qty, total)
+    if not ok:
+        await q.answer("⚠️ Не удалось продать. Попробуй ещё раз.", show_alert=True)
+        return
+
+    await db.add_balance(user.id, total)
+    coin2 = await db.coin_get(cid)
+    try:
+        await db.coin_price_history_add(
+            cid, _current_price(coin2 or coin), int((coin2 or coin)["sold"])
+        )
+    except Exception as e:
+        logger.warning("coin history sell: %s", e)
+
+    await q.answer(f"✅ Продано {qty} шт за {total}💰")
+    text, kb = await _render_coin_card(coin2 or coin)
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError:
+        pass
+
+
 async def _send_chart(q, context, cid: int) -> None:
     import coin_graph
     coin = await db.coin_get(cid)
@@ -311,7 +359,7 @@ async def _send_chart(q, context, cid: int) -> None:
         coin["name"],
         [(h["ts"], h["price"], h["sold"]) for h in hist],
         _current_price(coin),
-        int(coin["yield_per_day"]),
+        0,  # yield_per_day больше не показываем
     )
     if not png:
         await q.answer("Нет данных для графика.", show_alert=True)
@@ -340,7 +388,7 @@ async def _render_my_coins(q, user) -> None:
             value = cp * int(h["quantity"])
             lines.append(
                 f"• {escape(coin['name'])}: <b>{h['quantity']}</b> шт · "
-                f"цена <b>{cp}</b>💰 · стоимость <b>{value}</b>💰"
+                f"NAV <b>{cp}</b>💰 · стоимость <b>{value}</b>💰"
             )
     lines.append("\n<b>Выпущенные:</b>")
     if not created:
@@ -348,8 +396,9 @@ async def _render_my_coins(q, user) -> None:
     else:
         for c in created:
             lines.append(
-                f"• {escape(c['name'])}: продано <b>{c['sold']}/{c['total_supply']}</b> · "
-                f"доход <b>{c['yield_per_day']}</b>💰/сутки"
+                f"• {escape(c['name'])}: эмиссия <b>{c['sold']}/{c['total_supply']}</b> · "
+                f"в обороте <b>{c.get('circulating', 0)}</b> · "
+                f"резерв <b>{c.get('reserve', 0)}</b>💰"
             )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="coin:main")]])
     try:
@@ -362,17 +411,6 @@ async def _render_my_coins(q, user) -> None:
 # ---------- создание ----------
 
 async def _start_create(q, user) -> None:
-    if not _is_sss(user.id):
-        logger.info("coin create DENY: user_id=%s not in SSS", user.id)
-        try:
-            await q.answer("Только члены ССС могут создавать коины.", show_alert=True)
-        except TelegramError as e:
-            logger.warning("coin create deny answer: %s", e)
-        return
-
-    logger.info("coin create START: user_id=%s chat=%s",
-                user.id, q.message.chat_id if q.message else "?")
-
     chat_id = q.message.chat_id if q.message else None
     if chat_id is None:
         try:
@@ -381,19 +419,46 @@ async def _start_create(q, user) -> None:
             pass
         return
 
-    # ── FIX #2: не начинаем вторую сессию поверх активной
-    existing = _PENDING_CREATE.get(user.id)
-    if existing is not None:
+    # FIX #3: только лицензированные эмитенты
+    if not await db.emitter_is_allowed(chat_id, user.id):
+        logger.info("coin create DENY: user_id=%s not in emitters", user.id)
         try:
             await q.answer(
-                "⚠️ У тебя уже идёт создание монеты. Заверши или отмени его (/cancel).",
+                "⛔ Эмиссия доступна только лицензированным эмитентам.",
+                show_alert=True,
+            )
+        except TelegramError as e:
+            logger.warning("coin create deny answer: %s", e)
+        return
+
+    # FIX #3: не больше 1 активной монеты
+    active = await db.user_active_coin_count(chat_id, user.id)
+    if active >= MAX_ACTIVE_COINS_PER_USER:
+        try:
+            await q.answer(
+                f"⛔ У тебя уже есть активная монета. Лимит: "
+                f"{MAX_ACTIVE_COINS_PER_USER}.",
                 show_alert=True,
             )
         except TelegramError:
             pass
         return
 
-    # ── FIX #2: owner_id в состоянии
+    # FIX #2: не начинаем вторую сессию поверх активной
+    existing = _PENDING_CREATE.get(user.id)
+    if existing is not None:
+        try:
+            await q.answer(
+                "⚠️ У тебя уже идёт создание монеты. Заверши или отмени (/cancel).",
+                show_alert=True,
+            )
+        except TelegramError:
+            pass
+        return
+
+    logger.info("coin create START: user_id=%s chat=%s", user.id, chat_id)
+
+    # FIX #2: owner_id в состоянии
     _PENDING_CREATE[user.id] = {
         "step": "name",
         "chat_id": chat_id,
@@ -406,7 +471,8 @@ async def _start_create(q, user) -> None:
             chat_id=chat_id,
             text=(
                 "🪙 <b>Создание монеты</b>\n\n"
-                "Шаг 1/6: напиши название (3–16 символов, A-Za-z0-9_).\n"
+                "Шаг 1/4: напиши название (3–16 символов, A-Za-z0-9_).\n"
+                "<i>Цена и доход не вводятся — они считаются автоматически.</i>\n"
                 "<i>Отмена: /cancel</i>"
             ),
             parse_mode=ParseMode.HTML,
@@ -436,7 +502,7 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if not user or not msg:
         return False
     st = _PENDING_CREATE.get(user.id)
-    # ── FIX #2: реагируем только на свой FSM и только с правом
+    # FIX #2: реагируем только на свой FSM
     if not _fsm_owner_ok(user.id, st):
         return False
 
@@ -460,7 +526,7 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         st["step"] = "desc"
         await msg.reply_text(
             f"Название: <b>{escape(text)}</b>\n\n"
-            f"Шаг 2/6: описание (до {DESC_MAX} символов).",
+            f"Шаг 2/4: описание (до {DESC_MAX} символов).",
             parse_mode=ParseMode.HTML,
         )
         return True
@@ -470,34 +536,14 @@ async def create_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             await msg.reply_text(f"⛔ Описание: 1–{DESC_MAX} символов.")
             return True
         st["description"] = text
-        st["step"] = "price"
-        await msg.reply_text("Шаг 3/6: цена (целое 0–10 монет).")
-        return True
-
-    if step == "price":
-        if not text.isdigit() or not (0 <= int(text) <= 10):
-            await msg.reply_text("⛔ Цена: целое 0–10.")
-            return True
-        st["start_price"] = int(text)
         st["step"] = "supply"
         rows = [[InlineKeyboardButton(
-            f"Тираж {t} — плата {TIER_FEE[t]}💰",
+            f"Тираж {t}",
             callback_data=f"coin:tier:{t}",
         )] for t in TIER_LIST]
         await msg.reply_text(
-            "Шаг 4/6: выбери тираж:",
+            "Шаг 3/4: выбери тираж:",
             reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return True
-
-    if step == "yield":
-        if not text.isdigit() or not (0 <= int(text) <= YIELD_MAX):
-            await msg.reply_text(f"⛔ Доход: целое 0–{YIELD_MAX}.")
-            return True
-        st["yield_per_day"] = int(text)
-        st["step"] = "photo"
-        await msg.reply_text(
-            "Шаг 6/6: пришли фото для монеты. Оно будет сжато в 512×512 JPEG."
         )
         return True
 
@@ -527,25 +573,21 @@ async def tier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await q.answer()
         return
 
-    # ── FIX #2: кнопку тиража может нажать только владелец FSM и только ССС
     st = _PENDING_CREATE.get(user.id)
     if not _fsm_owner_ok(user.id, st):
         await q.answer("⛔ Это не твоя сессия создания.", show_alert=True)
         return
 
     t = int(parts[2])
-    if t not in TIER_FEE:
+    if t not in TIER_LIST:
         await q.answer("Неверный тираж.", show_alert=True)
         return
     st["total_supply"] = t
-    st["step"] = "yield"
-    row = await db.get_user(user.id)
-    fee = _total_fee(row or {}, t)
+    st["step"] = "photo"
     try:
         await q.edit_message_text(
-            f"Тираж: <b>{t}</b>\n"
-            f"Полная плата: <b>{fee}</b>💰 (в казну)\n\n"
-            f"Шаг 5/6: доход в сутки (целое 0–{YIELD_MAX}).",
+            f"Тираж: <b>{t}</b>\n\n"
+            f"Шаг 4/4: пришли фото для монеты. Оно будет сжато в 512×512 JPEG.",
             parse_mode=ParseMode.HTML,
         )
     except TelegramError as e:
@@ -560,7 +602,6 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     if not user or not msg:
         return False
     st = _PENDING_CREATE.get(user.id)
-    # ── FIX #2: только свой FSM, только ССС, только шаг photo
     if not _fsm_owner_ok(user.id, st) or st.get("step") != "photo":
         return False
     photo = msg.photo[-1] if msg.photo else None
@@ -618,7 +659,6 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
     if not q or not user:
         return
 
-    # ── FIX #2: только владелец FSM и только ССС
     st = _PENDING_CREATE.get(user.id)
     if not _fsm_owner_ok(user.id, st):
         await q.answer("⛔ Это не твоя сессия создания.", show_alert=True)
@@ -640,22 +680,25 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
         await q.answer()
         return
     if q.data == "coin:photo_ok":
-        row = await db.get_user(user.id)
-        bal = (row or {}).get("balance") or 0
-        total_fee = _total_fee(row or {}, st["total_supply"])
-        if bal < total_fee:
-            await q.answer(f"⛔ Нужно {total_fee}, у тебя {bal}.", show_alert=True)
+        # FIX #3: повторная проверка лимита (на случай гонки)
+        active = await db.user_active_coin_count(st["chat_id"], user.id)
+        if active >= MAX_ACTIVE_COINS_PER_USER:
             _PENDING_CREATE.pop(user.id, None)
+            await q.answer(
+                f"⛔ У тебя уже есть активная монета. Лимит: "
+                f"{MAX_ACTIVE_COINS_PER_USER}.",
+                show_alert=True,
+            )
             return
-        ok = await db.take_balance_atomic(user.id, total_fee)
-        if not ok:
-            await q.answer("⛔ Не удалось списать.", show_alert=True)
+        # повторная проверка whitelist (могли снять права в процессе)
+        if not await db.emitter_is_allowed(st["chat_id"], user.id):
             _PENDING_CREATE.pop(user.id, None)
+            await q.answer(
+                "⛔ Ты больше не эмитент. Создание отменено.",
+                show_alert=True,
+            )
             return
-        try:
-            await db.treasury_add(st["chat_id"], total_fee)
-        except Exception as e:
-            logger.warning("coin treasury create: %s", e)
+
         sent = await context.bot.send_photo(
             chat_id=st["chat_id"],
             photo=InputFile(io.BytesIO(st["photo_bytes"]), filename="coin.jpg"),
@@ -667,16 +710,17 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
             pass
         cid = await db.coin_create(
             st["chat_id"], user.id, st["name"], st["description"],
-            st["start_price"], st["total_supply"], st["yield_per_day"],
+            1,                # start_price = 1 (номинал)
+            st["total_supply"],
+            0,                # yield_per_day = 0 (доход = дивиденды)
             file_id, st["photo_hash"],
         )
         _PENDING_CREATE.pop(user.id, None)
         if not cid:
-            await db.add_balance(user.id, total_fee)
-            await q.answer("⚠️ Не удалось создать монету, монеты возвращены.", show_alert=True)
+            await q.answer("⚠️ Не удалось создать монету.", show_alert=True)
             return
         try:
-            await db.coin_price_history_add(cid, st["start_price"], 0)
+            await db.coin_price_history_add(cid, 1, 0)
         except Exception as e:
             logger.warning("coin history create: %s", e)
         await db.inc_user_counter_coin_created(user.id)
@@ -689,8 +733,9 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
                 chat_id=st["chat_id"],
                 text=(
                     f"✅ Монета <b>{escape(st['name'])}</b> создана!\n"
-                    f"Тираж: <b>{st['total_supply']}</b> · Цена: <b>{st['start_price']}</b>💰\n"
-                    f"Доход: <b>{st['yield_per_day']}</b>💰/сутки"
+                    f"Тираж: <b>{st['total_supply']}</b>\n"
+                    f"Стартовая цена: <b>1</b>💰 (NAV)\n"
+                    f"Доход: дивиденды от комиссий торговли"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -699,3 +744,78 @@ async def photo_decision_callback(update: Update, context: ContextTypes.DEFAULT_
         await q.answer()
         return
     await q.answer()
+
+
+# ---------- эмитенты (админ) ----------
+
+async def cmd_emitters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
+        return
+    ids = await db.emitter_list(chat.id)
+    if not ids:
+        await msg.reply_text("Эмитентов нет.")
+        return
+    lines = ["📜 <b>Эмитенты монет</b>"]
+    for uid in ids:
+        name = str(uid)
+        try:
+            c = await context.bot.get_chat(uid)
+            name = c.first_name or c.username or str(uid)
+        except TelegramError:
+            pass
+        lines.append(f"• {escape(name)}")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_emitter_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Только админ.")
+        return
+    import utils
+    text = (msg.text or "")
+    clean = re.sub(r"(?i)^\+Эмитент\s*", "", text).strip()
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажи @username или сделай реплай.")
+        return
+    uid, name = target
+    ok = await db.emitter_add(chat.id, uid, user.id)
+    if not ok:
+        await msg.reply_text("⚠️ Не удалось выдать лицензию.")
+        return
+    await msg.reply_text(
+        f"✅ {escape(str(name))} теперь эмитент.", parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_emitter_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Только админ.")
+        return
+    import utils
+    text = (msg.text or "")
+    clean = re.sub(r"(?i)^[-–−]Эмитент\s*", "", text).strip()
+    target = await utils.resolve_target(update, context, clean)
+    if not target:
+        await msg.reply_text("Укажи @username или сделай реплай.")
+        return
+    uid, name = target
+    ok = await db.emitter_remove(chat.id, uid)
+    if not ok:
+        await msg.reply_text("⚠️ Не удалось снять лицензию.")
+        return
+    await msg.reply_text(
+        f"✅ {escape(str(name))} больше не эмитент.", parse_mode=ParseMode.HTML,
+    )
