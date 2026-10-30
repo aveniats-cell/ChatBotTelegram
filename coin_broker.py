@@ -1,4 +1,8 @@
-"""Панель брокера: портфель + кнопка «Создать монету» (только создатель/ССС)."""
+"""Панель брокера: портфель + кнопка «Создать монету» (только создатель/ССС).
+
+FIX #2: кнопка «Создать монету» скрывается, если у юзера уже есть
+активная сессия создания (_PENDING_CREATE).
+"""
 import os
 import logging
 from html import escape
@@ -79,7 +83,8 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"P&L: <b>{pnl_total:+d}</b>💰")
 
     rows = [[InlineKeyboardButton("🎒 Мои коины", callback_data="coin:mine")]]
-    if _is_sss(user.id):
+    # ── FIX #2: не показываем «Создать», если сессия уже идёт
+    if _is_sss(user.id) and not coins._PENDING_CREATE.get(user.id):
         rows.append([InlineKeyboardButton("➕ Создать монету", callback_data="coin:new")])
     rows.append([InlineKeyboardButton("🪙 Магазин коинов", callback_data="coin:main")])
 
