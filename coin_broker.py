@@ -1,4 +1,4 @@
-"""Панель брокера: портфель + кнопка «Создать монету» (для ССС)."""
+"""Панель брокера: портфель + кнопка «Создать монету» (только создатель/ССС)."""
 import os
 import logging
 from html import escape
@@ -26,7 +26,10 @@ def _is_admin(uid: int) -> bool:
 
 
 def _is_sss(uid: int) -> bool:
-    return _is_admin(uid) or sss.is_sss_member(uid)
+    try:
+        return _is_admin(uid) or sss.is_sss_member(uid)
+    except Exception:
+        return _is_admin(uid)
 
 
 async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -34,6 +37,15 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg:
+        return
+
+    # ПРИВАТ: панель брокера только для создателя (ADMIN_ID).
+    if not _is_admin(user.id):
+        try:
+            await msg.reply_text("⛔ Панель брокера доступна только создателю.")
+        except TelegramError:
+            pass
+        logger.info("broker DENY: user_id=%s chat=%s", user.id, chat.id)
         return
 
     bought = await db.coin_holders_by_user(chat.id, user.id)
@@ -71,8 +83,11 @@ async def cmd_broker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         rows.append([InlineKeyboardButton("➕ Создать монету", callback_data="coin:new")])
     rows.append([InlineKeyboardButton("🪙 Магазин коинов", callback_data="coin:main")])
 
-    await msg.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    try:
+        await msg.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except TelegramError as e:
+        logger.warning("broker send: %s", e)
