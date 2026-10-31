@@ -29,6 +29,7 @@ import sss
 import complaints
 import warns
 import aura
+import aura_admin
 import awards
 import actions
 import ai
@@ -265,6 +266,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
+    app.add_handler(CommandHandler("auraplush", aura_admin.cmd_aura_plush))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
     app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
 
