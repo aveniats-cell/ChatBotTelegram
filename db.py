@@ -122,6 +122,21 @@ async def _create_tables() -> None:
         )
     """)
     await _exec("""
+        CREATE TABLE IF NOT EXISTS reputation_votes (
+            voter_id  INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            vote      INTEGER NOT NULL CHECK (vote IN (-1, 1)),
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (voter_id, target_id)
+        )
+    """)
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS reputation_cooldowns (
+            user_id INTEGER PRIMARY KEY,
+            last_vote_at INTEGER NOT NULL
+        )
+    """)
+    await _exec("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             user_id      INTEGER PRIMARY KEY,
             is_subscribed INTEGER NOT NULL DEFAULT 0,
@@ -2787,19 +2802,101 @@ async def shop_user_has_pocket(chat_id: int, user_id: int, pocket_id: int) -> bo
 
 async def shop_purchase_add(chat_id: int, user_id: int, pocket_id: int,
                             price: int) -> bool:
-    """Только записывает покупку. Списание выполняется в shop.py."""
+    """сначала списываем деньги, потом пишем покупку.
+    При сбое — возвращаем деньги. UNIQUE защищает от двойной покупки."""
     if price < 0:
         return False
 
-    # UNIQUE(chat_id, user_id, pocket_id) защищает от повторной покупки.
-    rs = await _exec(
-        """INSERT OR IGNORE INTO shop_purchases
-           (chat_id, user_id, pocket_id, price_paid)
-           VALUES (?, ?, ?, ?)""",
-        [chat_id, user_id, pocket_id, price],
-    )
-
-    if getattr(rs, "error", False):
+    # если уже куплено — не списываем
+    if await shop_user_has_pocket(chat_id, user_id, pocket_id):
         return False
 
-    return (getattr(rs, "rows_affected", 0) or 0) > 0
+    # 1. списываем деньги (если цена > 0)
+    if price > 0:
+        rs_bal = await _exec(
+            """UPDATE users
+               SET balance = COALESCE(balance, 10) - ?
+               WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+            [price, user_id, price],
+        )
+        if getattr(rs_bal, "error", False) or (getattr(rs_bal, "rows_affected", 0) or 0) == 0:
+            return False
+
+    # 2. пишем покупку (INSERT OR IGNORE — UNIQUE по (chat,user,pocket))
+    rs = await _exec(
+        "INSERT OR IGNORE INTO shop_purchases "
+        "(chat_id, user_id, pocket_id, price_paid) VALUES (?, ?, ?, ?)",
+        [chat_id, user_id, pocket_id, price],
+    )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        # откат денег (если списывали)
+        if price > 0:
+            await _exec(
+                "UPDATE users SET balance = COALESCE(balance, 10) + ? WHERE user_id = ?",
+                [price, user_id],
+            )
+        return False
+    return True
+
+# ---------- global user reputation ----------
+
+async def reputation_cast_vote(voter_id: int, target_id: int, vote: int,
+                                now_ts: int, cooldown_seconds: int = 10) -> str:
+    """Глобальный голос: один голос voter -> target во всех чатах.
+
+    Возвращает: created, changed, same, cooldown, error.
+    Cooldown фиксируется атомарным UPSERT в общей базе Turso.
+    """
+    if voter_id <= 0 or target_id <= 0 or voter_id == target_id or vote not in (-1, 1):
+        return "error"
+
+    old = await _exec(
+        "SELECT vote FROM reputation_votes WHERE voter_id=? AND target_id=?",
+        [voter_id, target_id],
+    )
+    if getattr(old, "error", False):
+        return "error"
+    if old.rows and int(old.rows[0][0]) == vote:
+        return "same"
+
+    allowed_after = int(now_ts) - int(cooldown_seconds)
+    gate = await _exec(
+        """INSERT INTO reputation_cooldowns (user_id, last_vote_at) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_vote_at=excluded.last_vote_at
+           WHERE reputation_cooldowns.last_vote_at <= ?""",
+        [voter_id, int(now_ts), allowed_after],
+    )
+    if getattr(gate, "error", False):
+        return "error"
+    if (getattr(gate, "rows_affected", 0) or 0) == 0:
+        return "cooldown"
+
+    result = await _exec(
+        """INSERT INTO reputation_votes (voter_id, target_id, vote, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(voter_id, target_id) DO UPDATE SET
+             vote=excluded.vote, updated_at=excluded.updated_at""",
+        [voter_id, target_id, vote, int(now_ts)],
+    )
+    if getattr(result, "error", False):
+        return "error"
+    return "changed" if old.rows else "created"
+
+
+async def reputation_get(target_id: int) -> dict:
+    rs = await _exec(
+        """SELECT
+             SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END)
+           FROM reputation_votes WHERE target_id=?""",
+        [target_id],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return {"plus": 0, "minus": 0, "score": 5.5, "total": 0}
+    plus = int(rs.rows[0][0] or 0)
+    minus = int(rs.rows[0][1] or 0)
+    total = plus + minus
+    # Сглаживание: три условных нейтральных голоса по 5.5 балла.
+    score = (16.5 + 10 * plus + 1 * minus) / (3 + total)
+    return {"plus": plus, "minus": minus, "score": round(max(1.0, min(10.0, score)), 1),
+            "total": total}
