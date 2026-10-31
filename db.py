@@ -1966,15 +1966,20 @@ async def aura_droch(chat_id: int, user_id: int) -> bool:
 
 
 async def aura_add_points(chat_id: int, user_id: int, amount: int) -> bool:
-    """Атомарно начислить указанное количество ауры пользователю в чате."""
-    if chat_id == 0 or user_id <= 0 or amount <= 0:
+    """Атомарно изменить ауру: положительное число добавляет, отрицательное списывает.
+
+    Значение ауры не может стать отрицательным: при списании сверх баланса
+    оно устанавливается в 0. last_droch_at не меняется.
+    """
+    if chat_id == 0 or user_id <= 0 or amount == 0:
         return False
+    initial_value = max(0, amount)
     rs = await _exec(
         """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
            VALUES (?, ?, ?, NULL)
            ON CONFLICT(chat_id, user_id) DO UPDATE SET
-             value = aura.value + excluded.value""",
-        [chat_id, user_id, amount],
+             value = MAX(0, aura.value + ?)""",
+        [chat_id, user_id, initial_value, amount],
     )
     if getattr(rs, "error", False):
         return False
