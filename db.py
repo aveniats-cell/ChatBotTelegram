@@ -1965,6 +1965,22 @@ async def aura_droch(chat_id: int, user_id: int) -> bool:
     return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
+async def aura_add_points(chat_id: int, user_id: int, amount: int) -> bool:
+    """Атомарно начислить указанное количество ауры пользователю в чате."""
+    if chat_id == 0 or user_id <= 0 or amount <= 0:
+        return False
+    rs = await _exec(
+        """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
+           VALUES (?, ?, ?, NULL)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             value = aura.value + excluded.value""",
+        [chat_id, user_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
 async def aura_get(chat_id: int, user_id: int) -> Optional[dict]:
     rs = await _exec(
         """SELECT value, last_droch_at FROM aura
