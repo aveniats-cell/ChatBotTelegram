@@ -40,6 +40,7 @@ import command_registry   # noqa: F401 — должен идти до commands_d
 import commands_dop       # noqa: F401 — регистрирует команды в реестре
 import commands_dop_handlers
 import shop
+import reputation
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -321,6 +322,15 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+браки(\s|$)"), wedding.cmd_marriage_top))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
+
+    # ── глобальная репутация
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Репутация(?:\s+.*)?$"), reputation.cmd_reputation,
+    ))
+    # Голосуем только точным сообщением + или - в ответ на сообщение пользователя.
+    app.add_handler(MessageHandler(
+        filters.REPLY & filters.Regex(r"^[+-]$"), reputation.cmd_vote,
+    ))
 
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
                                    profile.cmd_profile))
