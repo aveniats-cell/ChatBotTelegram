@@ -157,24 +157,25 @@ async def _buy_pocket(q, user, pocket_id: int) -> None:
         return
 
     price = int(pocket["price"])
-    # Списание и запись покупки выполняются только в db.shop_purchase_add().
-    # Раньше баланс уменьшался и здесь, и повторно внутри db.shop_purchase_add().
-    ok = await db.shop_purchase_add(chat.id, user.id, pocket_id, price)
+    row = await db.get_user(user.id)
+    bal = (row or {}).get("balance") or 0
+    if bal < price:
+        await q.answer(
+            f"⛔ Не хватает монет: нужно {price}, у тебя {bal}.\n"
+            f"Возьми кредит (+Кредит 50) или поднакопи.",
+            show_alert=True,
+        )
+        return
+
+    ok = await db.take_balance_atomic(user.id, price)
     if not ok:
-        row = await db.get_user(user.id)
-        bal = int((row or {}).get("balance") or 0)
-        if bal < price:
-            await q.answer(
-                f"⛔ Не хватает монет: нужно {price}, у тебя {bal}.\\n"
-                f"Возьми кредит (+Кредит 50) или поднакопи.",
-                show_alert=True,
-            )
-        else:
-            await q.answer(
-                "⚠️ Покупка не завершена: пакет уже куплен или произошла ошибка. "
-                "Проверь баланс перед повторной попыткой.",
-                show_alert=True,
-            )
+        await q.answer("⛔ Не удалось списать.", show_alert=True)
+        return
+
+    ok2 = await db.shop_purchase_add(chat.id, user.id, pocket_id, price)
+    if not ok2:
+        await db.add_balance(user.id, price)
+        await q.answer("⚠️ Не удалось выдать пакет, монеты возвращены.", show_alert=True)
         return
 
     try:
