@@ -165,18 +165,35 @@ async def _pay_pending_salary(chat_id: int, user_id: int, day: str) -> None:
     if taken <= 0:
         return
 
-    coins = await db.pay_salary_from_treasury(chat_id, user_id, day, taken)
-    if coins is None:
-        logger.info(
-            "salary: не выплачено, возврат в pending_salary (chat=%s user=%s frac=%s)",
-            chat_id, user_id, taken,
+    payout = await db.pay_salary_from_treasury(chat_id, user_id, day, taken)
+    if payout is None:
+        # DB-функция не меняет pending_salary: при неудаче возвращаем весь
+        # снятый объём ровно один раз здесь.
+        restored = await db.return_pending_salary(chat_id, user_id, day, taken)
+        if not restored:
+            logger.error(
+                "salary: не удалось вернуть pending_salary "
+                "(chat=%s user=%s day=%s frac=%s)",
+                chat_id, user_id, day, taken,
+            )
+        return
+
+    coins, unpaid_frac = payout
+    if unpaid_frac > 0:
+        restored = await db.return_pending_salary(
+            chat_id, user_id, day, unpaid_frac,
         )
-        await db.return_pending_salary(chat_id, user_id, day, taken)
-    else:
-        logger.info(
-            "salary: выплачено coins=%s (chat=%s user=%s frac_was=%s)",
-            coins, chat_id, user_id, taken,
-        )
+        if not restored:
+            logger.error(
+                "salary: не удалось сохранить невыплаченные сотые "
+                "(chat=%s user=%s day=%s frac=%s)",
+                chat_id, user_id, day, unpaid_frac,
+            )
+
+    logger.info(
+        "salary: выплачено coins=%s, pending=%s (chat=%s user=%s frac_was=%s)",
+        coins, unpaid_frac, chat_id, user_id, taken,
+    )
 
 
 async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
