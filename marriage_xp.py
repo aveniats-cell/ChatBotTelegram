@@ -1,12 +1,7 @@
-"""XP для брака: начисляется, когда супруги взаимодействуют.
+"""Начисление XP браку за взаимодействия супругов.
 
-Логика:
-  - action даёт XP только если цель — супруг(а) актора;
-  - XP складывается в marriages.xp;
-  - уровень брака = дни_с_свадьбы + 1 + xp // XP_PER_LEVEL.
-
-Не импортирует wedding.py, чтобы не было цикла. XP_PER_LEVEL
-дублируется здесь и в wedding.py — держи их одинаковыми.
+XP добавляется только если цель действия — действующий супруг/супруга
+автора в том же чате. Уровень брака по-прежнему рассчитывается в wedding.py.
 """
 import logging
 
@@ -16,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 XP_PER_LEVEL = 50
 
-# Сколько XP даёт действие супругу (если цель — супруг(а)).
+# Стандартные действия, уже поддерживавшиеся ботом.
 XP_BY_ACTION = {
     "kiss": 2,
     "kiss_deep": 3,
@@ -35,35 +30,48 @@ XP_BY_ACTION = {
 }
 
 
+async def award_custom_if_spouse(
+    chat_id: int, actor_id: int, target_id: int, xp: int,
+) -> int:
+    """Начислить произвольное число XP за кастомную команду.
+
+    Возвращает фактически начисленное число XP или 0, если это не супруг(а),
+    сумма некорректна либо произошла ошибка.
+    """
+    try:
+        amount = int(xp)
+    except (TypeError, ValueError):
+        return 0
+    if amount <= 0 or actor_id == target_id:
+        return 0
+
+    try:
+        marriage = await db.find_active_marriage(chat_id, actor_id)
+        if not marriage:
+            return 0
+
+        if int(marriage["user1_id"]) == actor_id:
+            spouse_id = int(marriage["user2_id"])
+        elif int(marriage["user2_id"]) == actor_id:
+            spouse_id = int(marriage["user1_id"])
+        else:
+            return 0
+
+        if spouse_id != target_id:
+            return 0
+
+        ok = await db.marriage_add_xp(chat_id, actor_id, amount)
+        return amount if ok else 0
+    except Exception as e:
+        logger.warning("award_custom_if_spouse failed: %s", e)
+        return 0
+
+
 async def award_if_spouse(
     chat_id: int, actor_id: int, target_id: int, action: str,
 ) -> int:
-    """Начисляет XP браку, если target_id — супруг(а) actor_id.
-
-    Возвращает начисленное XP (0, если не супруг или ошибка).
-    """
+    """Начислить стандартное XP по ключу действия, если цель — супруг(а)."""
     xp = XP_BY_ACTION.get(action, 0)
     if xp <= 0:
         return 0
-    if actor_id == target_id:
-        return 0
-
-    try:
-        m = await db.find_active_marriage(chat_id, actor_id)
-    except Exception as e:
-        logger.warning("award_if_spouse find: %s", e)
-        return 0
-    if not m:
-        return 0
-
-    spouse_id = m["user2_id"] if m["user1_id"] == actor_id else m["user1_id"]
-    if spouse_id != target_id:
-        return 0
-
-    try:
-        ok = await db.marriage_add_xp(chat_id, actor_id, xp)
-    except Exception as e:
-        logger.warning("award_if_spouse add_xp: %s", e)
-        return 0
-
-    return xp if ok else 0
+    return await award_custom_if_spouse(chat_id, actor_id, target_id, xp)
