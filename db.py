@@ -424,6 +424,7 @@ async def _create_tables() -> None:
 async def _migrate_tables() -> None:
     adds = [
         ("users", "balance", "INTEGER NOT NULL DEFAULT 10"),
+        ("users", "ai_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "sss_member", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "mutes_issued", "INTEGER NOT NULL DEFAULT 0"),
@@ -549,7 +550,7 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: str) ->
 async def get_user(user_id: int) -> Optional[dict]:
     rs = await _exec(
         """SELECT user_id, username, first_name, created_at,
-                  balance, credit, sss_member,
+                  balance, ai_tokens, credit, sss_member,
                   mutes_issued, reports_made, courts_held,
                   tictactoe_wins, tictactoe_losses, tictactoe_draws,
                   credit_taken_day, salary_today, salary_day, salary_frac,
@@ -561,12 +562,60 @@ async def get_user(user_id: int) -> Optional[dict]:
         return None
     r = rs.rows[0]
     keys = ["user_id", "username", "first_name", "created_at",
-            "balance", "credit", "sss_member",
+            "balance", "ai_tokens", "credit", "sss_member",
             "mutes_issued", "reports_made", "courts_held",
             "tictactoe_wins", "tictactoe_losses", "tictactoe_draws",
             "credit_taken_day", "salary_today", "salary_day", "salary_frac",
             "avatar_file_id", "coins_created"]
     return dict(zip(keys, r))
+
+
+async def get_ai_tokens(user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(ai_tokens, 0) FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return 0
+    return max(0, int(rs.rows[0][0] or 0))
+
+
+async def consume_ai_token(user_id: int) -> bool:
+    """Атомарно списывает один токен, не допуская отрицательного баланса."""
+    rs = await _exec(
+        """UPDATE users SET ai_tokens = COALESCE(ai_tokens, 0) - 1
+           WHERE user_id = ? AND COALESCE(ai_tokens, 0) >= 1""",
+        [user_id],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def refund_ai_token(user_id: int) -> bool:
+    rs = await _exec(
+        """INSERT INTO users (user_id, ai_tokens) VALUES (?, 1)
+           ON CONFLICT(user_id) DO UPDATE SET
+             ai_tokens = COALESCE(users.ai_tokens, 0) + 1""",
+        [user_id],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def buy_ai_tokens(user_id: int, price: int, amount: int) -> bool:
+    """Атомарно списывает монеты и зачисляет токены одной операцией."""
+    if price <= 0 or amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) - ?,
+               ai_tokens = COALESCE(ai_tokens, 0) + ?
+           WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+        [price, amount, user_id, price],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def get_user_by_username(username: str) -> Optional[int]:
