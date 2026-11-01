@@ -481,6 +481,7 @@ def build_app() -> Application:
     # ── динамические команды из commands_dop.py
     commands_dop_handlers.register(app)
 
+    if CHAT_ID:
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
