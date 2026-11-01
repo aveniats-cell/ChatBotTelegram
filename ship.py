@@ -11,6 +11,7 @@ from cachetools import TTLCache
 
 import resolver
 import ai
+import db
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,24 @@ async def _generate_phrase(a_id: int, a_name: str, b_id: int, b_name: str) -> st
         return cached
 
     prompt = _build_ai_prompt(a_name, b_name)
+    reserved = ai.estimate_request_tokens(prompt, a_id)
+    if not await db.reserve_ai_tokens(a_id, reserved):
+        return _fallback_phrase(a_name, b_name)
+
     try:
-        answer = await ai.ask_ai(prompt, user_id=a_id)
+        result = await ai.ask_ai(prompt, user_id=a_id)
     except Exception as e:
         logger.warning("ship ai: %s", e)
-        answer = None
+        result = None
 
+    if not result:
+        await db.refund_ai_tokens(a_id, reserved)
+        return _fallback_phrase(a_name, b_name)
+
+    used = max(1, int(result.get("usage") or reserved))
+    if not await db.settle_ai_tokens(a_id, reserved, used):
+        logger.warning("ship AI token settlement failed for user %s", a_id)
+    answer = str(result.get("text") or "")
     if not answer:
         return _fallback_phrase(a_name, b_name)
 
