@@ -107,21 +107,35 @@ async def _run_ai(user, msg, prompt: str) -> None:
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
+
+    # Токен резервируется до обращения к API, при ошибке возвращается.
+    if not await db.consume_ai_token(user.id):
+        balance = await db.get_ai_tokens(user.id)
+        await msg.reply_text(
+            "🧠 У тебя закончились токены ИИ.\n"
+            "Купи их в «Магазине» → «Токены ИИ».\n"
+            f"Остаток: {balance} токенов."
+        )
+        return
+
     thinking = await msg.reply_text("🤔 Думаю…")
     answer = await ai.ask_ai(prompt, user_id=user.id)
     if not answer:
+        await db.refund_ai_token(user.id)
         try:
-            await thinking.edit_text("⚠️ ИИ не ответил. Попробуй позже.")
+            await thinking.edit_text("⚠️ ИИ не ответил. Токен возвращён, попробуй позже.")
         except Exception:
             pass
         return
+
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
+    left = await db.get_ai_tokens(user.id)
     try:
-        await thinking.edit_text(answer)
+        await thinking.edit_text(f"{answer}\n\n🧠 Токенов осталось: {left}")
     except Exception:
         try:
-            await msg.reply_text(answer)
+            await msg.reply_text(f"{answer}\n\n🧠 Токенов осталось: {left}")
         except Exception:
             pass
 
@@ -131,25 +145,21 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
+
     text = (msg.text or "").strip()
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if msg.reply_to_message.from_user.id == context.bot.id:
-            prompt = _AI_WORD.sub("", text).strip()
-            if not prompt:
-                await msg.reply_text("Напиши вопрос реплаем.")
-                return
-            await _run_ai(user, msg, prompt)
-            return
-    m = _AI_WORD.match(text)
-    if not m:
+    match = _AI_WORD.match(text)
+    if not match:
         return
-    prompt = text[m.end():].strip()
+
+    prompt = text[match.end():].strip()
     if not prompt:
         await msg.reply_text(
-            "Формат: <code>ИИ Привет</code> или реплай на сообщение бота.",
+            "Формат: <code>ИИ Привет</code> или <code>Браини Как дела?</code>.\n"
+            "Один запрос стоит 1 токен. Токены можно купить в «Магазине».",
             parse_mode=ParseMode.HTML,
         )
         return
+
     await _run_ai(user, msg, prompt)
 
 
@@ -452,11 +462,6 @@ def build_app() -> Application:
     commands_dop_handlers.register(app)
 
     if CHAT_ID:
-        app.add_handler(MessageHandler(
-            filters.REPLY & filters.Chat(chat_id=CHAT_ID),
-            cmd_ai,
-        ))
-
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
