@@ -83,10 +83,6 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _render_main(q, user) -> None:
     pockets = await db.shop_pockets_list(q.message.chat.id)
-    if not pockets:
-        await q.edit_message_text("Магазин пока пуст.")
-        await q.answer()
-        return
     rows = []
     for p in pockets:
         if not p["active"]:
@@ -98,7 +94,7 @@ async def _render_main(q, user) -> None:
     rows.append([InlineKeyboardButton("🧠 Купить ИИ-токены", callback_data="shop:tokens")])
     try:
         await q.edit_message_text(
-            "🛒 <b>Магазин</b>\nВыбери пакет:",
+            "🛒 <b>Магазин</b>\nВыбери пакет команд или ИИ-токены:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -120,7 +116,7 @@ async def _render_tokens(q, user, answer: bool = True) -> None:
     rows.append([InlineKeyboardButton("⬅️ Назад в магазин", callback_data="shop:main")])
     try:
         await q.edit_message_text(
-            f"🧠 <b>ИИ-токены</b>\\nНа балансе: <b>{balance}</b>\\n\\n"
+            f"🧠 <b>ИИ-токены</b>\nНа балансе: <b>{balance}</b>\n\n"
             "Выбери набор. Токены списываются по фактическому расходу ИИ.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
