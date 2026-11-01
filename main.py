@@ -83,7 +83,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
         "Казино — мини-казино\n"
-        "Магазин — пакеты команд и ИИ-токены\\n"
+        "Магазин — пакеты команд и ИИ-токены\n"
         "Токены — баланс ИИ-токенов"
     )
 
@@ -113,7 +113,7 @@ async def _run_ai(user, msg, prompt: str) -> None:
     if not await db.reserve_ai_tokens(user.id, reserved):
         balance = await db.get_ai_tokens(user.id)
         await msg.reply_text(
-            f"🧠 У тебя недостаточно ИИ-токенов. Остаток: {balance}.\\n"
+            f"🧠 У тебя недостаточно ИИ-токенов. Остаток: {balance}.\n"
             "Открой «Магазин» и купи пакет токенов."
         )
         return
@@ -136,7 +136,7 @@ async def _run_ai(user, msg, prompt: str) -> None:
 
     if len(answer) > 3700:
         answer = answer[:3700] + "…"
-    answer += f"\\n\\n🧾 Потрачено: {actual} токенов · Осталось: {remaining}"
+    answer += f"\n\n🧾 Потрачено: {actual} токенов · Осталось: {remaining}"
     try:
         await thinking.edit_text(answer)
     except Exception:
@@ -173,7 +173,7 @@ async def cmd_ai_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     balance = await db.get_ai_tokens(user.id)
     await msg.reply_text(
-        f"🧠 На твоём балансе: {balance} ИИ-токенов.\\n"
+        f"🧠 На твоём балансе: {balance} ИИ-токенов.\n"
         "Купить токены можно через команду «Магазин»."
     )
 
@@ -465,7 +465,7 @@ def build_app() -> Application:
         cmd_ai,
     ))
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^(токены|баланс ии)(\\s|$)"), cmd_ai_tokens,
+        filters.Regex(r"(?i)^(токены|баланс ии)(\s|$)"), cmd_ai_tokens,
     ))
 
     # ── магазин
