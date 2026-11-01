@@ -83,7 +83,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
         "Казино — мини-казино\n"
-        "Магазин — пакеты команд"
+        "Магазин — пакеты команд и ИИ-токены\\n"
+        "Токены — баланс ИИ-токенов"
     )
 
 
@@ -107,16 +108,35 @@ async def _run_ai(user, msg, prompt: str) -> None:
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
+
+    reserved = ai.estimate_request_tokens(prompt, user.id)
+    if not await db.reserve_ai_tokens(user.id, reserved):
+        balance = await db.get_ai_tokens(user.id)
+        await msg.reply_text(
+            f"🧠 У тебя недостаточно ИИ-токенов. Остаток: {balance}.\\n"
+            "Открой «Магазин» и купи пакет токенов."
+        )
+        return
+
     thinking = await msg.reply_text("🤔 Думаю…")
-    answer = await ai.ask_ai(prompt, user_id=user.id)
-    if not answer:
+    result = await ai.ask_ai(prompt, user_id=user.id)
+    if not result:
+        await db.refund_ai_tokens(user.id, reserved)
         try:
-            await thinking.edit_text("⚠️ ИИ не ответил. Попробуй позже.")
+            await thinking.edit_text("⚠️ ИИ не ответил. Зарезервированные токены возвращены.")
         except Exception:
             pass
         return
-    if len(answer) > 4000:
-        answer = answer[:4000] + "…"
+
+    answer = str(result.get("text") or "").strip()
+    actual = max(1, int(result.get("usage") or reserved))
+    if not await db.settle_ai_tokens(user.id, reserved, actual):
+        logger.error("AI token settlement failed for user %s", user.id)
+    remaining = await db.get_ai_tokens(user.id)
+
+    if len(answer) > 3700:
+        answer = answer[:3700] + "…"
+    answer += f"\\n\\n🧾 Потрачено: {actual} токенов · Осталось: {remaining}"
     try:
         await thinking.edit_text(answer)
     except Exception:
@@ -132,25 +152,30 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not msg:
         return
     text = (msg.text or "").strip()
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if msg.reply_to_message.from_user.id == context.bot.id:
-            prompt = _AI_WORD.sub("", text).strip()
-            if not prompt:
-                await msg.reply_text("Напиши вопрос реплаем.")
-                return
-            await _run_ai(user, msg, prompt)
-            return
     m = _AI_WORD.match(text)
     if not m:
         return
     prompt = text[m.end():].strip()
     if not prompt:
         await msg.reply_text(
-            "Формат: <code>ИИ Привет</code> или реплай на сообщение бота.",
+            "Формат: <code>ИИ Привет</code>, <code>Браини Привет</code> "
+            "или <code>Мозг Привет</code>. Реплаи больше не используются.",
             parse_mode=ParseMode.HTML,
         )
         return
     await _run_ai(user, msg, prompt)
+
+
+async def cmd_ai_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    balance = await db.get_ai_tokens(user.id)
+    await msg.reply_text(
+        f"🧠 На твоём балансе: {balance} ИИ-токенов.\\n"
+        "Купить токены можно через команду «Магазин»."
+    )
 
 
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -439,6 +464,9 @@ def build_app() -> Application:
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(токены|баланс ии)(\\s|$)"), cmd_ai_tokens,
+    ))
 
     # ── магазин
     app.add_handler(MessageHandler(
@@ -450,12 +478,6 @@ def build_app() -> Application:
 
     # ── динамические команды из commands_dop.py
     commands_dop_handlers.register(app)
-
-    if CHAT_ID:
-        app.add_handler(MessageHandler(
-            filters.REPLY & filters.Chat(chat_id=CHAT_ID),
-            cmd_ai,
-        ))
 
         app.add_handler(
             MessageHandler(
