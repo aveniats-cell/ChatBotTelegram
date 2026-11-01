@@ -1114,12 +1114,16 @@ async def add_salary_frac_atomic(
 
 async def pay_salary_from_treasury(
     chat_id: int, user_id: int, day: str, frac_delta: int,
-) -> Optional[int]:
-    """при сбое UPDATE users возвращаем и coins в казну,
-    и new_frac в pending_salary, чтобы не терять дробную часть."""
-    logger.info("salary: chat=%s user=%s frac_in=%s", chat_id, user_id, frac_delta)
+) -> Optional[tuple[int, int]]:
+    """Выплачивает доступную часть зарплаты из казны.
+
+    Возвращает (выплаченные_монеты, невыплаченные_сотые) либо None.
+    Функция НЕ меняет pending_salary: его снятие/возврат полностью
+    контролирует вызывающая сторона. Это исключает двойной возврат одной
+    и той же дробной суммы при ошибке UPDATE users.
+    """
     if frac_delta <= 0:
-        return 0
+        return (0, 0)
 
     rs = await _exec(
         "SELECT salary_frac, salary_day FROM users WHERE user_id = ?",
@@ -1134,43 +1138,19 @@ async def pay_salary_from_treasury(
     else:
         cur_frac = 0
 
-    total_frac = (cur_frac or 0) + frac_delta
-    coins = total_frac // 100
-    new_frac = total_frac % 100
+    total_frac = int(cur_frac or 0) + int(frac_delta)
+    due_coins, new_frac = divmod(total_frac, 100)
+    paid_coins = due_coins
 
-    if coins > 0:
-        cur_treasury = await treasury_get(chat_id)
-        logger.info("salary: treasury_before=%s coins=%s", cur_treasury, coins)
-        if cur_treasury <= 0:
-            logger.info("salary: казна пуста, зарплата не платится")
+    if due_coins > 0:
+        treasury = await treasury_get(chat_id)
+        if treasury <= 0:
             return None
-        take = min(coins, cur_treasury)
-        ok = await treasury_withdraw(chat_id, take)
-        logger.info("salary: withdraw ok=%s take=%s", ok, take)
-        if not ok:
+        paid_coins = min(due_coins, treasury)
+        if not await treasury_withdraw(chat_id, paid_coins):
             return None
-        coins = take
-        if coins < total_frac // 100:
-            unpaid_coins = (total_frac // 100) - coins
-            logger.warning(
-                "salary: казна кончилась, выдано %s из %s; отложено %s",
-                coins, total_frac // 100, unpaid_coins,
-            )
-            # salary_frac хранит только остаток 0..99; целые невыплаченные
-            # монеты возвращаем в pending_salary в тех же сотых единицах.
-            if unpaid_coins > 0:
-                pending_ok = await return_pending_salary(
-                    chat_id, user_id, day, unpaid_coins * 100,
-                )
-                if not pending_ok:
-                    await treasury_add(chat_id, coins)
-                    return None
-            new_frac = total_frac % 100
-        else:
-            new_frac = total_frac % 100
-    else:
-        new_frac = total_frac % 100
 
+    unpaid_frac = (due_coins - paid_coins) * 100
     rs2 = await _exec(
         """UPDATE users
            SET balance = COALESCE(balance, 10) + ?,
@@ -1181,16 +1161,23 @@ async def pay_salary_from_treasury(
                    ELSE ?
                END
            WHERE user_id = ?""",
-        [coins, new_frac, day, day, coins, coins, user_id],
+        [paid_coins, new_frac, day, day, paid_coins, paid_coins, user_id],
     )
-    if getattr(rs2, "error", False):
-        # компенсация: вернуть деньги в казну и дробную часть в pending
-        if coins > 0:
-            await treasury_add(chat_id, coins)
-        if new_frac > 0:
-            await return_pending_salary(chat_id, user_id, day, new_frac)
+    if (
+        getattr(rs2, "error", False)
+        or (getattr(rs2, "rows_affected", 0) or 0) == 0
+    ):
+        if paid_coins > 0:
+            restored = await treasury_add(chat_id, paid_coins)
+            if not restored:
+                logger.error(
+                    "salary: не удалось вернуть %s монет в казну "
+                    "(chat=%s user=%s day=%s)",
+                    paid_coins, chat_id, user_id, day,
+                )
         return None
-    return coins
+
+    return paid_coins, unpaid_frac
 
 
 async def get_salary_today(user_id: int, day: str) -> int:
