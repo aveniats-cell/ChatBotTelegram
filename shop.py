@@ -28,6 +28,7 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not chat or not msg or not user:
         return
+    await db.upsert_user(user.id, user.username, user.first_name)
     pockets = await db.shop_pockets_list(chat.id)
     rows = []
     for p in pockets:
