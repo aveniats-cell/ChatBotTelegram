@@ -47,30 +47,30 @@ def _build_ai_prompt(a_name: str, b_name: str) -> str:
     )
 
 
-async def _generate_phrase(a_id: int, a_name: str, b_id: int, b_name: str) -> str:
+async def _generate_phrase(payer_id: int, a_id: int, a_name: str, b_id: int, b_name: str) -> str:
     key = (min(a_id, b_id), max(a_id, b_id))
     cached = _PHRASE_CACHE.get(key)
     if cached:
         return cached
 
     prompt = _build_ai_prompt(a_name, b_name)
-    reserved = ai.estimate_request_tokens(prompt, a_id)
-    if not await db.reserve_ai_tokens(a_id, reserved):
+    reserved = ai.estimate_request_tokens(prompt, payer_id)
+    if not await db.reserve_ai_tokens(payer_id, reserved):
         return _fallback_phrase(a_name, b_name)
 
     try:
-        result = await ai.ask_ai(prompt, user_id=a_id)
+        result = await ai.ask_ai(prompt, user_id=payer_id)
     except Exception as e:
         logger.warning("ship ai: %s", e)
         result = None
 
     if not result:
-        await db.refund_ai_tokens(a_id, reserved)
+        await db.refund_ai_tokens(payer_id, reserved)
         return _fallback_phrase(a_name, b_name)
 
     used = max(1, int(result.get("usage") or reserved))
-    if not await db.settle_ai_tokens(a_id, reserved, used):
-        logger.warning("ship AI token settlement failed for user %s", a_id)
+    if not await db.settle_ai_tokens(payer_id, reserved, used):
+        logger.warning("ship AI token settlement failed for user %s", payer_id)
     answer = str(result.get("text") or "")
     if not answer:
         return _fallback_phrase(a_name, b_name)
@@ -88,8 +88,10 @@ async def _generate_phrase(a_id: int, a_name: str, b_id: int, b_name: str) -> st
 
 async def cmd_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg:
+    actor = update.effective_user
+    if not msg or not actor:
         return
+    await db.upsert_user(actor.id, actor.username, actor.first_name)
     text = msg.text or ""
 
     names = []
@@ -129,7 +131,7 @@ async def cmd_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if a_id == 0 or b_id == 0:
         phrase = _fallback_phrase(a, b)
     else:
-        phrase = await _generate_phrase(a_id, a, b_id, b)
+        phrase = await _generate_phrase(actor.id, a_id, a, b_id, b)
 
     await msg.reply_text(
         f"💘 <b>Шип</b>\n{phrase}",
