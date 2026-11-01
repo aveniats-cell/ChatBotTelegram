@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 _MENU_OWNERS: dict[tuple[int, int], int] = {}
 
+AI_TOKEN_PACKS = {1000: 30, 5000: 135, 10000: 250}
+
 
 async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
@@ -27,10 +29,6 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat or not msg or not user:
         return
     pockets = await db.shop_pockets_list(chat.id)
-    if not pockets:
-        await msg.reply_text("Магазин пока пуст.")
-        return
-
     rows = []
     for p in pockets:
         if not p["active"]:
@@ -39,8 +37,9 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{p['name']} — {p['price']}🪙",
             callback_data=f"shop:view:{p['id']}",
         )])
+    rows.append([InlineKeyboardButton("🧠 Купить ИИ-токены", callback_data="shop:tokens")])
     sent = await msg.reply_text(
-        "🛒 <b>Магазин</b>\nВыбери пакет:",
+        "🛒 <b>Магазин</b>\nВыбери пакет команд или ИИ-токены:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -66,6 +65,12 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action == "main":
         await _render_main(q, user)
         return
+    if action == "tokens":
+        await _render_tokens(q, user)
+        return
+    if action == "tokenbuy" and len(parts) == 3:
+        await _buy_ai_tokens(q, user, int(parts[2]))
+        return
     if action == "view" and len(parts) == 3:
         await _view_pocket(q, user, int(parts[2]))
         return
@@ -90,6 +95,7 @@ async def _render_main(q, user) -> None:
             f"{p['name']} — {p['price']}🪙",
             callback_data=f"shop:view:{p['id']}",
         )])
+    rows.append([InlineKeyboardButton("🧠 Купить ИИ-токены", callback_data="shop:tokens")])
     try:
         await q.edit_message_text(
             "🛒 <b>Магазин</b>\nВыбери пакет:",
@@ -100,6 +106,51 @@ async def _render_main(q, user) -> None:
         pass
     _MENU_OWNERS[(q.message.chat.id, q.message.message_id)] = user.id
     await q.answer()
+
+
+async def _render_tokens(q, user, answer: bool = True) -> None:
+    balance = await db.get_ai_tokens(user.id)
+    rows = [
+        [InlineKeyboardButton(
+            f"{amount:,} токенов — {price}🪙".replace(",", " "),
+            callback_data=f"shop:tokenbuy:{amount}",
+        )]
+        for amount, price in AI_TOKEN_PACKS.items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад в магазин", callback_data="shop:main")])
+    try:
+        await q.edit_message_text(
+            f"🧠 <b>ИИ-токены</b>\\nНа балансе: <b>{balance}</b>\\n\\n"
+            "Выбери набор. Токены списываются по фактическому расходу ИИ.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except TelegramError:
+        pass
+    if answer:
+        await q.answer()
+
+
+async def _buy_ai_tokens(q, user, amount: int) -> None:
+    price = AI_TOKEN_PACKS.get(amount)
+    if not price:
+        await q.answer("Такого набора нет.", show_alert=True)
+        return
+    ok = await db.buy_ai_tokens(user.id, price, amount)
+    if not ok:
+        row = await db.get_user(user.id)
+        balance = int((row or {}).get("balance") or 0)
+        await q.answer(
+            f"Не хватает монет или покупка не прошла. Баланс: {balance}🪙",
+            show_alert=True,
+        )
+        return
+    try:
+        await db.treasury_add(q.message.chat.id, price)
+    except Exception as e:
+        logger.warning("AI token shop treasury: %s", e)
+    await q.answer(f"✅ Куплено {amount:,} ИИ-токенов!".replace(",", " "), show_alert=True)
+    await _render_tokens(q, user, answer=False)
 
 
 async def _view_pocket(q, user, pocket_id: int) -> None:
