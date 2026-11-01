@@ -108,6 +108,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
     name = user_row.get("first_name") or str(target_uid)
     rank = await db.user_rank(chat_id, target_uid)
     total_msgs = rank[0] if rank else 0
+    rank_number = rank[1] if rank else "—"
 
     marriage = await db.find_active_marriage(chat_id, target_uid)
     if marriage:
@@ -166,7 +167,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
         f"<b>{_safe(name)}</b>\n"
         f"<i>{_safe(role_name)}</i>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💬 <b>{total_msgs:,}</b> сообщений\n"
+        f"💬 <b>{total_msgs:,}</b> сообщений   ·   🏆 Рейтинг: <b>{rank_number}</b>\n"
         f"🪙 <b>{balance:,}</b> монет   ·   💳 Кредит: <b>{credit:,}</b>\n"
         f"🏅 Награды: <b>{awards_total} ★</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
