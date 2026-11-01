@@ -151,6 +151,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
+    await db.upsert_user(user.id, user.username, user.first_name)
     text = (msg.text or "").strip()
     m = _AI_WORD.match(text)
     if not m:
@@ -171,6 +172,7 @@ async def cmd_ai_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     msg = update.effective_message
     if not user or not msg:
         return
+    await db.upsert_user(user.id, user.username, user.first_name)
     balance = await db.get_ai_tokens(user.id)
     await msg.reply_text(
         f"🧠 На твоём балансе: {balance} ИИ-токенов.\n"
