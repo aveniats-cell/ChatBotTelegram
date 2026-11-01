@@ -438,6 +438,7 @@ async def _migrate_tables() -> None:
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "avatar_file_id", "TEXT"),
         ("users", "coins_created", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "ai_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("marriages", "married_at", "TEXT"),
         ("marriages", "client_token", "TEXT"),
         ("marriages", "xp", "INTEGER NOT NULL DEFAULT 0"),
@@ -553,7 +554,7 @@ async def get_user(user_id: int) -> Optional[dict]:
                   mutes_issued, reports_made, courts_held,
                   tictactoe_wins, tictactoe_losses, tictactoe_draws,
                   credit_taken_day, salary_today, salary_day, salary_frac,
-                  avatar_file_id, coins_created
+                  avatar_file_id, coins_created, ai_tokens
            FROM users WHERE user_id = ?""",
         [user_id],
     )
@@ -565,7 +566,7 @@ async def get_user(user_id: int) -> Optional[dict]:
             "mutes_issued", "reports_made", "courts_held",
             "tictactoe_wins", "tictactoe_losses", "tictactoe_draws",
             "credit_taken_day", "salary_today", "salary_day", "salary_frac",
-            "avatar_file_id", "coins_created"]
+            "avatar_file_id", "coins_created", "ai_tokens"]
     return dict(zip(keys, r))
 
 
@@ -623,6 +624,77 @@ async def add_balance(user_id: int, delta: int) -> bool:
         [user_id, delta, delta],
     )
     return not getattr(rs, "error", False)
+
+
+
+# ---------- AI token wallet ----------
+
+async def get_ai_tokens(user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(ai_tokens, 0) FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return 0
+    return max(0, int(rs.rows[0][0] or 0))
+
+
+async def buy_ai_tokens(user_id: int, coin_price: int, token_amount: int) -> bool:
+    """Одним UPDATE списывает монеты и начисляет ИИ-токены."""
+    if coin_price <= 0 or token_amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) - ?,
+               ai_tokens = COALESCE(ai_tokens, 0) + ?
+           WHERE user_id = ?
+             AND COALESCE(balance, 10) >= ?""",
+        [coin_price, token_amount, user_id, coin_price],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def reserve_ai_tokens(user_id: int, amount: int) -> bool:
+    """Резервирует бюджет запроса, не позволяя двум запросам уйти в минус."""
+    if amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET ai_tokens = COALESCE(ai_tokens, 0) - ?
+           WHERE user_id = ? AND COALESCE(ai_tokens, 0) >= ?""",
+        [amount, user_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def refund_ai_tokens(user_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        "UPDATE users SET ai_tokens = COALESCE(ai_tokens, 0) + ? WHERE user_id = ?",
+        [amount, user_id],
+    )
+    return not getattr(rs, "error", False) and (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def settle_ai_tokens(user_id: int, reserved: int, actual: int) -> bool:
+    """Возвращает неиспользованный резерв или списывает перерасход."""
+    if reserved <= 0 or actual < 0:
+        return False
+    if actual <= reserved:
+        return await refund_ai_tokens(user_id, reserved - actual)
+    extra = actual - reserved
+    rs = await _exec(
+        """UPDATE users
+           SET ai_tokens = MAX(0, COALESCE(ai_tokens, 0) - ?)
+           WHERE user_id = ?""",
+        [extra, user_id],
+    )
+    return not getattr(rs, "error", False) and (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def take_balance_atomic(user_id: int, amount: int) -> bool:
