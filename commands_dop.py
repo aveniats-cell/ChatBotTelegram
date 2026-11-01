@@ -31,5 +31,20 @@ CREATE_BUY("Сходить в бар", "user1 сходил(а) в бар с user
 CREATE_BUY("Поговорить по душам", "user1 и user2 говорят по душам", pocket=73)
 CREATE_BUY("Выпить вино", "user1  выпил(а) вино с user2", pocket=73)
 CREATE_BUY("Сходить в клуб", "user1 и user2 пошли в клуб", pocket=73)
+CREATE_POCKET("Воин 18+", price=450, id=10)
+CREATE_BUY("Разрезать кинжалом", "user1 разрезал(а) кинжалом user2", pocket=10)
+CREATE_BUY("Выбить зубы", "user1 выбил(а) зубы user2", pocket=10)
+CREATE_BUY("Срезать голову", "user1 срезал(а)  голову user2", pocket=10)
+CREATE_BUY("Вставить кинжал в анус", "user1 вставил(а) кинжал в анус user2", pocket=10)
+CREATE_BUY("Сжечь", "user1 сжег/сожгла  user2 в муках", pocket=10)
+CREATE_BUY("Отрезать пальцы", "user1 отрезал(а) пальцы user2", pocket=10)
+CREATE_BUY("Срезать нос", "user1 срезал(а) нос user2", pocket=10)
+CREATE_BUY("Вскрыть", "user1 вскрыл(а)  user2 на живо", pocket=10)
+CREATE_BUY("Прибить на гвозди", "user1 прибил(а)  user2 гвоздями к стене", pocket=10)
+CREATE_BUY("Разрезать вены", "user1 разрезал(а)  вены user2", pocket=10)
+CREATE_BUY("Отрезать хуй", "user1 отрезал(а)  хуй user2", pocket=10)
+CREATE_BUY("Поджечь пизду", "user1 зажег(ла) пизду user2", pocket=10)
+CREATE_BUY("Нанести увечья", "user1 нанес(ла) увечия user2", pocket=10)
+
 
 
