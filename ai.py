@@ -18,6 +18,7 @@ MODEL = "openai-fast"
 COOLDOWN_SEC = 5.0
 
 MAX_HISTORY = 10
+MAX_OUTPUT_TOKENS = 512
 
 _last_request: TTLCache = TTLCache(maxsize=10000, ttl=COOLDOWN_SEC * 2)
 _cooldown_lock = asyncio.Lock()
@@ -67,6 +68,16 @@ def _api_url() -> str:
     return f"{base}/v1/chat/completions"
 
 
+
+def estimate_request_tokens(prompt: str, user_id: Optional[int] = None) -> int:
+    """Консервативный резерв: оценка входа + максимум ответа + запас."""
+    system_chars = len("Ты умный чат-бот в Telegram. Пиши максимально кратко.")
+    history_chars = 0
+    if user_id is not None:
+        history_chars = sum(len(str(m.get("content", ""))) for m in _get_history(user_id))
+    input_estimate = (system_chars + history_chars + len(prompt) + 2) // 3
+    return max(1, int(input_estimate * 1.15) + MAX_OUTPUT_TOKENS)
+
 def reset_history(user_id: int) -> None:
     _history.pop(user_id, None)
 
@@ -88,7 +99,7 @@ def _append(user_id: int, role: str, content: str) -> None:
         h.pop(0)
 
 
-async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
+async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[dict]:
     """Отправляет запрос в gemini. Возвращает текст или None."""
     if not AI_TOKEN:
         logger.error("ai: AI_TOKEN не задан в переменных окружения")
@@ -112,7 +123,7 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
     payload = {
         "model": MODEL,
         "messages": messages,
-        "max_tokens": 2048,
+        "max_tokens": MAX_OUTPUT_TOKENS,
     }
 
     headers = {
@@ -155,10 +166,19 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
             if not content:
                 return None
 
+            usage_data = data.get("usage") or {}
+            reported_usage = usage_data.get("total_tokens")
+            if isinstance(reported_usage, (int, float)) and reported_usage > 0:
+                used_tokens = int(reported_usage)
+            else:
+                # Совместимость с провайдерами, которые не возвращают usage.
+                used_tokens = (sum(len(str(m.get("content", ""))) for m in messages)
+                               + len(content) + 2) // 3
+
             if user_id is not None:
                 _append(user_id, "user", prompt)
                 _append(user_id, "assistant", content)
-            return content
+            return {"text": content, "usage": max(1, used_tokens)}
 
     except aiohttp.ClientError as e:
         logger.warning("ai: сеть — %s", e)
