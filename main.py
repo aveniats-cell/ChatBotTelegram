@@ -11,6 +11,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
     ContextTypes,
     filters,
 )
@@ -42,6 +44,7 @@ import commands_dop       # noqa: F401 — регистрирует команд
 import commands_dop_handlers
 import shop
 import reputation
+import blacklist
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -267,6 +270,16 @@ def build_app() -> Application:
         .build()
     )
     app.add_error_handler(_error_handler)
+
+    # Глобальный фильтр ставится раньше всех команд, сообщений и callback-кнопок.
+    # Заблокированные пользователи не доходят до обработчиков бота.
+    app.add_handler(
+        TypeHandler(Update, blacklist.guard_blacklisted_update),
+        group=-1,
+    )
+
+    app.add_handler(CommandHandler("banbot", blacklist.cmd_banbot))
+    app.add_handler(CommandHandler("unbanbot", blacklist.cmd_unbanbot))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
