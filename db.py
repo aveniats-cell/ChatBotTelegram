@@ -420,6 +420,17 @@ async def _create_tables() -> None:
         )
     """)
 
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS bot_blacklist (
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            first_name    TEXT,
+            banned_by     INTEGER,
+            reason        TEXT,
+            created_at    TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
 
 async def _migrate_tables() -> None:
     adds = [
@@ -494,6 +505,8 @@ async def _migrate_tables() -> None:
         "ON coin_purchases(coin_id)",
         "CREATE INDEX IF NOT EXISTS idx_coin_emitters_chat "
         "ON coin_emitters(chat_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_blacklist_username "
+        "ON bot_blacklist(username COLLATE NOCASE)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
@@ -626,6 +639,72 @@ async def get_user_by_username(username: str) -> Optional[int]:
         [username.lstrip("@")],
     )
     return rs.rows[0][0] if rs.rows else None
+
+async def get_blacklisted_user_by_username(username: str) -> Optional[int]:
+    """Найти ID по username среди заблокированных пользователей."""
+    if not username:
+        return None
+    rs = await _exec(
+        "SELECT user_id FROM bot_blacklist WHERE username = ? COLLATE NOCASE",
+        [username.lstrip("@")],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return None
+    return int(rs.rows[0][0])
+
+
+async def is_user_blacklisted(user_id: int) -> bool:
+    rs = await _exec(
+        "SELECT 1 FROM bot_blacklist WHERE user_id = ? LIMIT 1",
+        [int(user_id)],
+    )
+    return bool(not getattr(rs, "error", False) and rs.rows)
+
+
+async def blacklist_user(
+    user_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    banned_by: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Добавить пользователя в глобальный чёрный список без удаления его активов."""
+    rs = await _exec(
+        """INSERT INTO bot_blacklist
+               (user_id, username, first_name, banned_by, reason)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               username = COALESCE(excluded.username, bot_blacklist.username),
+               first_name = COALESCE(excluded.first_name, bot_blacklist.first_name),
+               banned_by = excluded.banned_by,
+               reason = COALESCE(excluded.reason, bot_blacklist.reason)""",
+        [int(user_id), username.lstrip("@") if username else None,
+         first_name, banned_by, reason],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def unblacklist_user(user_id: int) -> bool:
+    rs = await _exec(
+        "DELETE FROM bot_blacklist WHERE user_id = ?",
+        [int(user_id)],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def list_blacklisted_users(limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    rs = await _exec(
+        """SELECT user_id, username, first_name, banned_by, reason, created_at
+           FROM bot_blacklist
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        [limit],
+    )
+    if getattr(rs, "error", False):
+        return []
+    keys = ["user_id", "username", "first_name", "banned_by", "reason", "created_at"]
+    return [dict(zip(keys, row)) for row in rs.rows]
 
 
 async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
