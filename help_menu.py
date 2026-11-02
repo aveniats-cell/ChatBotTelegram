@@ -1,3 +1,4 @@
+
 """Справка /help: разделы Общий / Шериф / Комиссар / Создатель."""
 import os
 import logging
@@ -11,7 +12,18 @@ import db
 
 logger = logging.getLogger(__name__)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+
+def _get_admin_id() -> int:
+    """Безопасно получает ID создателя из переменных окружения."""
+    try:
+        return int(os.getenv("ADMIN_ID", "0") or "0")
+    except (TypeError, ValueError):
+        logger.error("ADMIN_ID должен быть числом.")
+        return 0
+
+
+ADMIN_ID = _get_admin_id()
+
 
 _SECTIONS = {
     "general": ("📋 Общий", [
@@ -70,9 +82,11 @@ _SECTIONS = {
         "/ping — жив?",
         "/start — приветствие",
     ]),
+
     "sheriff": ("👮 Шериф", [
         "Поймать @user — запрос админу на бан",
     ]),
+
     "commissar": ("🎖 Комиссар", [
         "+Шериф / -Шериф @user — назначить/снять шерифа",
         "+Мут 5ч Причина @user — замутить",
@@ -87,6 +101,7 @@ _SECTIONS = {
         "+Суд ССС @user — суд ССС без причины",
         "Опрос ССС / описание /1/ В1 / В2 — опрос для ССС (5 мин)",
     ]),
+
     "creator": ("👑 Создатель", [
         "+Комиссар / -Комиссар @user — назначить/снять комиссара",
         "Список шерифы — список шерифов",
@@ -118,91 +133,155 @@ _SECTIONS = {
 }
 
 
+def _normalize_role(role) -> str | None:
+    """Приводит название роли к единому виду."""
+    if role is None:
+        return None
+
+    value = str(role).strip().lower()
+    return value or None
+
+
 def _visible_sections(is_admin: bool, role: str | None) -> list[str]:
-    out = ["general"]
+    """Возвращает разделы, доступные пользователю."""
+    role = _normalize_role(role)
+
+    sections = ["general"]
+
+    # Шериф видит свой раздел.
+    if is_admin or role in ("sheriff", "commissar"):
+        sections.append("sheriff")
+
+    # Комиссар видит раздел комиссара.
     if is_admin or role == "commissar":
-        out.append("sheriff")
-        out.append("commissar")
+        sections.append("commissar")
+
+    # Раздел создателя доступен только ADMIN_ID.
     if is_admin:
-        out.append("creator")
-    return out
+        sections.append("creator")
+
+    return sections
 
 
 def _main_kb(sections: list[str]) -> InlineKeyboardMarkup:
+    """Клавиатура главного меню справки."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(_SECTIONS[s][0], callback_data=f"help:{s}")]
-        for s in sections
+        [
+            InlineKeyboardButton(
+                _SECTIONS[section][0],
+                callback_data=f"help:{section}",
+            )
+        ]
+        for section in sections
     ])
 
 
 def _section_kb(section: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Назад", callback_data="help:back")
-    ]])
+    """Кнопка возврата к списку разделов."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data="help:back",
+            )
+        ]
+    ])
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _get_user_access(user_id: int) -> tuple[bool, str | None]:
+    """Определяет права пользователя для справки."""
+    is_admin = bool(ADMIN_ID) and user_id == ADMIN_ID
+
+    try:
+        role = await db.get_role(user_id)
+    except Exception:
+        logger.exception("Не удалось получить роль пользователя %s", user_id)
+        role = None
+
+    return is_admin, _normalize_role(role)
+
+
+async def cmd_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Открывает главное меню справки."""
     user = update.effective_user
     msg = update.effective_message
+
     if not user or not msg:
         return
-    is_admin = bool(ADMIN_ID) and user.id == ADMIN_ID
-    try:
-        role = await db.get_role(user.id)
-    except Exception as e:
-        logger.warning("cmd_help get_role: %s", e)
-        role = None
+
+    is_admin, role = await _get_user_access(user.id)
     sections = _visible_sections(is_admin, role)
+
     await msg.reply_text(
         "📖 <b>Справка</b>\nВыбери раздел:",
-        parse_mode=ParseMode.HTML, reply_markup=_main_kb(sections),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_main_kb(sections),
     )
 
 
-async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Обрабатывает нажатия на кнопки справки."""
     q = update.callback_query
     user = update.effective_user
+
     if not q or not user:
         return
-    parts = (q.data or "").split(":")
+
+    parts = (q.data or "").split(":", 1)
+
     if len(parts) != 2 or parts[0] != "help":
         await q.answer()
         return
+
     section = parts[1]
 
-    is_admin = bool(ADMIN_ID) and user.id == ADMIN_ID
-    try:
-        role = await db.get_role(user.id)
-    except Exception as e:
-        logger.warning("help_callback get_role: %s", e)
-        role = None
+    is_admin, role = await _get_user_access(user.id)
     sections = _visible_sections(is_admin, role)
 
+    # Возврат в главное меню.
     if section == "back":
         try:
             await q.edit_message_text(
                 "📖 <b>Справка</b>\nВыбери раздел:",
-                parse_mode=ParseMode.HTML, reply_markup=_main_kb(sections),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_main_kb(sections),
             )
         except Exception as e:
             if "not modified" not in str(e).lower():
                 logger.warning("help back edit: %s", e)
+
         await q.answer()
         return
 
+    # Проверяем существование раздела и права пользователя.
     if section not in _SECTIONS or section not in sections:
-        await q.answer("Раздел не найден.", show_alert=True)
+        await q.answer(
+            "У тебя нет доступа к этому разделу.",
+            show_alert=True,
+        )
         return
 
     title, lines = _SECTIONS[section]
-    text = f"<b>{escape(title)}</b>\n" + "\n".join(
-        f"• {escape(l)}" for l in lines
+
+    text = (
+        f"<b>{escape(title)}</b>\n"
+        + "\n".join(f"• {escape(line)}" for line in lines)
     )
+
     try:
         await q.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=_section_kb(section),
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_section_kb(section),
         )
     except Exception as e:
         if "not modified" not in str(e).lower():
             logger.warning("help section edit: %s", e)
+
     await q.answer()
