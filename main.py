@@ -251,6 +251,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Топ все / Топ день / Топ богачи / Мое место\n"
         "• Шип @u1 @u2 (с ИИ)\n"
         "• Сделать предложение / +Брак / -Брак / Мой брак / Топ браки\n"
+        "• /MarriedClean @user — обнулить счётчик разводов (только админ)\n"
         "• Профиль\n"
         "• хо @user 50 — крестики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50 — из казны\n"
@@ -414,6 +415,10 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+браки(\s|$)"), wedding.cmd_marriage_top))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^/marriedclean(?:@\w+)?(?:\s|$)"),
+        wedding.cmd_married_clean,
+    ))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
     # Глобальная репутация.
