@@ -37,6 +37,9 @@ TAX_REPORT_CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
 DEFAULT_COOLDOWN_HOURS = 6
 DEFAULT_PCT = 40
 
+SAVINGS_INTEREST_PCT = 0.2  # в день.
+SAVINGS_INTEREST_BPS = 20  # 20 basis points = 0.2% в день
+
 FORCE_DEFAULT_CMD = "Defloult220099"
 
 TZ = timezone.utc
@@ -178,6 +181,76 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Остаток долга: <b>{new_credit}</b>.\n"
         f"Баланс: <b>{new_balance}</b>.\n"
         f"Казна: <b>{new_treasury}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_savings_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    row = await db.get_user(user.id)
+    if not row:
+        await db.upsert_user(user.id, user.username, user.first_name)
+        row = await db.get_user(user.id)
+    if not row:
+        await msg.reply_text("⚠️ Не удалось открыть сберкнижку.")
+        return
+    savings = await db.savings_get(user.id)
+    frac = savings["interest_pending_hundredths"]
+    interest = frac / 100
+    await msg.reply_text(
+        "📘 <b>Государственная сберкнижка</b>\n"
+        f"Накоплено: <b>{savings['balance']}</b> монет\n"
+        f"Ожидает выплаты процентов: <b>{interest:.2f}</b> монет\n"
+        f"Ставка: <b>{SAVINGS_INTEREST_PCT:.1f}% в день</b>\n"
+        "Проценты выплачиваются из казны; при нехватке средств остаются в ожидании.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_savings_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, msg = update.effective_user, update.effective_message
+    if not user or not msg:
+        return
+    amount = _num_after(msg.text or "", "+Сберкнижка")
+    if amount is None or amount <= 0:
+        await msg.reply_text("Формат: <code>+Сберкнижка 500</code>", parse_mode=ParseMode.HTML)
+        return
+    if not await db.savings_deposit(user.id, amount):
+        row = await db.get_user(user.id)
+        balance = int((row or {}).get("balance") or 0)
+        await msg.reply_text(f"⛔ Не удалось положить деньги. Обычный баланс: {balance}.")
+        return
+    savings = await db.savings_get(user.id)
+    row = await db.get_user(user.id)
+    await msg.reply_text(
+        f"📘 В сберкнижку положено <b>{amount}</b> монет.\n"
+        f"На сберкнижке: <b>{savings['balance']}</b>\n"
+        f"Обычный баланс: <b>{int((row or {}).get('balance') or 0)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_savings_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, msg = update.effective_user, update.effective_message
+    if not user or not msg:
+        return
+    amount = _num_after(msg.text or "", "-Сберкнижка")
+    if amount is None or amount <= 0:
+        await msg.reply_text("Формат: <code>-Сберкнижка 200</code>", parse_mode=ParseMode.HTML)
+        return
+    if not await db.savings_withdraw(user.id, amount):
+        savings = await db.savings_get(user.id)
+        await msg.reply_text(f"⛔ Недостаточно средств. На сберкнижке: {savings['balance']}.")
+        return
+    savings = await db.savings_get(user.id)
+    row = await db.get_user(user.id)
+    await msg.reply_text(
+        f"💵 Со сберкнижки снято <b>{amount}</b> монет.\n"
+        f"Остаток: <b>{savings['balance']}</b>\n"
+        f"Обычный баланс: <b>{int((row or {}).get('balance') or 0)}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -595,53 +668,54 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
+    """Конфискует долю обычного баланса, сберкнижки и целых начисленных процентов."""
+    pct = max(0, min(100, int(pct)))
     if pct <= 0:
         return 0, 0
-    if pct > 100:
-        pct = 100
-
     rs = await db._exec(
-        "SELECT COALESCE(SUM(balance), 0), COUNT(*) "
-        "FROM users WHERE balance > 0",
+        """SELECT user_id, COALESCE(balance, 0), COALESCE(savings_balance, 0),
+                  COALESCE(savings_interest_frac, 0), COALESCE(savings_interest_remainder, 0)
+           FROM users
+           WHERE COALESCE(balance, 0) > 0 OR COALESCE(savings_balance, 0) > 0
+              OR COALESCE(savings_interest_frac, 0) >= 100"""
     )
-    if not rs.rows:
+    if getattr(rs, "error", False):
+        logger.error("_collect_balances: SELECT failed")
         return 0, 0
-    total_before = rs.rows[0][0] or 0
-    users_count = rs.rows[0][1] or 0
-    if total_before <= 0:
-        return 0, 0
-
-    if pct == 100:
-        rs2 = await db._exec(
-            "UPDATE users SET balance = 0 WHERE balance > 0",
+    total = 0
+    users_count = 0
+    for uid, balance, savings, interest_frac, interest_remainder in rs.rows:
+        balance = int(balance or 0)
+        savings = int(savings or 0)
+        interest_frac = int(interest_frac or 0)
+        interest_remainder = int(interest_remainder or 0)
+        pending_whole = interest_frac // 100
+        take_balance = balance if pct == 100 else balance * pct // 100
+        take_savings = savings if pct == 100 else savings * pct // 100
+        take_interest = pending_whole if pct == 100 else pending_whole * pct // 100
+        if take_balance + take_savings + take_interest <= 0:
+            continue
+        new_interest_frac = interest_frac - take_interest * 100
+        new_remainder = 0 if pct == 100 else interest_remainder
+        upd = await db._exec(
+            """UPDATE users
+               SET balance = balance - ?,
+                   savings_balance = savings_balance - ?,
+                   savings_interest_frac = ?,
+                   savings_interest_remainder = ?
+               WHERE user_id = ? AND COALESCE(balance, 0) = ?
+                 AND COALESCE(savings_balance, 0) = ?
+                 AND COALESCE(savings_interest_frac, 0) = ?
+                 AND COALESCE(savings_interest_remainder, 0) = ?""",
+            [take_balance, take_savings, new_interest_frac, new_remainder,
+             uid, balance, savings, interest_frac, interest_remainder],
         )
-    else:
-        rs2 = await db._exec(
-            f"""UPDATE users
-                SET balance = balance - CAST(balance * {int(pct)} / 100 AS INTEGER)
-                WHERE balance > 0""",
-        )
-    if getattr(rs2, "error", False):
-        logger.error("_collect_balances: UPDATE failed")
-        return 0, 0
-
-    rs3 = await db._exec(
-        "SELECT COALESCE(SUM(balance), 0) FROM users WHERE balance > 0",
-    )
-    total_after = (rs3.rows[0][0] if rs3.rows else 0) or 0
-    real = total_before - total_after
-    if real <= 0:
-        logger.warning(
-            "_collect_balances: расхождение before=%s after=%s",
-            total_before, total_after,
-        )
-        return 0, users_count
-
-    logger.info(
-        "_collect_balances: списано %s у %s юзеров (pct=%s)",
-        real, users_count, pct,
-    )
-    return real, users_count
+        if getattr(upd, "error", False) or (getattr(upd, "rows_affected", 0) or 0) <= 0:
+            continue
+        total += take_balance + take_savings + take_interest
+        users_count += 1
+    logger.info("_collect_balances: confiscated=%s users=%s pct=%s", total, users_count, pct)
+    return total, users_count
 
 
 async def _run_default(context, chat_id: int, force: bool = False) -> bool:
@@ -949,10 +1023,30 @@ async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("daily_interest_job: %s", e)
 
 
+async def savings_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневные проценты по сберкнижкам; источник выплат — казна."""
+    chat_id = int(os.getenv("CHAT_ID", "0") or "0")
+    if not chat_id:
+        logger.error("savings_interest_job: CHAT_ID не задан")
+        return
+    try:
+        paid, users_paid = await db.savings_accrue_and_pay(
+            chat_id, _today_utc(), SAVINGS_INTEREST_BPS,
+        )
+        if paid:
+            logger.info("savings_interest_job: выплачено %s монет %s пользователям", paid, users_paid)
+    except Exception:
+        logger.exception("savings_interest_job: ошибка начисления процентов")
+
+
 def register_jobs(app) -> None:
     if not app.job_queue:
         logger.warning("economy: job_queue нет, джобы не будут начисляться")
         return
+    app.job_queue.run_daily(
+        savings_interest_job,
+        time=dtime(hour=0, minute=5, tzinfo=TZ),
+    )
     app.job_queue.run_daily(
         daily_interest_job,
         time=dtime(hour=0, minute=10, tzinfo=TZ),
@@ -969,7 +1063,7 @@ def register_jobs(app) -> None:
         default_watchdog_job, interval=3600, first=60,
     )
     logger.info(
-        "economy: проценты (00:10), автопогашение кредитов (00:25), налог (00:40), "
+        "economy: сберкнижки (00:05), проценты по кредитам (00:10), автопогашение кредитов (00:25), налог (00:40), "
         "watchdog (раз в час), cooldown дефолта %sч, "
         "органический pct=%s%%, искусственный pct=100%% запланированы",
         DEFAULT_COOLDOWN_HOURS, DEFAULT_PCT,
