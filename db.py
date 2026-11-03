@@ -1859,13 +1859,39 @@ async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
     return [(r[0], r[1]) for r in rs.rows]
 
 
-async def top_balances(limit: int = 20) -> List[tuple]:
-    rs = await _exec(
-        """SELECT user_id, COALESCE(balance, 0) + COALESCE(savings_balance, 0) AS wealth
-           FROM users ORDER BY wealth DESC LIMIT ?""",
-        [limit],
-    )
-    return [(r[0], r[1]) for r in rs.rows]
+async def top_balances(limit: int = 20, chat_id: Optional[int] = None) -> List[tuple]:
+    """Топ пользователей по доступному финансовому состоянию.
+
+    Учитывает кошелёк и сберкнижку. Если передан chat_id, показывает
+    только пользователей, которые писали в этом чате. Старый вызов
+    top_balances(limit) остаётся совместимым с другими модулями.
+    """
+    limit = max(1, min(int(limit), 100))
+    if chat_id is None:
+        rs = await _exec(
+            """SELECT user_id,
+                      COALESCE(balance, 0) + COALESCE(savings_balance, 0) AS wealth
+               FROM users
+               ORDER BY wealth DESC, user_id ASC
+               LIMIT ?""",
+            [limit],
+        )
+    else:
+        rs = await _exec(
+            """SELECT u.user_id,
+                      COALESCE(u.balance, 0) + COALESCE(u.savings_balance, 0) AS wealth
+               FROM users u
+               INNER JOIN (
+                   SELECT DISTINCT user_id FROM messages WHERE chat_id = ?
+               ) members ON members.user_id = u.user_id
+               ORDER BY wealth DESC, u.user_id ASC
+               LIMIT ?""",
+            [int(chat_id), limit],
+        )
+    if getattr(rs, "error", False):
+        logger.error("top_balances: запрос рейтинга завершился ошибкой")
+        return []
+    return [(int(r[0]), int(r[1] or 0)) for r in rs.rows]
 
 
 async def user_rank(chat_id: int, user_id: int) -> Optional[tuple]:
