@@ -1,3 +1,4 @@
+
 """Профиль участника: аккуратный основной экран и отдельные разделы."""
 import os
 import re
@@ -108,6 +109,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
     name = user_row.get("first_name") or str(target_uid)
     rank = await db.user_rank(chat_id, target_uid)
     total_msgs = rank[0] if rank else 0
+
     try:
         reputation_data = await db.reputation_get(target_uid)
         reputation_score = reputation_data.get("score", 5.5)
@@ -158,7 +160,11 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
     balance = user_row.get("balance")
     if balance is None:
         balance = 10
+
     credit = user_row.get("credit") or 0
+
+    # Баланс сберкнижки.
+    savings = user_row.get("savings_balance") or 0
 
     try:
         awards_total = await db.award_total_stars(chat_id, target_uid)
@@ -166,7 +172,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
         logger.warning("profile awards_total: %s", exc)
         awards_total = 0
 
-    # Разбиваем информацию на короткие смысловые блоки.
+    # Главная страница профиля.
     return (
         f"👤 <b>ПРОФИЛЬ УЧАСТНИКА</b>\n"
         f"<b>{_safe(name)}</b>\n"
@@ -174,6 +180,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
         "━━━━━━━━━━━━━━━━━━\n"
         f"💬 <b>{total_msgs:,}</b> сообщений   ·   ⭐ Репутация: <b>{reputation_score}</b>\n"
         f"🪙 <b>{balance:,}</b> монет   ·   💳 Кредит: <b>{credit:,}</b>\n"
+        f"📖 Сберкнижка: <b>{savings:,}</b> монет\n"
         f"🏅 Награды: <b>{awards_total} ★</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "<b>ЛИЧНОЕ</b>\n"
@@ -277,6 +284,7 @@ async def _render_awards(context, chat_id: int, target_uid: int) -> str:
         f"Получено: <b>{len(items)}</b>  ·  Всего звёзд: <b>{total} ★</b>",
         "",
     ]
+
     for award in items:
         stars = max(0, min(int(award.get("stars") or 0), 10))
         star_line = "★" * stars + "☆" * (10 - stars)
@@ -364,6 +372,7 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     _, section, uid_text = parts
+
     try:
         target_uid = int(uid_text)
     except ValueError:
@@ -384,6 +393,7 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if not renderer:
                 await query.answer("Раздел не найден.", show_alert=True)
                 return
+
             profile_text = await renderer(context, chat.id, target_uid)
             keyboard = _kb_section(target_uid)
 
@@ -393,10 +403,12 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=keyboard,
         )
         await query.answer()
+
     except TelegramError as exc:
         if "not modified" in str(exc).lower():
             await query.answer()
             return
+
         logger.warning("profile_callback: %s", exc)
         try:
             await query.answer("Не удалось обновить профиль.", show_alert=True)
