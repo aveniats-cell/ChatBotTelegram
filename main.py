@@ -11,6 +11,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
     ContextTypes,
     filters,
 )
@@ -29,6 +31,7 @@ import sss
 import complaints
 import warns
 import aura
+import aura_admin
 import awards
 import actions
 import ai
@@ -41,6 +44,7 @@ import commands_dop       # noqa: F401 — регистрирует команд
 import commands_dop_handlers
 import shop
 import reputation
+import blacklist
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -101,28 +105,70 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await msg.reply_text("🔄 Контекст ИИ сброшен.")
 
 
+def _split_telegram_text(text: str, limit: int = 3900) -> list[str]:
+    """Делит длинный ответ на сообщения, не обрезая его."""
+    text = str(text or "")
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit + 1)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit + 1)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        chunks.append(text)
+    return chunks or [""]
+
+
 async def _run_ai(user, msg, prompt: str) -> None:
     remain = await ai.try_acquire(user.id)
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
+
+    needed = ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip())
     thinking = await msg.reply_text("🤔 Думаю…")
     answer = await ai.ask_ai(prompt, user_id=user.id)
+
     if not answer:
+        left = await db.get_ai_tokens(user.id)
+        if left < needed:
+            error_text = (
+                f"🧠 Недостаточно токенов. Нужно {needed}, у тебя {left}.\n"
+                "Купи токены в «Магазине» → «Токены ИИ»."
+            )
+        else:
+            error_text = "⚠️ ИИ не ответил. Если токены были списаны, они возвращены. Попробуй позже."
         try:
-            await thinking.edit_text("⚠️ ИИ не ответил. Попробуй позже.")
+            await thinking.edit_text(error_text)
         except Exception:
             pass
         return
-    if len(answer) > 4000:
-        answer = answer[:4000] + "…"
-    try:
-        await thinking.edit_text(answer)
-    except Exception:
+
+    # ask_ai возвращает это сообщение, если атомарное списание не удалось.
+    if answer.startswith("🧠 Недостаточно токенов:"):
         try:
-            await msg.reply_text(answer)
+            await thinking.edit_text(answer)
         except Exception:
             pass
+        return
+
+    left = await db.get_ai_tokens(user.id)
+    chunks = _split_telegram_text(answer)
+    chunks[-1] += f"\n\n🧠 Списано: {needed} · Осталось: {left}"
+    try:
+        await thinking.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await msg.reply_text(chunk)
+    except Exception:
+        # Если редактирование не удалось, отправляем весь ответ отдельными сообщениями.
+        try:
+            for chunk in chunks:
+                await msg.reply_text(chunk)
+        except Exception:
+            logger.exception("Не удалось отправить полный ответ ИИ")
 
 
 async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,25 +176,21 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
+
     text = (msg.text or "").strip()
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if msg.reply_to_message.from_user.id == context.bot.id:
-            prompt = _AI_WORD.sub("", text).strip()
-            if not prompt:
-                await msg.reply_text("Напиши вопрос реплаем.")
-                return
-            await _run_ai(user, msg, prompt)
-            return
-    m = _AI_WORD.match(text)
-    if not m:
+    match = _AI_WORD.match(text)
+    if not match:
         return
-    prompt = text[m.end():].strip()
+
+    prompt = text[match.end():].strip()
     if not prompt:
         await msg.reply_text(
-            "Формат: <code>ИИ Привет</code> или реплай на сообщение бота.",
+            "Формат: <code>ИИ Привет</code> или <code>Браини Как дела?</code>.\n"
+            "1 слово в запросе = 1 токен. Токены можно купить в «Магазине».",
             parse_mode=ParseMode.HTML,
         )
         return
+
     await _run_ai(user, msg, prompt)
 
 
@@ -258,6 +300,16 @@ def build_app() -> Application:
     )
     app.add_error_handler(_error_handler)
 
+    # Глобальный фильтр ставится раньше всех команд, сообщений и callback-кнопок.
+    # Заблокированные пользователи не доходят до обработчиков бота.
+    app.add_handler(
+        TypeHandler(Update, blacklist.guard_blacklisted_update),
+        group=-1,
+    )
+
+    app.add_handler(CommandHandler("banbot", blacklist.cmd_banbot))
+    app.add_handler(CommandHandler("unbanbot", blacklist.cmd_unbanbot))
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
@@ -266,6 +318,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
+    app.add_handler(CommandHandler("auraplush", aura_admin.cmd_aura_plush))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
     app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
 
@@ -287,6 +340,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сберкнижка\s*$"), economy.cmd_savings_book))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Сберкнижка(\s|$)"), economy.cmd_savings_deposit))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Сберкнижка(\s|$)"), economy.cmd_savings_withdraw))
+
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Кредит(\s|$)"), economy.cmd_credit_take))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
@@ -454,11 +508,6 @@ def build_app() -> Application:
     commands_dop_handlers.register(app)
 
     if CHAT_ID:
-        app.add_handler(MessageHandler(
-            filters.REPLY & filters.Chat(chat_id=CHAT_ID),
-            cmd_ai,
-        ))
-
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
