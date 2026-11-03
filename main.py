@@ -7,14 +7,8 @@ from datetime import time as dtime, timezone
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    TypeHandler,
-    ApplicationHandlerStop,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    TypeHandler, ContextTypes, filters,
 )
 
 import db
@@ -56,14 +50,12 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 CHAT_ID = int(os.getenv("CHAT_ID", "0") or "0")
-
 if not ADMIN_ID:
     logger.error("main: ADMIN_ID не задан — админ-команды работать не будут!")
 
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = "webhook"
-
 _AI_WORD = re.compile(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)")
 
 
@@ -94,6 +86,48 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg:
         await msg.reply_text("pong 🏓")
+
+
+async def cmd_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет сообщение-реплай и команду -смс; доступно владельцу и комиссарам."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+
+    # _require_role пропускает ADMIN_ID и пользователей с ролью commissar.
+    if not await roles._require_role(update, ("commissar",)):
+        await msg.reply_text("⛔ Только владелец или комиссар могут использовать -смс.")
+        return
+
+    target = msg.reply_to_message
+    if not target:
+        await msg.reply_text(
+            "Ответь командой <code>-смс</code> на сообщение, которое нужно удалить.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=target.message_id)
+    except Exception as e:
+        logger.warning(
+            "cmd_delete_message: не удалось удалить цель: chat_id=%s message_id=%s: %s",
+            chat.id, target.message_id, e,
+        )
+        await msg.reply_text(
+            "⚠️ Не удалось удалить отмеченное сообщение. "
+            "Проверь права бота администратора и возможность удаления этого сообщения."
+        )
+        return
+
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.warning(
+            "cmd_delete_message: цель удалена, но команда осталась: chat_id=%s message_id=%s: %s",
+            chat.id, msg.message_id, e,
+        )
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -147,7 +181,6 @@ async def _run_ai(user, msg, prompt: str) -> None:
             pass
         return
 
-    # ask_ai возвращает это сообщение, если атомарное списание не удалось.
     if answer.startswith("🧠 Недостаточно токенов:"):
         try:
             await thinking.edit_text(answer)
@@ -163,7 +196,6 @@ async def _run_ai(user, msg, prompt: str) -> None:
         for chunk in chunks[1:]:
             await msg.reply_text(chunk)
     except Exception:
-        # Если редактирование не удалось, отправляем весь ответ отдельными сообщениями.
         try:
             for chunk in chunks:
                 await msg.reply_text(chunk)
@@ -176,12 +208,10 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
-
     text = (msg.text or "").strip()
     match = _AI_WORD.match(text)
     if not match:
         return
-
     prompt = text[match.end():].strip()
     if not prompt:
         await msg.reply_text(
@@ -190,7 +220,6 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-
     await _run_ai(user, msg, prompt)
 
 
@@ -238,6 +267,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
         "• Магазин — пакеты команд\n"
+        "• -смс (реплай на сообщение; владелец/комиссары)\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
         "• /restart /help"
@@ -269,11 +299,7 @@ async def post_init(app: Application) -> None:
             interval=top.FLUSH_INTERVAL_SEC,
             first=top.FLUSH_INTERVAL_SEC,
         )
-        app.job_queue.run_repeating(
-            _cleanup_polls_job,
-            interval=60,
-            first=60,
-        )
+        app.job_queue.run_repeating(_cleanup_polls_job, interval=60, first=60)
         economy.register_jobs(app)
     else:
         logger.warning("JobQueue не инициализирован")
@@ -300,8 +326,7 @@ def build_app() -> Application:
     )
     app.add_error_handler(_error_handler)
 
-    # Глобальный фильтр ставится раньше всех команд, сообщений и callback-кнопок.
-    # Заблокированные пользователи не доходят до обработчиков бота.
+    # Глобальный фильтр: заблокированные пользователи не доходят до обработчиков.
     app.add_handler(
         TypeHandler(Update, blacklist.guard_blacklisted_update),
         group=-1,
@@ -332,6 +357,12 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поймать(\s|$)"), roles.sheriff_catch))
     app.add_handler(CallbackQueryHandler(roles.catch_callback, pattern=r"^catch:"))
 
+    # -смс: только владелец (ADMIN_ID) и комиссары; нужен реплай.
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^-смс\s*$"),
+        cmd_delete_message,
+    ))
+
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Мут(\s|$)"), roles.mute_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Мут(\s|$)"), roles.unmute_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
@@ -350,23 +381,27 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+ВКассу(\s|$)"), economy.cmd_treasury_add))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^ОбрезатьКасну(\s|$)"), economy.cmd_treasury_trim))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Зарплата(\s|$)"), economy.cmd_salary))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+богачи(\s|$)"), economy.cmd_top_rich))
-
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
-                                   economy.cmd_burn_treasury))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
-                                   economy.cmd_burn_user))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил\s+\d+\s+казна(\s|$)"),
-                                   economy.cmd_mint_treasury))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Утил(\s|$)"),
-                                   economy.cmd_mint_user))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+богачи(\s|$)"), top.cmd_top_rich))
 
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^казино(\s|$)"), casino.cmd_casino,
+        filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
+        economy.cmd_burn_treasury,
     ))
-    app.add_handler(CallbackQueryHandler(
-        casino.casino_help_callback, pattern=r"^cas:help:",
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
+        economy.cmd_burn_user,
     ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Утил\s+\d+\s+казна(\s|$)"),
+        economy.cmd_mint_treasury,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Утил(\s|$)"),
+        economy.cmd_mint_user,
+    ))
+
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^казино(\s|$)"), casino.cmd_casino))
+    app.add_handler(CallbackQueryHandler(casino.casino_help_callback, pattern=r"^cas:help:"))
 
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+все(\s|$)"), top.cmd_top_all))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+день(\s|$)"), top.cmd_top_day))
@@ -381,19 +416,18 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+браки(\s|$)"), wedding.cmd_marriage_top))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
-    # ── глобальная репутация
+    # Глобальная репутация.
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^Репутация(?:\s+.*)?$"), reputation.cmd_reputation,
+        filters.Regex(r"(?i)^Репутация(?:\s+.*)?$"),
+        reputation.cmd_reputation,
     ))
-    # Голосуем только точным сообщением + или - в ответ на сообщение пользователя.
     app.add_handler(MessageHandler(
-        filters.REPLY & filters.Regex(r"^[+-]$"), reputation.cmd_vote,
+        filters.REPLY & filters.Regex(r"^[+-]$"),
+        reputation.cmd_vote,
     ))
 
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"),
-                                   profile.cmd_profile))
-    app.add_handler(CallbackQueryHandler(profile.profile_callback,
-                                         pattern=r"^prof:"))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Профиль(\s|$)"), profile.cmd_profile))
+    app.add_handler(CallbackQueryHandler(profile.profile_callback, pattern=r"^prof:"))
 
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^хо(\s|$)"), tictactoe.cmd_challenge))
     app.add_handler(CallbackQueryHandler(tictactoe.ttt_callback, pattern=r"^ttt:"))
@@ -407,10 +441,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(sss.public_trial_callback, pattern=r"^pubtrial:"))
     app.add_handler(CallbackQueryHandler(sss.public_admin_callback, pattern=r"^pubadm:"))
 
-    app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^правила(\s+чата)?\s*[.!?]*\s*$"),
-        rules.cmd_rules,
-    ))
+    app.add_handler(MessageHandler(filters.Regex(rules.RULES_RE), rules.cmd_rules))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^Опрос\s+ССС(\s|/)"),
@@ -420,16 +451,13 @@ def build_app() -> Application:
         filters.Regex(r"(?i)^Опрос(?!\s+ССС)(\s|/)"),
         polls.cmd_poll_public,
     ))
-    app.add_handler(CallbackQueryHandler(
-        polls.poll_callback, pattern=r"^poll:",
-    ))
+    app.add_handler(CallbackQueryHandler(polls.poll_callback, pattern=r"^poll:"))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
         complaints.cmd_complaint,
     ))
-    app.add_handler(CallbackQueryHandler(complaints.complaint_callback,
-                                         pattern=r"^compl:"))
+    app.add_handler(CallbackQueryHandler(complaints.complaint_callback, pattern=r"^compl:"))
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^\+(Предупреждение|Пред|Варн)(\s|$)"),
         warns.cmd_warn,
@@ -439,72 +467,45 @@ def build_app() -> Application:
         warns.cmd_unwarn,
     ))
 
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^дроч(\s|$)"),
-                                   aura.cmd_droch))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+аура(\s|$)"),
-                                   aura.cmd_aura_top))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аура(\s|$)"),
-                                   aura.cmd_aura))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^дроч(\s|$)"), aura.cmd_droch))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+аура(\s|$)"), aura.cmd_aura_top))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Аура(\s|$)"), aura.cmd_aura))
 
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Награда(\s|$)"),
-                                   awards.cmd_award))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
-                                   awards.cmd_unaward))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Награда(\s|$)"), awards.cmd_award))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Награда(\s|$)"), awards.cmd_unaward))
 
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
-                                   actions.cmd_slap))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"),
-                                   actions.cmd_kiss))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять(\s|$)"),
-                                   actions.cmd_hug))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Побить(\s|$)"),
-                                   actions.cmd_hit))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обоссать(\s|$)"),
-                                   actions.cmd_piss))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"),
-                                   actions.cmd_pat))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+леща(\s|$)"), actions.cmd_slap))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Поцеловать(\s|$)"), actions.cmd_kiss))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять(\s|$)"), actions.cmd_hug))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Побить(\s|$)"), actions.cmd_hit))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обоссать(\s|$)"), actions.cmd_piss))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить(\s|$)"), actions.cmd_pat))
 
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Засос(\s|$)"),
-                                   actions.cmd_kiss_deep))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расстрел(\s|$)"),
-                                   actions.cmd_shoot))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+по\s+шапке(\s|$)"),
-                                   actions.cmd_bonk))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Выстрел(\s|$)"),
-                                   actions.cmd_gunshot))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расцеловать(\s|$)"),
-                                   actions.cmd_kiss_all))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+18\+?(\s|$)"),
-                                   actions.cmd_make18))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Станцевать(\s|$)"),
-                                   actions.cmd_dance))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять\s+всех(\s|$)"),
-                                   actions.cmd_hug_all))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить\s+всех(\s|$)"),
-                                   actions.cmd_pat_all))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Лещей\s+всем(\s|$)"),
-                                   actions.cmd_slap_all))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Тыкнуть(\s|$)"),
-                                   actions.cmd_poke))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Защекотать(\s|$)"),
-                                   actions.cmd_tickle))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
-                                   actions.cmd_handshake))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Засос(\s|$)"), actions.cmd_kiss_deep))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расстрел(\s|$)"), actions.cmd_shoot))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Дать\s+по\s+шапке(\s|$)"), actions.cmd_bonk))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Выстрел(\s|$)"), actions.cmd_gunshot))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Расцеловать(\s|$)"), actions.cmd_kiss_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сделать\s+18\+?(\s|$)"), actions.cmd_make18))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Станцевать(\s|$)"), actions.cmd_dance))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Обнять\s+всех(\s|$)"), actions.cmd_hug_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Погладить\s+всех(\s|$)"), actions.cmd_pat_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Лещей\s+всем(\s|$)"), actions.cmd_slap_all))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Тыкнуть(\s|$)"), actions.cmd_poke))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Защекотать(\s|$)"), actions.cmd_tickle))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
+        actions.cmd_handshake,
+    ))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
         cmd_ai,
     ))
 
-    # ── магазин
-    app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop,
-    ))
-    app.add_handler(CallbackQueryHandler(
-        shop.shop_callback, pattern=r"^shop:",
-    ))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop))
+    app.add_handler(CallbackQueryHandler(shop.shop_callback, pattern=r"^shop:"))
 
-    # ── динамические команды из commands_dop.py
     commands_dop_handlers.register(app)
 
     if CHAT_ID:
