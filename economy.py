@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-CREDIT_DAILY_LIMIT = 100
-CREDIT_PERCENT_PER_DAY = 10
+CREDIT_DAILY_LIMIT = 1000
+CREDIT_PERCENT_PER_DAY = 1
+CREDIT_AUTO_COLLECT_PCT = 25
 
 TRANSFER_FEE_PCT = 3
 TRANSFER_MIN = 5
@@ -62,7 +63,7 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     amount = _num_after(msg.text or "", "+Кредит")
     if amount is None:
         await msg.reply_text(
-            "Формат: <code>+Кредит 50</code> (от 1 до 100).",
+            "Формат: <code>+Кредит 500</code> (от 1 до 1000).",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -116,7 +117,8 @@ async def cmd_credit_take(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"💳 Взят кредит из казны: <b>{amount}</b>\n"
         f"Долг: <b>{new_credit}</b>\n"
         f"Казна: <b>{new_treasury}</b>\n"
-        f"Ставка: <b>{CREDIT_PERCENT_PER_DAY}%</b> в день (идёт в казну).",
+        f"Ставка: <b>{CREDIT_PERCENT_PER_DAY}%</b> в день.\n"
+        f"Автопогашение: до <b>{CREDIT_AUTO_COLLECT_PCT}%</b> баланса раз в сутки.",
         parse_mode=ParseMode.HTML,
     )
     await _check_default_after(context, chat.id)
@@ -910,13 +912,23 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("tax_job send: %s", e)
 
 
+async def credit_auto_collect_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневно удерживает часть положительного баланса в счёт кредита."""
+    try:
+        affected = await db.auto_collect_credit_payments(CREDIT_AUTO_COLLECT_PCT, _today_utc())
+        if affected:
+            logger.info("credit_auto_collect_job: автоматически погашено кредитов у %s пользователей", affected)
+    except Exception as e:
+        logger.exception("credit_auto_collect_job: %s", e)
+
+
 async def daily_interest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(os.getenv("CHAT_ID", "0") or "0")
     if not chat_id:
         return
     try:
         affected = await db.apply_credit_interest_to_treasury(
-            chat_id, CREDIT_PERCENT_PER_DAY,
+            chat_id, CREDIT_PERCENT_PER_DAY, _today_utc(),
         )
         logger.info("daily_interest_job: затронуто %s, казна пополнена", affected)
     except Exception as e:
@@ -932,6 +944,10 @@ def register_jobs(app) -> None:
         time=dtime(hour=0, minute=10, tzinfo=TZ),
     )
     app.job_queue.run_daily(
+        credit_auto_collect_job,
+        time=dtime(hour=0, minute=25, tzinfo=TZ),
+    )
+    app.job_queue.run_daily(
         tax_job,
         time=dtime(hour=0, minute=40, tzinfo=TZ),
     )
@@ -939,7 +955,7 @@ def register_jobs(app) -> None:
         default_watchdog_job, interval=3600, first=60,
     )
     logger.info(
-        "economy: проценты (00:10), налог (00:40), "
+        "economy: проценты (00:10), автопогашение кредитов (00:25), налог (00:40), "
         "watchdog (раз в час), cooldown дефолта %sч, "
         "органический pct=%s%%, искусственный pct=100%% запланированы",
         DEFAULT_COOLDOWN_HOURS, DEFAULT_PCT,
