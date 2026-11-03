@@ -870,38 +870,52 @@ async def cmd_all_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        total = await db.tax_active_balances(
-            TAX_MIN_BALANCE, TAX_PCT, days=TAX_ACTIVE_DAYS,
-        )
-    except Exception as e:
-        logger.warning("tax_job: %s", e)
+    """Ежедневно собирает налог с активных пользователей указанного чата."""
+    chat_id = TAX_REPORT_CHAT_ID
+    if not chat_id:
+        logger.error("tax_job: CHAT_ID не задан — налог не собран")
         return
 
-    chat_id = TAX_REPORT_CHAT_ID
-    if total > 0 and chat_id:
+    # В db.tax_active_balances первый аргумент — chat_id.
+    # Раньше передавались TAX_MIN_BALANCE и TAX_PCT, поэтому сбор
+    # завершался ошибкой из-за неверного порядка аргументов.
+    try:
+        total = await db.tax_active_balances(
+            chat_id,
+            TAX_MIN_BALANCE,
+            TAX_PCT,
+            days=TAX_ACTIVE_DAYS,
+        )
+    except Exception as e:
+        logger.exception("tax_job: ошибка сбора налога: %s", e)
+        return
+
+    if total > 0:
         try:
             await db.treasury_add(chat_id, total)
         except Exception as e:
-            logger.warning("tax_job treasury: %s", e)
+            logger.exception("tax_job: не удалось зачислить налог в казну: %s", e)
+            return
 
-    new_treasury = await db.treasury_get(chat_id) if chat_id else 0
-    if not chat_id:
-        return
+    try:
+        new_treasury = await db.treasury_get(chat_id)
+    except Exception as e:
+        logger.exception("tax_job: не удалось получить баланс казны: %s", e)
+        new_treasury = 0
 
     if total <= 0:
         text = (
-            f"🏦 <b>Налог дня</b>\n"
-            f"Сегодня платить некому: у активных баланс ≤ {TAX_MIN_BALANCE}.\n"
+            f"🏦 <b>Налог дня</b>\\n"
+            f"Сегодня платить некому: у активных баланс ≤ {TAX_MIN_BALANCE}.\\n"
             f"Казна: <b>{new_treasury}</b>"
         )
     else:
         text = (
-            f"🏦 <b>Налог дня</b>\n"
-            f"Ставка: <b>{TAX_PCT}%</b> с баланса > {TAX_MIN_BALANCE}\n"
-            f"Платят только активные (писали за {TAX_ACTIVE_DAYS} дн.)\n"
-            f"Собрано в казну: <b>{total}</b> монет\n"
-            f"Казна: <b>{new_treasury}</b>\n\n"
+            f"🏦 <b>Налог дня</b>\\n"
+            f"Ставка: <b>{TAX_PCT}%</b> с баланса > {TAX_MIN_BALANCE}\\n"
+            f"Платят только активные (писали за {TAX_ACTIVE_DAYS} дн.)\\n"
+            f"Собрано в казну: <b>{total}</b> монет\\n"
+            f"Казна: <b>{new_treasury}</b>\\n\\n"
             f"<i>Неактивные не платят. Вернулся — баланс на месте.</i>"
         )
     try:
