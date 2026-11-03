@@ -445,6 +445,9 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
+        ("users", "credit_chat_id", "INTEGER"),
+        ("users", "credit_interest_day", "TEXT"),
+        ("users", "credit_auto_collect_day", "TEXT"),
         ("users", "salary_today", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "salary_day", "TEXT"),
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
@@ -512,6 +515,63 @@ async def _migrate_tables() -> None:
         rs = await _exec(sql)
         if getattr(rs, "error", False):
             logger.warning("migrate: не удалось выполнить: %s", sql)
+
+    # Кредитные платежи и проценты зачисляются в казну триггерами в той же
+    # SQL-операции, что и изменение долга. Это исключает рассинхронизацию
+    # баланса пользователя и казны при сетевой ошибке между двумя запросами.
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_issue_from_treasury
+        BEFORE UPDATE OF credit ON users
+        WHEN NEW.credit > OLD.credit
+         AND NEW.balance > OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            SELECT CASE
+                WHEN COALESCE((
+                    SELECT balance FROM treasury WHERE chat_id = NEW.credit_chat_id
+                ), 0) < (NEW.credit - OLD.credit)
+                THEN RAISE(ABORT, 'insufficient treasury for credit')
+            END;
+            UPDATE treasury
+               SET balance = balance - (NEW.credit - OLD.credit)
+             WHERE chat_id = NEW.credit_chat_id
+               AND balance >= (NEW.credit - OLD.credit);
+        END
+    """)
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_repayment_to_treasury
+        AFTER UPDATE OF credit ON users
+        WHEN NEW.credit < OLD.credit
+         AND NEW.balance < OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            INSERT INTO treasury (chat_id, balance)
+            VALUES (OLD.credit_chat_id, OLD.credit - NEW.credit)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                balance = treasury.balance + excluded.balance;
+        END
+    """)
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_interest_to_treasury
+        AFTER UPDATE OF credit ON users
+        WHEN NEW.credit > OLD.credit
+         AND NEW.balance = OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            INSERT INTO treasury (chat_id, balance)
+            VALUES (OLD.credit_chat_id, NEW.credit - OLD.credit)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                balance = treasury.balance + excluded.balance;
+        END
+    """)
+    # Старые кредиты не имели привязки к казне. Для них используем основной CHAT_ID.
+    default_credit_chat = int(os.getenv("CHAT_ID", "0") or "0")
+    if default_credit_chat:
+        await _exec(
+            "UPDATE users SET credit_chat_id = ? "
+            "WHERE credit > 0 AND credit_chat_id IS NULL",
+            [default_credit_chat],
+        )
 
     await _backfill_coin_assets()
 
@@ -1352,105 +1412,101 @@ async def get_salary_frac(user_id: int, day: str) -> int:
 async def take_credit_from_treasury(
     chat_id: int, user_id: int, amount: int, today: str,
 ) -> bool:
-    logger.info("credit_from_treasury: chat=%s user=%s amount=%s",
-                chat_id, user_id, amount)
-    if amount <= 0:
+    """Выдаёт кредит; триггер списывает его из казны в той же транзакции."""
+    if amount <= 0 or amount > 1000:
         return False
-
-    cur = await treasury_get(chat_id)
-    logger.info("credit_from_treasury: treasury_before=%s", cur)
-    if cur < amount:
-        logger.info("credit_from_treasury: казна меньше нужного")
-        return False
-
     rs = await _exec(
         """UPDATE users
-           SET credit  = COALESCE(credit, 0) + ?,
+           SET credit = COALESCE(credit, 0) + ?,
                balance = COALESCE(balance, 10) + ?,
-               credit_taken_day = ?
+               credit_taken_day = ?,
+               credit_chat_id = ?
            WHERE user_id = ?
              AND COALESCE(credit, 0) = 0
              AND (credit_taken_day IS NULL OR credit_taken_day != ?)""",
-        [amount, amount, today, user_id, today],
+        [amount, amount, today, chat_id, user_id, today],
     )
-    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
-        logger.warning(
-            "credit_from_treasury: UPDATE users failed (условия не выполнены или ошибка)",
-        )
+    if getattr(rs, "error", False):
+        # В том числе сюда попадает RAISE(ABORT), если казны недостаточно.
+        logger.info("take_credit_from_treasury: выдача отклонена user=%s", user_id)
         return False
-
-    ok = await treasury_withdraw(chat_id, amount)
-    logger.info("credit_from_treasury: withdraw ok=%s", ok)
-    if not ok:
-        await _exec(
-            """UPDATE users
-               SET credit  = COALESCE(credit, 0) - ?,
-                   balance = COALESCE(balance, 10) - ?,
-                   credit_taken_day = NULL
-               WHERE user_id = ?
-                 AND COALESCE(credit, 0) >= ?""",
-            [amount, amount, user_id, amount],
-        )
-        return False
-
-    logger.info("credit_from_treasury: успешно, казна=%s",
-                await treasury_get(chat_id))
-    return True
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def repay_credit_to_treasury(
     chat_id: int, user_id: int, amount: int,
 ) -> bool:
+    """Ручное погашение; триггер зачисляет платёж в казну атомарно."""
     if amount <= 0:
         return False
     rs = await _exec(
         """UPDATE users
-           SET credit  = COALESCE(credit, 0) - ?,
-               balance = COALESCE(balance, 10) - ?
+           SET credit = COALESCE(credit, 0) - ?,
+               balance = COALESCE(balance, 10) - ?,
+               credit_chat_id = credit_chat_id
            WHERE user_id = ?
              AND COALESCE(balance, 0) >= ?
              AND COALESCE(credit, 0) >= ?""",
         [amount, amount, user_id, amount, amount],
     )
-    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+    if getattr(rs, "error", False):
         return False
-    ok = await treasury_add(chat_id, amount)
-    if not ok:
-        # вернуть пользователю, если казна не приняла
-        await _exec(
-            """UPDATE users
-               SET credit  = COALESCE(credit, 0) + ?,
-                   balance = COALESCE(balance, 10) + ?
-               WHERE user_id = ?""",
-            [amount, amount, user_id],
-        )
-        return False
-    return True
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
-async def apply_credit_interest_to_treasury(chat_id: int, percent: float) -> int:
+async def auto_collect_credit_payments(percent: int = 25, today: Optional[str] = None) -> int:
+    """Автоматически удерживает часть баланса у должников.
+
+    Один UPDATE на пользователя изменяет и баланс, и долг. Триггер БД
+    зачисляет удержанную сумму в связанную казну в рамках той же операции.
+    """
+    percent = max(1, min(int(percent), 100))
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    payment = "MIN(COALESCE(credit, 0), MAX(1, CAST(COALESCE(balance, 0) * ? / 100 AS INTEGER)))"
     rs = await _exec(
-        """SELECT COALESCE(SUM(CAST(credit * ? / 100 AS INTEGER)), 0)
-           FROM users WHERE credit > 0""",
-        [percent],
+        f"""UPDATE users
+            SET balance = COALESCE(balance, 0) - {payment},
+                credit = COALESCE(credit, 0) - {payment},
+                credit_auto_collect_day = ?
+            WHERE COALESCE(credit, 0) > 0
+              AND COALESCE(balance, 0) > 0
+              AND credit_chat_id IS NOT NULL
+              AND (credit_auto_collect_day IS NULL OR credit_auto_collect_day != ?)""",
+        [percent, percent, today, today],
     )
-    total = (rs.rows[0][0] if rs.rows else 0) or 0
-    if total <= 0:
+    if getattr(rs, "error", False):
+        logger.error("auto_collect_credit_payments: ошибка UPDATE")
         return 0
-    rs2 = await _exec(
-        "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
-        "WHERE credit > 0",
-        [percent],
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def apply_credit_interest_to_treasury(
+    chat_id: int, percent: float, today: Optional[str] = None,
+) -> int:
+    """Начисляет проценты не более одного раза за календарный день.
+
+    Триггер одновременно зачисляет начисленные проценты в казну.
+    """
+    if percent <= 0:
+        return 0
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rs = await _exec(
+        """UPDATE users
+           SET credit = credit + CAST(credit * ? / 100 AS INTEGER),
+               credit_interest_day = ?
+           WHERE credit > 0
+             AND credit_chat_id = ?
+             AND (credit_interest_day IS NULL OR credit_interest_day != ?)""",
+        [percent, today, chat_id, today],
     )
-    affected = getattr(rs2, "rows_affected", 0) or 0
-    if affected > 0:
-        ok = await treasury_add(chat_id, total)
-        if not ok:
-            logger.error(
-                "apply_credit_interest_to_treasury: проценты начислены, "
-                "но казна не пополнена (chat=%s total=%s)", chat_id, total,
-            )
-    return affected
+    if getattr(rs, "error", False):
+        logger.error("apply_credit_interest_to_treasury: ошибка UPDATE")
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 # ---------- subscriptions ----------
