@@ -6,6 +6,8 @@ import logging
 from typing import Optional
 
 import aiohttp
+
+import db
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,10 @@ AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
 MODEL = "openai-fast"
+
+INSUFFICIENT_TOKENS_PREFIX = "🧠 Недостаточно токенов:"
+MAX_PROMPT_CHARS = 16000
+MAX_OUTPUT_TOKENS = 4096
 
 COOLDOWN_SEC = 5.0
 
@@ -37,9 +43,9 @@ async def _get_session() -> aiohttp.ClientSession:
                 ttl_dns_cache=300,
             ),
             timeout=aiohttp.ClientTimeout(
-                total=30,
-                connect=10,
-                sock_read=20,
+                total=120,
+                connect=15,
+                sock_read=90,
             ),
         )
     return _session
@@ -88,8 +94,18 @@ def _append(user_id: int, role: str, content: str) -> None:
         h.pop(0)
 
 
+def count_words(text: str) -> int:
+    """Считает слова по пробельным разделителям; повторные пробелы не считаются."""
+    return len((text or "").split())
+
+
 async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
-    """Отправляет запрос в gemini. Возвращает текст или None."""
+    """Отправляет запрос в API. 1 токен списывается за каждое слово запроса.
+
+    Списание централизовано здесь, поэтому все модули, вызывающие ask_ai с
+    user_id, используют одну и ту же тарификацию. При любой ошибке API токены
+    возвращаются в исходном количестве.
+    """
     if not AI_TOKEN:
         logger.error("ai: AI_TOKEN не задан в переменных окружения")
         return None
@@ -98,31 +114,48 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
     if not url:
         return None
 
-    if len(prompt) > 8000:
-        prompt = prompt[:8000]
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None
+    if len(prompt) > MAX_PROMPT_CHARS:
+        logger.info("ai: запрос обрезан с %s до %s символов", len(prompt), MAX_PROMPT_CHARS)
+        prompt = prompt[:MAX_PROMPT_CHARS]
 
-    messages = [{
-        "role": "system",
-        "content": "Ты умный чат-бот в Telegram. Пиши максимально кратко.",
-    }]
+    # Считаем только новое сообщение пользователя, не историю диалога.
+    token_cost = max(1, count_words(prompt))
+    charged = False
     if user_id is not None:
-        messages.extend(dict(m) for m in _get_history(user_id))
-    messages.append({"role": "user", "content": prompt})
+        charged = await db.consume_ai_tokens(user_id, token_cost)
+        if not charged:
+            balance = await db.get_ai_tokens(user_id)
+            return (
+                f"{INSUFFICIENT_TOKENS_PREFIX} нужно {token_cost}, "
+                f"у тебя {balance}.\n"
+                "Купи токены в «Магазине» → «Токены ИИ»."
+            )
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": 2048,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AI_TOKEN}",
-    }
-
-    session = await _get_session()
-
+    success = False
     try:
+        messages = [{
+            "role": "system",
+            "content": "Ты умный чат-бот в Telegram. Отвечай понятно и по существу. "
+                       "Если пользователь просит подробное объяснение, не сокращай ответ без необходимости.",
+        }]
+        if user_id is not None:
+            messages.extend(dict(m) for m in _get_history(user_id))
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {AI_TOKEN}",
+        }
+
+        session = await _get_session()
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status == 401:
                 logger.error("ai: 401 Unauthorized — проверь AI_TOKEN")
@@ -136,19 +169,18 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
                 return None
             if resp.status != 200:
                 body = await resp.text()
-                logger.warning("ai: HTTP %s — %s", resp.status, body[:300])
+                logger.warning("ai: HTTP %s — %s", resp.status, body[:500])
                 return None
 
             data = await resp.json(content_type=None)
             choices = data.get("choices") or []
             if not choices:
-                logger.warning("ai: пустой ответ — %s", repr(data)[:300])
+                logger.warning("ai: пустой ответ — %s", repr(data)[:500])
                 return None
 
             choice = choices[0]
-            finish = choice.get("finish_reason")
-            if finish == "length":
-                logger.warning("ai: ответ обрезан по max_tokens")
+            if choice.get("finish_reason") == "length":
+                logger.warning("ai: ответ достиг лимита max_tokens=%s", MAX_OUTPUT_TOKENS)
 
             msg = choice.get("message") or {}
             content = (msg.get("content") or "").strip()
@@ -158,14 +190,26 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
             if user_id is not None:
                 _append(user_id, "user", prompt)
                 _append(user_id, "assistant", content)
+            success = True
             return content
 
-    except aiohttp.ClientError as e:
-        logger.warning("ai: сеть — %s", e)
+    except asyncio.TimeoutError as exc:
+        logger.warning("ai: таймаут запроса: %s", exc)
         return None
-    except Exception as e:
-        logger.exception("ai: неожиданная ошибка — %s", e)
+    except aiohttp.ClientError as exc:
+        logger.warning("ai: сеть — %s", exc)
         return None
+    except Exception as exc:
+        logger.exception("ai: неожиданная ошибка — %s", exc)
+        return None
+    finally:
+        if charged and not success:
+            try:
+                refunded = await db.refund_ai_tokens(user_id, token_cost)
+                if not refunded:
+                    logger.error("ai: НЕ УДАЛОСЬ вернуть %s токенов user=%s", token_cost, user_id)
+            except Exception:
+                logger.exception("ai: ошибка возврата %s токенов user=%s", token_cost, user_id)
 
 
 async def try_acquire(user_id: int) -> float:
