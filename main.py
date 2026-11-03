@@ -11,8 +11,6 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    TypeHandler,
-    ApplicationHandlerStop,
     ContextTypes,
     filters,
 )
@@ -31,7 +29,6 @@ import sss
 import complaints
 import warns
 import aura
-import aura_admin
 import awards
 import actions
 import ai
@@ -44,7 +41,6 @@ import commands_dop       # noqa: F401 — регистрирует команд
 import commands_dop_handlers
 import shop
 import reputation
-import blacklist
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -110,35 +106,21 @@ async def _run_ai(user, msg, prompt: str) -> None:
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
-
-    # Токен резервируется до обращения к API, при ошибке возвращается.
-    if not await db.consume_ai_token(user.id):
-        balance = await db.get_ai_tokens(user.id)
-        await msg.reply_text(
-            "🧠 У тебя закончились токены ИИ.\n"
-            "Купи их в «Магазине» → «Токены ИИ».\n"
-            f"Остаток: {balance} токенов."
-        )
-        return
-
     thinking = await msg.reply_text("🤔 Думаю…")
     answer = await ai.ask_ai(prompt, user_id=user.id)
     if not answer:
-        await db.refund_ai_token(user.id)
         try:
-            await thinking.edit_text("⚠️ ИИ не ответил. Токен возвращён, попробуй позже.")
+            await thinking.edit_text("⚠️ ИИ не ответил. Попробуй позже.")
         except Exception:
             pass
         return
-
     if len(answer) > 4000:
         answer = answer[:4000] + "…"
-    left = await db.get_ai_tokens(user.id)
     try:
-        await thinking.edit_text(f"{answer}\n\n🧠 Токенов осталось: {left}")
+        await thinking.edit_text(answer)
     except Exception:
         try:
-            await msg.reply_text(f"{answer}\n\n🧠 Токенов осталось: {left}")
+            await msg.reply_text(answer)
         except Exception:
             pass
 
@@ -148,21 +130,25 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not user or not msg:
         return
-
     text = (msg.text or "").strip()
-    match = _AI_WORD.match(text)
-    if not match:
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if msg.reply_to_message.from_user.id == context.bot.id:
+            prompt = _AI_WORD.sub("", text).strip()
+            if not prompt:
+                await msg.reply_text("Напиши вопрос реплаем.")
+                return
+            await _run_ai(user, msg, prompt)
+            return
+    m = _AI_WORD.match(text)
+    if not m:
         return
-
-    prompt = text[match.end():].strip()
+    prompt = text[m.end():].strip()
     if not prompt:
         await msg.reply_text(
-            "Формат: <code>ИИ Привет</code> или <code>Браини Как дела?</code>.\n"
-            "Один запрос стоит 1 токен. Токены можно купить в «Магазине».",
+            "Формат: <code>ИИ Привет</code> или реплай на сообщение бота.",
             parse_mode=ParseMode.HTML,
         )
         return
-
     await _run_ai(user, msg, prompt)
 
 
@@ -197,6 +183,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Профиль\n"
         "• хо @user 50 — крестики (комиссия 5%)\n"
         "• +Кредит 50 / -Кредит 50 — из казны\n"
+        "• Сберкнижка / +Сберкнижка 500 / -Сберкнижка 200\n"
         "• +Монеты / -Монеты @user\n"
         "• +Утил / -Утил @user / казна\n"
         "• Перевод 50 @user — комиссия 3%\n"
@@ -271,16 +258,6 @@ def build_app() -> Application:
     )
     app.add_error_handler(_error_handler)
 
-    # Глобальный фильтр ставится раньше всех команд, сообщений и callback-кнопок.
-    # Заблокированные пользователи не доходят до обработчиков бота.
-    app.add_handler(
-        TypeHandler(Update, blacklist.guard_blacklisted_update),
-        group=-1,
-    )
-
-    app.add_handler(CommandHandler("banbot", blacklist.cmd_banbot))
-    app.add_handler(CommandHandler("unbanbot", blacklist.cmd_unbanbot))
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
@@ -289,7 +266,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(help_menu.help_callback, pattern=r"^help:"))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
-    app.add_handler(CommandHandler("auraplush", aura_admin.cmd_aura_plush))
     app.add_handler(CommandHandler("Defloult220099", economy.cmd_force_default))
     app.add_handler(CommandHandler("ALLMONEY", economy.cmd_all_money))
 
@@ -308,6 +284,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сберкнижка\s*$"), economy.cmd_savings_book))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Сберкнижка(\s|$)"), economy.cmd_savings_deposit))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Сберкнижка(\s|$)"), economy.cmd_savings_withdraw))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Кредит(\s|$)"), economy.cmd_credit_take))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"), economy.cmd_credit_repay))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Монеты(\s|$)"), economy.cmd_admin_coins))
@@ -475,6 +454,11 @@ def build_app() -> Application:
     commands_dop_handlers.register(app)
 
     if CHAT_ID:
+        app.add_handler(MessageHandler(
+            filters.REPLY & filters.Chat(chat_id=CHAT_ID),
+            cmd_ai,
+        ))
+
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
