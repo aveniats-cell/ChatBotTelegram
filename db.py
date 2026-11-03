@@ -420,10 +420,22 @@ async def _create_tables() -> None:
         )
     """)
 
+    await _exec("""
+        CREATE TABLE IF NOT EXISTS bot_blacklist (
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            first_name    TEXT,
+            banned_by     INTEGER,
+            reason        TEXT,
+            created_at    TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
 
 async def _migrate_tables() -> None:
     adds = [
         ("users", "balance", "INTEGER NOT NULL DEFAULT 10"),
+        ("users", "ai_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "sss_member", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "mutes_issued", "INTEGER NOT NULL DEFAULT 0"),
@@ -433,6 +445,9 @@ async def _migrate_tables() -> None:
         ("users", "tictactoe_losses", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "tictactoe_draws", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "credit_taken_day", "TEXT"),
+        ("users", "credit_chat_id", "INTEGER"),
+        ("users", "credit_interest_day", "TEXT"),
+        ("users", "credit_auto_collect_day", "TEXT"),
         ("users", "salary_today", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "salary_day", "TEXT"),
         ("users", "salary_frac", "INTEGER NOT NULL DEFAULT 0"),
@@ -497,11 +512,70 @@ async def _migrate_tables() -> None:
         "ON coin_purchases(coin_id)",
         "CREATE INDEX IF NOT EXISTS idx_coin_emitters_chat "
         "ON coin_emitters(chat_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_blacklist_username "
+        "ON bot_blacklist(username COLLATE NOCASE)",
     ]
     for sql in idx_stmts:
         rs = await _exec(sql)
         if getattr(rs, "error", False):
             logger.warning("migrate: не удалось выполнить: %s", sql)
+
+    # Кредитные платежи и проценты зачисляются в казну триггерами в той же
+    # SQL-операции, что и изменение долга. Это исключает рассинхронизацию
+    # баланса пользователя и казны при сетевой ошибке между двумя запросами.
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_issue_from_treasury
+        BEFORE UPDATE OF credit ON users
+        WHEN NEW.credit > OLD.credit
+         AND NEW.balance > OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            SELECT CASE
+                WHEN COALESCE((
+                    SELECT balance FROM treasury WHERE chat_id = NEW.credit_chat_id
+                ), 0) < (NEW.credit - OLD.credit)
+                THEN RAISE(ABORT, 'insufficient treasury for credit')
+            END;
+            UPDATE treasury
+               SET balance = balance - (NEW.credit - OLD.credit)
+             WHERE chat_id = NEW.credit_chat_id
+               AND balance >= (NEW.credit - OLD.credit);
+        END
+    """)
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_repayment_to_treasury
+        AFTER UPDATE OF credit ON users
+        WHEN NEW.credit < OLD.credit
+         AND NEW.balance < OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            INSERT INTO treasury (chat_id, balance)
+            VALUES (OLD.credit_chat_id, OLD.credit - NEW.credit)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                balance = treasury.balance + excluded.balance;
+        END
+    """)
+    await _exec("""
+        CREATE TRIGGER IF NOT EXISTS trg_credit_interest_to_treasury
+        AFTER UPDATE OF credit ON users
+        WHEN NEW.credit > OLD.credit
+         AND NEW.balance = OLD.balance
+         AND NEW.credit_chat_id IS NOT NULL
+        BEGIN
+            INSERT INTO treasury (chat_id, balance)
+            VALUES (OLD.credit_chat_id, NEW.credit - OLD.credit)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                balance = treasury.balance + excluded.balance;
+        END
+    """)
+    # Старые кредиты не имели привязки к казне. Для них используем основной CHAT_ID.
+    default_credit_chat = int(os.getenv("CHAT_ID", "0") or "0")
+    if default_credit_chat:
+        await _exec(
+            "UPDATE users SET credit_chat_id = ? "
+            "WHERE credit > 0 AND credit_chat_id IS NULL",
+            [default_credit_chat],
+        )
 
     await _backfill_coin_assets()
 
@@ -553,7 +627,7 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: str) ->
 async def get_user(user_id: int) -> Optional[dict]:
     rs = await _exec(
         """SELECT user_id, username, first_name, created_at,
-                  balance, credit, sss_member,
+                  balance, ai_tokens, credit, sss_member,
                   mutes_issued, reports_made, courts_held,
                   tictactoe_wins, tictactoe_losses, tictactoe_draws,
                   credit_taken_day, salary_today, salary_day, salary_frac,
@@ -566,13 +640,78 @@ async def get_user(user_id: int) -> Optional[dict]:
         return None
     r = rs.rows[0]
     keys = ["user_id", "username", "first_name", "created_at",
-            "balance", "credit", "sss_member",
+            "balance", "ai_tokens", "credit", "sss_member",
             "mutes_issued", "reports_made", "courts_held",
             "tictactoe_wins", "tictactoe_losses", "tictactoe_draws",
             "credit_taken_day", "salary_today", "salary_day", "salary_frac",
             "avatar_file_id", "coins_created", "savings_balance",
             "savings_interest_frac", "savings_interest_remainder", "savings_interest_day"]
     return dict(zip(keys, r))
+
+
+async def get_ai_tokens(user_id: int) -> int:
+    rs = await _exec(
+        "SELECT COALESCE(ai_tokens, 0) FROM users WHERE user_id = ?",
+        [user_id],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return 0
+    return max(0, int(rs.rows[0][0] or 0))
+
+
+async def consume_ai_tokens(user_id: int, amount: int) -> bool:
+    """Атомарно списывает указанное количество токенов ИИ."""
+    amount = int(amount)
+    if amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users SET ai_tokens = COALESCE(ai_tokens, 0) - ?
+           WHERE user_id = ? AND COALESCE(ai_tokens, 0) >= ?""",
+        [amount, user_id, amount],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
+
+
+async def refund_ai_tokens(user_id: int, amount: int) -> bool:
+    """Возвращает указанное количество токенов после неудачного запроса."""
+    amount = int(amount)
+    if amount <= 0:
+        return True
+    rs = await _exec(
+        """INSERT INTO users (user_id, ai_tokens) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             ai_tokens = COALESCE(users.ai_tokens, 0) + excluded.ai_tokens""",
+        [user_id, amount],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def consume_ai_token(user_id: int) -> bool:
+    """Совместимость со старым API: списывает один токен."""
+    return await consume_ai_tokens(user_id, 1)
+
+
+async def refund_ai_token(user_id: int) -> bool:
+    """Совместимость со старым API: возвращает один токен."""
+    return await refund_ai_tokens(user_id, 1)
+
+
+async def buy_ai_tokens(user_id: int, price: int, amount: int) -> bool:
+    """Атомарно списывает монеты и зачисляет токены одной операцией."""
+    if price <= 0 or amount <= 0:
+        return False
+    rs = await _exec(
+        """UPDATE users
+           SET balance = COALESCE(balance, 10) - ?,
+               ai_tokens = COALESCE(ai_tokens, 0) + ?
+           WHERE user_id = ? AND COALESCE(balance, 10) >= ?""",
+        [price, amount, user_id, price],
+    )
+    if getattr(rs, "error", False):
+        return False
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def get_user_by_username(username: str) -> Optional[int]:
@@ -583,6 +722,72 @@ async def get_user_by_username(username: str) -> Optional[int]:
         [username.lstrip("@")],
     )
     return rs.rows[0][0] if rs.rows else None
+
+async def get_blacklisted_user_by_username(username: str) -> Optional[int]:
+    """Найти ID по username среди заблокированных пользователей."""
+    if not username:
+        return None
+    rs = await _exec(
+        "SELECT user_id FROM bot_blacklist WHERE username = ? COLLATE NOCASE",
+        [username.lstrip("@")],
+    )
+    if getattr(rs, "error", False) or not rs.rows:
+        return None
+    return int(rs.rows[0][0])
+
+
+async def is_user_blacklisted(user_id: int) -> bool:
+    rs = await _exec(
+        "SELECT 1 FROM bot_blacklist WHERE user_id = ? LIMIT 1",
+        [int(user_id)],
+    )
+    return bool(not getattr(rs, "error", False) and rs.rows)
+
+
+async def blacklist_user(
+    user_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    banned_by: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Добавить пользователя в глобальный чёрный список без удаления его активов."""
+    rs = await _exec(
+        """INSERT INTO bot_blacklist
+               (user_id, username, first_name, banned_by, reason)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               username = COALESCE(excluded.username, bot_blacklist.username),
+               first_name = COALESCE(excluded.first_name, bot_blacklist.first_name),
+               banned_by = excluded.banned_by,
+               reason = COALESCE(excluded.reason, bot_blacklist.reason)""",
+        [int(user_id), username.lstrip("@") if username else None,
+         first_name, banned_by, reason],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def unblacklist_user(user_id: int) -> bool:
+    rs = await _exec(
+        "DELETE FROM bot_blacklist WHERE user_id = ?",
+        [int(user_id)],
+    )
+    return not getattr(rs, "error", False)
+
+
+async def list_blacklisted_users(limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    rs = await _exec(
+        """SELECT user_id, username, first_name, banned_by, reason, created_at
+           FROM bot_blacklist
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        [limit],
+    )
+    if getattr(rs, "error", False):
+        return []
+    keys = ["user_id", "username", "first_name", "banned_by", "reason", "created_at"]
+    return [dict(zip(keys, row)) for row in rs.rows]
 
 
 async def inc_user_counter(user_id: int, field: str, delta: int = 1) -> None:
@@ -1344,105 +1549,101 @@ async def get_salary_frac(user_id: int, day: str) -> int:
 async def take_credit_from_treasury(
     chat_id: int, user_id: int, amount: int, today: str,
 ) -> bool:
-    logger.info("credit_from_treasury: chat=%s user=%s amount=%s",
-                chat_id, user_id, amount)
-    if amount <= 0:
+    """Выдаёт кредит; триггер списывает его из казны в той же транзакции."""
+    if amount <= 0 or amount > 1000:
         return False
-
-    cur = await treasury_get(chat_id)
-    logger.info("credit_from_treasury: treasury_before=%s", cur)
-    if cur < amount:
-        logger.info("credit_from_treasury: казна меньше нужного")
-        return False
-
     rs = await _exec(
         """UPDATE users
-           SET credit  = COALESCE(credit, 0) + ?,
+           SET credit = COALESCE(credit, 0) + ?,
                balance = COALESCE(balance, 10) + ?,
-               credit_taken_day = ?
+               credit_taken_day = ?,
+               credit_chat_id = ?
            WHERE user_id = ?
              AND COALESCE(credit, 0) = 0
              AND (credit_taken_day IS NULL OR credit_taken_day != ?)""",
-        [amount, amount, today, user_id, today],
+        [amount, amount, today, chat_id, user_id, today],
     )
-    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
-        logger.warning(
-            "credit_from_treasury: UPDATE users failed (условия не выполнены или ошибка)",
-        )
+    if getattr(rs, "error", False):
+        # В том числе сюда попадает RAISE(ABORT), если казны недостаточно.
+        logger.info("take_credit_from_treasury: выдача отклонена user=%s", user_id)
         return False
-
-    ok = await treasury_withdraw(chat_id, amount)
-    logger.info("credit_from_treasury: withdraw ok=%s", ok)
-    if not ok:
-        await _exec(
-            """UPDATE users
-               SET credit  = COALESCE(credit, 0) - ?,
-                   balance = COALESCE(balance, 10) - ?,
-                   credit_taken_day = NULL
-               WHERE user_id = ?
-                 AND COALESCE(credit, 0) >= ?""",
-            [amount, amount, user_id, amount],
-        )
-        return False
-
-    logger.info("credit_from_treasury: успешно, казна=%s",
-                await treasury_get(chat_id))
-    return True
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
 async def repay_credit_to_treasury(
     chat_id: int, user_id: int, amount: int,
 ) -> bool:
+    """Ручное погашение; триггер зачисляет платёж в казну атомарно."""
     if amount <= 0:
         return False
     rs = await _exec(
         """UPDATE users
-           SET credit  = COALESCE(credit, 0) - ?,
-               balance = COALESCE(balance, 10) - ?
+           SET credit = COALESCE(credit, 0) - ?,
+               balance = COALESCE(balance, 10) - ?,
+               credit_chat_id = credit_chat_id
            WHERE user_id = ?
              AND COALESCE(balance, 0) >= ?
              AND COALESCE(credit, 0) >= ?""",
         [amount, amount, user_id, amount, amount],
     )
-    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+    if getattr(rs, "error", False):
         return False
-    ok = await treasury_add(chat_id, amount)
-    if not ok:
-        # вернуть пользователю, если казна не приняла
-        await _exec(
-            """UPDATE users
-               SET credit  = COALESCE(credit, 0) + ?,
-                   balance = COALESCE(balance, 10) + ?
-               WHERE user_id = ?""",
-            [amount, amount, user_id],
-        )
-        return False
-    return True
+    return (getattr(rs, "rows_affected", 0) or 0) > 0
 
 
-async def apply_credit_interest_to_treasury(chat_id: int, percent: float) -> int:
+async def auto_collect_credit_payments(percent: int = 25, today: Optional[str] = None) -> int:
+    """Автоматически удерживает часть баланса у должников.
+
+    Один UPDATE на пользователя изменяет и баланс, и долг. Триггер БД
+    зачисляет удержанную сумму в связанную казну в рамках той же операции.
+    """
+    percent = max(1, min(int(percent), 100))
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    payment = "MIN(COALESCE(credit, 0), MAX(1, CAST(COALESCE(balance, 0) * ? / 100 AS INTEGER)))"
     rs = await _exec(
-        """SELECT COALESCE(SUM(CAST(credit * ? / 100 AS INTEGER)), 0)
-           FROM users WHERE credit > 0""",
-        [percent],
+        f"""UPDATE users
+            SET balance = COALESCE(balance, 0) - {payment},
+                credit = COALESCE(credit, 0) - {payment},
+                credit_auto_collect_day = ?
+            WHERE COALESCE(credit, 0) > 0
+              AND COALESCE(balance, 0) > 0
+              AND credit_chat_id IS NOT NULL
+              AND (credit_auto_collect_day IS NULL OR credit_auto_collect_day != ?)""",
+        [percent, percent, today, today],
     )
-    total = (rs.rows[0][0] if rs.rows else 0) or 0
-    if total <= 0:
+    if getattr(rs, "error", False):
+        logger.error("auto_collect_credit_payments: ошибка UPDATE")
         return 0
-    rs2 = await _exec(
-        "UPDATE users SET credit = credit + CAST(credit * ? / 100 AS INTEGER) "
-        "WHERE credit > 0",
-        [percent],
+    return getattr(rs, "rows_affected", 0) or 0
+
+
+async def apply_credit_interest_to_treasury(
+    chat_id: int, percent: float, today: Optional[str] = None,
+) -> int:
+    """Начисляет проценты не более одного раза за календарный день.
+
+    Триггер одновременно зачисляет начисленные проценты в казну.
+    """
+    if percent <= 0:
+        return 0
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rs = await _exec(
+        """UPDATE users
+           SET credit = credit + CAST(credit * ? / 100 AS INTEGER),
+               credit_interest_day = ?
+           WHERE credit > 0
+             AND credit_chat_id = ?
+             AND (credit_interest_day IS NULL OR credit_interest_day != ?)""",
+        [percent, today, chat_id, today],
     )
-    affected = getattr(rs2, "rows_affected", 0) or 0
-    if affected > 0:
-        ok = await treasury_add(chat_id, total)
-        if not ok:
-            logger.error(
-                "apply_credit_interest_to_treasury: проценты начислены, "
-                "но казна не пополнена (chat=%s total=%s)", chat_id, total,
-            )
-    return affected
+    if getattr(rs, "error", False):
+        logger.error("apply_credit_interest_to_treasury: ошибка UPDATE")
+        return 0
+    return getattr(rs, "rows_affected", 0) or 0
 
 
 # ---------- subscriptions ----------
@@ -1659,7 +1860,6 @@ async def top_messages(chat_id: int, limit: int = 50) -> List[tuple]:
 
 
 async def top_balances(limit: int = 20) -> List[tuple]:
-    """Топ по общему состоянию: обычный баланс + сберкнижка."""
     rs = await _exec(
         """SELECT user_id, COALESCE(balance, 0) + COALESCE(savings_balance, 0) AS wealth
            FROM users ORDER BY wealth DESC LIMIT ?""",
