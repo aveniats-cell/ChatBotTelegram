@@ -224,6 +224,15 @@ async def _create_tables() -> None:
         )
     """)
     await _exec("""
+        CREATE TABLE IF NOT EXISTS marriage_divorce_resets (
+            chat_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            reset_count INTEGER NOT NULL DEFAULT 0,
+            reset_at    TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    await _exec("""
         CREATE TABLE IF NOT EXISTS warnings (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id     INTEGER NOT NULL,
@@ -2061,15 +2070,47 @@ async def log_marriage_event(chat_id: int, user1_id: int, user2_id: int,
 
 
 async def count_divorces(chat_id: int, user_id: int) -> int:
+    """Возвращает число разводов после последнего сброса для пользователя."""
     rs = await _exec(
-        """SELECT COUNT(*) FROM marriage_history
-           WHERE chat_id = ? AND event IN ('divorced', 'forced_divorced')
-             AND (user1_id = ? OR user2_id = ?)""",
-        [chat_id, user_id, user_id],
+        """SELECT MAX(
+               0,
+               (SELECT COUNT(*) FROM marriage_history
+                WHERE chat_id = ?
+                  AND event IN ('divorced', 'forced_divorced')
+                  AND (user1_id = ? OR user2_id = ?))
+               - COALESCE((
+                   SELECT reset_count FROM marriage_divorce_resets
+                   WHERE chat_id = ? AND user_id = ?
+               ), 0)
+           )""",
+        [chat_id, user_id, user_id, chat_id, user_id],
     )
-    if not rs.rows:
+    if getattr(rs, "error", False) or not rs.rows:
         return 0
-    return rs.rows[0][0] or 0
+    return int(rs.rows[0][0] or 0)
+
+
+async def reset_divorces(chat_id: int, user_id: int) -> bool:
+    """Обнуляет счётчик разводов, сохраняя исходную историю браков и разводов.
+
+    Запоминает текущее количество событий для этого пользователя. Последующие
+    разводы будут считаться заново, а счётчик второго участника не изменится.
+    """
+    rs = await _exec(
+        """INSERT INTO marriage_divorce_resets (chat_id, user_id, reset_count)
+           VALUES (
+               ?, ?,
+               (SELECT COUNT(*) FROM marriage_history
+                WHERE chat_id = ?
+                  AND event IN ('divorced', 'forced_divorced')
+                  AND (user1_id = ? OR user2_id = ?))
+           )
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+               reset_count = excluded.reset_count,
+               reset_at = datetime('now')""",
+        [chat_id, user_id, chat_id, user_id, user_id],
+    )
+    return not getattr(rs, "error", False)
 
 
 # ---------- marriage xp / top ----------
