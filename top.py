@@ -287,6 +287,38 @@ async def cmd_top_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Топ богачей текущего чата: кошелёк + сберкнижка."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
+        return
+
+    rows = await db.top_balances(limit=50, chat_id=chat.id)
+    if not rows:
+        await msg.reply_text(
+            "💰 Пока нет данных для рейтинга богачей. "
+            "Участники появятся здесь после первого сообщения в чате."
+        )
+        return
+
+    lines = [
+        "<b>💰 Топ богачей чата</b>",
+        "<i>Учитываются монеты в кошельке и сберкнижке.</i>",
+    ]
+    for i, (uid, wealth) in enumerate(rows, start=1):
+        name = str(uid)
+        try:
+            member = await context.bot.get_chat(uid)
+            name = member.first_name or member.username or str(uid)
+        except TelegramError:
+            # Пользователь мог скрыть профиль или покинуть чат.
+            pass
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{wealth:,}</b> 🪙")
+
+    await msg.reply_text("\\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
