@@ -461,6 +461,46 @@ async def cmd_force_divorce_or_self(
     return await cmd_divorce(update, context)
 
 
+async def cmd_married_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает только счётчик разводов выбранного пользователя; только ADMIN_ID."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Команда доступна только главному админу.")
+        return
+
+    target = await _resolve_target(update, context, msg.text or "")
+    if not target:
+        await msg.reply_text(
+            "Укажите пользователя: <code>/MarriedClean @username</code> "
+            "или ответьте этой командой на его сообщение.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target_id, target_name = target
+    previous_count = await db.count_divorces(chat.id, target_id)
+    ok = await db.reset_divorces(chat.id, target_id)
+    if not ok:
+        logger.error(
+            "cmd_married_clean: не удалось сбросить счётчик: chat=%s user=%s",
+            chat.id, target_id,
+        )
+        await msg.reply_text("⚠️ Не удалось обнулить счётчик. Попробуйте ещё раз.")
+        return
+
+    await msg.reply_text(
+        f"🧹 История разводов для <b>{escape(target_name)}</b> обнулена.\n"
+        f"Было: <b>{previous_count}</b> · Теперь: <b>0</b>.\n"
+        "💍 Текущий брак и записи общей истории не затронуты.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def cmd_marriage_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
