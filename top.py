@@ -4,6 +4,7 @@
   - track_message       — считает сообщения/дроби зарплаты
   - cmd_top_all         — Топ все
   - cmd_top_day         — Топ день
+  - cmd_top_rich        — Топ богачи
   - cmd_my_place        — Мое место
   - flush_job           — периодический flush (interval из main)
   - cleanup_job         — daily cleanup (00:05 UTC)
@@ -288,35 +289,40 @@ async def cmd_top_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Топ богачей текущего чата: кошелёк + сберкнижка."""
-    chat = update.effective_chat
+    """Показывает рейтинг пользователей по сумме кошелька и сберкнижки."""
     msg = update.effective_message
-    if not chat or not msg:
+    if not msg:
         return
 
-    rows = await db.top_balances(limit=50, chat_id=chat.id)
+    try:
+        rows = await db.top_balances(limit=50)
+    except Exception:
+        logger.exception("Не удалось получить топ богачей")
+        await msg.reply_text("Не удалось загрузить топ богачей. Попробуйте позже.")
+        return
+
     if not rows:
-        await msg.reply_text(
-            "💰 Пока нет данных для рейтинга богачей. "
-            "Участники появятся здесь после первого сообщения в чате."
-        )
+        await msg.reply_text("💰 Пока нет данных для рейтинга богачей.")
         return
 
     lines = [
-        "<b>💰 Топ богачей чата</b>",
+        "<b>💰 Топ богачей</b>",
         "<i>Учитываются монеты в кошельке и сберкнижке.</i>",
     ]
-    for i, (uid, wealth) in enumerate(rows, start=1):
-        name = str(uid)
+    for i, (user_id, wealth) in enumerate(rows, start=1):
+        name = str(user_id)
         try:
-            member = await context.bot.get_chat(uid)
-            name = member.first_name or member.username or str(uid)
-        except TelegramError:
-            # Пользователь мог скрыть профиль или покинуть чат.
+            member = await context.bot.get_chat(int(user_id))
+            name = member.first_name or member.username or str(user_id)
+        except (TelegramError, TypeError, ValueError):
             pass
-        lines.append(f"{_medal(i)} {escape(name)} — <b>{wealth:,}</b> 🪙")
+        try:
+            amount = int(wealth or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        lines.append(f"{_medal(i)} {escape(name)} — <b>{amount:,}</b> 🪙")
 
-    await msg.reply_text("\\n".join(lines), parse_mode=ParseMode.HTML)
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_my_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
