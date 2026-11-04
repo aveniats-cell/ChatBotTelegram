@@ -1,4 +1,3 @@
-```python
 import logging
 import re
 
@@ -153,4 +152,3 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except TelegramError as e:
         logger.warning("rules send: %s", e)
-```
