@@ -207,10 +207,10 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     total = balance + savings_balance
 
     await msg.reply_text(
-        "💰 Баланс пользователя\\n"
-        f"Кошелёк: {balance:,} монет\\n"
-        f"📘 Сберкнижка: {savings_balance:,} монет\\n"
-        "━━━━━━━━━━━━━━━━━━\\n"
+        "💰 Баланс пользователя\n"
+        f"Кошелёк: {balance:,} монет\n"
+        f"📘 Сберкнижка: {savings_balance:,} монет\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         f"💎 Всего: {total:,} монет",
     )
 
@@ -1009,17 +1009,17 @@ async def tax_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if total <= 0:
         text = (
-            f"🏦 <b>Налог дня</b>\\n"
-            f"Сегодня платить некому: у активных баланс ≤ {TAX_MIN_BALANCE}.\\n"
+            f"🏦 <b>Налог дня</b>\n"
+            f"Сегодня платить некому: у активных баланс ≤ {TAX_MIN_BALANCE}.\n"
             f"Казна: <b>{new_treasury}</b>"
         )
     else:
         text = (
-            f"🏦 <b>Налог дня</b>\\n"
-            f"Ставка: <b>{TAX_PCT}%</b> с баланса > {TAX_MIN_BALANCE}\\n"
-            f"Платят только активные (писали за {TAX_ACTIVE_DAYS} дн.)\\n"
-            f"Собрано в казну: <b>{total}</b> монет\\n"
-            f"Казна: <b>{new_treasury}</b>\\n\\n"
+            f"🏦 <b>Налог дня</b>\n"
+            f"Ставка: <b>{TAX_PCT}%</b> с баланса > {TAX_MIN_BALANCE}\n"
+            f"Платят только активные (писали за {TAX_ACTIVE_DAYS} дн.)\n"
+            f"Собрано в казну: <b>{total}</b> монет\n"
+            f"Казна: <b>{new_treasury}</b>\n\n"
             f"<i>Неактивные не платят. Вернулся — баланс на месте.</i>"
         )
     try:
