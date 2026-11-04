@@ -265,7 +265,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• +Суд ССС / +Суд (с / Причина)\n"
         "• дроч / Аура / Топ аура\n"
         "• Казино монетка/кубик/слоты\n"
-        "• ИИ / Браини / Мозг <запрос>\n"
+        "• Ксюша / Ксения / Ксю <запрос>\n"
         "• Правила — текст правил чата\n"
         "• Магазин — пакеты команд\n"
         "• -смс (реплай на сообщение; владелец/комиссары)\n"
@@ -502,7 +502,7 @@ def build_app() -> Application:
     ))
 
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^(ии|браин|браини|мозг|brainy|brain)(\s|$)"),
+        filters.Regex(r"(?i)^(ксюш|кеся|ксюша|ксения|ксюха|ксю)(\s|$)"),
         cmd_ai,
     ))
 
