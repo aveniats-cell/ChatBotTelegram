@@ -207,12 +207,11 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     total = balance + savings_balance
 
     await msg.reply_text(
-        "💰 <b>Баланс пользователя</b>\\n"
-        f"Кошелёк: <b>{balance:,}</b> монет\\n"
-        f"📘 Сберкнижка: <b>{savings_balance:,}</b> монет\\n"
+        "💰 Баланс пользователя\\n"
+        f"Кошелёк: {balance:,} монет\\n"
+        f"📘 Сберкнижка: {savings_balance:,} монет\\n"
         "━━━━━━━━━━━━━━━━━━\\n"
-        f"💎 Всего: <b>{total:,}</b> монет",
-        parse_mode=ParseMode.HTML,
+        f"💎 Всего: {total:,} монет",
     )
 
 
