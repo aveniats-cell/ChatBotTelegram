@@ -834,7 +834,17 @@ async def list_sss_members() -> List[int]:
 
 
 async def add_balance(user_id: int, delta: int) -> bool:
-    """Атомарное начисление: один INSERT ... ON CONFLICT, без гонки."""
+    """Атомарно начисляет целые монеты. Списание выполняется отдельными API.
+
+    Не допускаем отрицательный delta: раньше этот метод позволял обойти
+    проверки достаточного баланса через UPDATE balance = balance + delta.
+    """
+    try:
+        user_id, delta = int(user_id), int(delta)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if user_id <= 0 or delta <= 0:
+        return False
     rs = await _exec(
         """INSERT INTO users (user_id, balance)
            VALUES (?, 10 + ?)
@@ -842,11 +852,16 @@ async def add_balance(user_id: int, delta: int) -> bool:
              balance = COALESCE(users.balance, 10) + ?""",
         [user_id, delta, delta],
     )
-    return not getattr(rs, "error", False)
+    return (not getattr(rs, "error", False)
+            and (getattr(rs, "rows_affected", 0) or 0) > 0)
 
 
 async def take_balance_atomic(user_id: int, amount: int) -> bool:
-    if amount <= 0:
+    try:
+        user_id, amount = int(user_id), int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if user_id <= 0 or amount <= 0:
         return False
     rs = await _exec(
         """UPDATE users
@@ -860,14 +875,27 @@ async def take_balance_atomic(user_id: int, amount: int) -> bool:
 
 
 async def take_balance_any(user_id: int, amount: int) -> int:
-    if amount <= 0:
+    """Списывает не больше доступного остатка и возвращает точное списание.
+
+    UPDATE содержит повторную проверку остатка, поэтому устаревшее значение
+    после SELECT не может привести к отрицательному балансу.
+    """
+    try:
+        user_id, amount = int(user_id), int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if user_id <= 0 or amount <= 0:
         return 0
     rs = await _exec(
         "SELECT COALESCE(balance, 10) FROM users WHERE user_id = ?", [user_id],
     )
     if getattr(rs, "error", False) or not rs.rows:
         return 0
-    bal = rs.rows[0][0] or 0
+    try:
+        bal = int(rs.rows[0][0] or 0)
+    except (TypeError, ValueError, OverflowError):
+        logger.error("take_balance_any: некорректный баланс user_id=%s", user_id)
+        return 0
     if bal <= 0:
         return 0
     take = min(amount, bal)
@@ -1078,6 +1106,13 @@ async def savings_accrue_and_pay(chat_id: int, today: str, rate_bps: int = 20) -
 # ---------- treasury ----------
 
 async def treasury_add(chat_id: int, amount: int) -> bool:
+    """Пополняет казну; отрицательные суммы запрещены (для списания есть API)."""
+    try:
+        chat_id, amount = int(chat_id), int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if chat_id == 0 or amount < 0:
+        return False
     if amount == 0:
         return True
     rs = await _exec(
@@ -1087,7 +1122,8 @@ async def treasury_add(chat_id: int, amount: int) -> bool:
              balance = balance + excluded.balance""",
         [chat_id, amount],
     )
-    return not getattr(rs, "error", False)
+    return (not getattr(rs, "error", False)
+            and (getattr(rs, "rows_affected", 0) or 0) > 0)
 
 
 async def treasury_get(chat_id: int) -> int:
@@ -1105,7 +1141,13 @@ async def treasury_reset(chat_id: int) -> int:
 
 
 async def treasury_withdraw(chat_id: int, amount: int) -> bool:
-    if amount <= 0:
+    try:
+        chat_id, amount = int(chat_id), int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if chat_id == 0 or amount < 0:
+        return False
+    if amount == 0:
         return True
     rs = await _exec(
         """UPDATE treasury SET balance = balance - ?
@@ -1118,16 +1160,23 @@ async def treasury_withdraw(chat_id: int, amount: int) -> bool:
 
 
 async def burn_treasury(chat_id: int, amount: int) -> int:
-    if amount <= 0:
+    try:
+        chat_id, amount = int(chat_id), int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if chat_id == 0 or amount <= 0:
         return 0
     cur = await treasury_get(chat_id)
     if cur <= 0:
         return 0
     take = min(amount, cur)
-    await _exec(
-        "UPDATE treasury SET balance = balance - ? WHERE chat_id = ?",
-        [take, chat_id],
+    rs = await _exec(
+        """UPDATE treasury SET balance = balance - ?
+           WHERE chat_id = ? AND balance >= ?""",
+        [take, chat_id, take],
     )
+    if getattr(rs, "error", False) or (getattr(rs, "rows_affected", 0) or 0) == 0:
+        return 0
     return take
 
 
