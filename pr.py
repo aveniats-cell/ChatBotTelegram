@@ -1,4 +1,6 @@
+
 """Логика PR-бота: проверка подписки, удаление сообщений, приглашение."""
+
 import os
 import logging
 from html import escape
@@ -10,7 +12,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Message,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
@@ -28,21 +30,23 @@ _ADMIN_WORDS = {
     "stats", "start", "ping", "check",
     "help", "restart", "казино",
     "ии", "браин", "браини", "мозг", "brainy", "brain",
-    "перевод", "казна",
-    "кредит", "монеты",
-    "дроч", "аура",
-    "дать", "поцеловать", "обнять", "побить", "обоссать", "погладить",
+    "перевод", "казна", "кредит", "монеты",
+    "дроч", "аура", "дать", "поцеловать", "обнять",
+    "побить", "обоссать", "погладить",
 }
 
 
 def _looks_like_admin_command(text: str) -> bool:
     if not text:
         return False
+
     stripped = text.lstrip()
     if not stripped:
         return False
+
     if stripped[0] in "+-–−":
         return True
+
     first = stripped.split(maxsplit=1)[0].casefold().strip(".,!?:;")
     return first in _ADMIN_WORDS
 
@@ -50,49 +54,112 @@ def _looks_like_admin_command(text: str) -> bool:
 def _is_reply_to_bot(msg: Message, bot_id: int) -> bool:
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
         return False
+
     return msg.reply_to_message.from_user.id == bot_id
+
+
+def _is_normal_user_message(update: Update) -> bool:
+    """Разрешаем проверку только обычных сообщений пользователей."""
+
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not msg or not user or not chat:
+        return False
+
+    # Игнорируем ботов и служебные аккаунты Telegram.
+    if user.is_bot:
+        return False
+
+    # Не проверяем каналы и личные сообщения.
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+
+    # Сообщения от имени каналов не имеют обычного отправителя.
+    if msg.sender_chat is not None:
+        return False
+
+    # Служебные сообщения о входе, выходе и т. п.
+    if msg.new_chat_members or msg.left_chat_member:
+        return False
+
+    # Не проверяем сообщения без обычного отправителя.
+    if not msg.from_user:
+        return False
+
+    return True
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
     if not CANAL_ID:
         return True
+
     try:
-        member = await bot.get_chat_member(chat_id=CANAL_ID, user_id=user_id)
-        return member.status not in (ChatMember.LEFT, ChatMember.BANNED)
+        member = await bot.get_chat_member(
+            chat_id=CANAL_ID,
+            user_id=user_id
+        )
+
+        return member.status not in (
+            ChatMember.LEFT,
+            ChatMember.BANNED,
+        )
+
     except TelegramError as e:
-        logger.warning("Не удалось проверить подписку %s: %s", user_id, e)
+        logger.warning(
+            "Не удалось проверить подписку %s: %s",
+            user_id,
+            e
+        )
+
+        # При ошибке API не блокируем пользователя.
         return True
 
 
 def _subscription_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📢 Подписаться на канал", url=CANAL_URL)]]
-    )
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 Подписаться на канал",
+                url=CANAL_URL
+            )
+        ]
+    ])
 
 
 def _subscription_text(user) -> str:
     name = escape(user.first_name or "друг")
+
     if user.username:
         link = f'<a href="https://t.me/{user.username}">{name}</a>'
     else:
         link = f'<a href="tg://user?id={user.id}">{name}</a>'
+
     return (
         f"👋 {link}, чтобы писать в чат, сначала подпишитесь на "
         f"<b>{escape(CANAL_TITLE)}</b>.\n\n"
-        f"После подписки возвращайтесь — и пишите. ✅"
+        "После подписки возвращайтесь — и пишите. ✅"
     )
 
 
-async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg: Message | None = update.effective_message
-    user = update.effective_user
-    if not msg or not user or user.is_bot:
+async def check_and_delete(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+
+    # Проверяем, что сообщение действительно от обычного пользователя.
+    if not _is_normal_user_message(update):
         return
+
+    msg = update.effective_message
+    user = update.effective_user
 
     try:
         bot_id = context.bot.id
     except Exception:
         bot_id = 0
+
     if bot_id and _is_reply_to_bot(msg, bot_id):
         return
 
@@ -100,12 +167,20 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     try:
-        await db.upsert_user(user.id, user.username, user.first_name)
+        await db.upsert_user(
+            user.id,
+            user.username,
+            user.first_name
+        )
     except Exception as e:
         logger.warning("upsert_user: %s", e)
 
     ok = await is_subscribed(context.bot, user.id)
-    await db.set_subscription(user.id, ok)
+
+    try:
+        await db.set_subscription(user.id, ok)
+    except Exception as e:
+        logger.warning("set_subscription: %s", e)
 
     if ok:
         return
@@ -113,7 +188,10 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         await msg.delete()
     except TelegramError as e:
-        logger.info("Не удалось удалить сообщение (нет прав?): %s", e)
+        logger.info(
+            "Не удалось удалить сообщение: %s",
+            e
+        )
 
     try:
         await context.bot.send_message(
@@ -124,43 +202,93 @@ async def check_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             disable_web_page_preview=True,
         )
     except TelegramError as e:
-        logger.warning("Не удалось отправить напоминание: %s", e)
+        logger.warning(
+            "Не удалось отправить напоминание: %s",
+            e
+        )
 
 
-async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.new_chat_members:
+async def on_new_member(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+
+    msg = update.effective_message
+
+    if not msg or not msg.new_chat_members:
         return
-    for member in update.message.new_chat_members:
+
+    for member in msg.new_chat_members:
+
         if member.is_bot:
             continue
-        await db.upsert_user(member.id, member.username, member.first_name)
-        ok = await is_subscribed(context.bot, member.id)
-        await db.set_subscription(member.id, ok)
+
+        try:
+            await db.upsert_user(
+                member.id,
+                member.username,
+                member.first_name
+            )
+
+            ok = await is_subscribed(context.bot, member.id)
+            await db.set_subscription(member.id, ok)
+
+        except Exception as e:
+            logger.warning("Ошибка обработки нового участника: %s", e)
+            continue
+
         if ok:
             continue
+
         try:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=msg.chat_id,
                 text=_subscription_text(member),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_subscription_keyboard(),
                 disable_web_page_preview=True,
             )
+
         except TelegramError as e:
-            logger.warning("Приветствие не отправлено: %s", e)
+            logger.warning(
+                "Приветствие не отправлено: %s",
+                e
+            )
 
 
-async def recheck_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def recheck_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+
     user = update.effective_user
-    if not user:
+    msg = update.effective_message
+
+    if not user or user.is_bot or not msg:
         return
+
+    if not update.effective_chat:
+        return
+
+    if update.effective_chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
     ok = await is_subscribed(context.bot, user.id)
+
     await db.set_subscription(user.id, ok)
+
     if ok:
-        await update.message.reply_text("✅ Подписка активна — можете писать в чат.")
+        await msg.reply_text(
+            "✅ Подписка активна — можете писать в чат."
+        )
     else:
-        await update.message.reply_text(
-            f"❌ Вы пока не подписаны на «{CANAL_TITLE}».\n"
-            f"Подпишитесь и возвращайтесь — после этого сообщения будут проходить.",
+        await msg.reply_text(
+            f"❌ Вы пока не подписаны на «{escape(CANAL_TITLE)}».\n"
+            "Подпишитесь и возвращайтесь — после этого сообщения "
+            "будут проходить.",
+            parse_mode=ParseMode.HTML,
             reply_markup=_subscription_keyboard(),
         )
