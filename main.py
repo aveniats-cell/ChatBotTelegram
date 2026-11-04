@@ -39,7 +39,6 @@ import commands_dop_handlers
 import shop
 import reputation
 import blacklist
-import music
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -79,8 +78,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/restart — сбросить контекст ИИ\n"
         "Профиль — профиль\n"
         "Казино — мини-казино\n"
-        "Магазин — пакеты команд\n"
-        "Музыка <запрос> — поиск и отправка трека"
+        "Магазин — пакеты команд"
     )
 
 
@@ -97,6 +95,7 @@ async def cmd_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not msg or not chat:
         return
 
+    # _require_role пропускает ADMIN_ID и пользователей с ролью commissar.
     if not await roles._require_role(update, ("commissar",)):
         await msg.reply_text("⛔ Только владелец или комиссар могут использовать -смс.")
         return
@@ -269,7 +268,6 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• ИИ / Браини / Мозг <запрос>\n"
         "• Правила — текст правил чата\n"
         "• Магазин — пакеты команд\n"
-        "• Музыка <запрос> — поиск и отправка разрешённых треков\n"
         "• -смс (реплай на сообщение; владелец/комиссары)\n"
         "• /Defloult220099 — экстремальный дефолт\n"
         "• /ALLMONEY 100 — начислить всем по 100 монет\n"
@@ -418,10 +416,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Брак(\s|$)"), wedding.cmd_force_marriage))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Мой\s+брак(\s|$)"), wedding.cmd_marriage_info))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Топ\s+браки(\s|$)"), wedding.cmd_marriage_top))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^/marriedclean(?:@\w+)?(?:\s|$)"),
-        wedding.cmd_married_clean,
-    ))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^/marriedclean(?:@\w+)?(?:\s|$)"), wedding.cmd_married_clean))
     app.add_handler(CallbackQueryHandler(wedding.wedding_callback, pattern=r"^wed:"))
 
     # Глобальная репутация.
@@ -513,16 +508,6 @@ def build_app() -> Application:
 
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Магазин(\s|$)"), shop.cmd_shop))
     app.add_handler(CallbackQueryHandler(shop.shop_callback, pattern=r"^shop:"))
-
-    # Музыкальный поиск.
-    app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^Музыка(?:\s|$)"),
-        music.cmd_music,
-    ))
-    app.add_handler(CallbackQueryHandler(
-        music.music_callback,
-        pattern=r"^music:",
-    ))
 
     commands_dop_handlers.register(app)
 
