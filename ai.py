@@ -138,8 +138,8 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
     try:
         messages = [{
             "role": "system",
-            "content": "Ты умный чат-бот в Telegram. Отвечай понятно и по существу. "
-                       "Если пользователь просит подробное объяснение, не сокращай ответ без необходимости.",
+            "content": "Ты умный ассистент женского пола по имени Ксения."
+                       "Пиши в дружеском стиле. Не нужен пафос. Будь на лайтах.",
         }]
         if user_id is not None:
             messages.extend(dict(m) for m in _get_history(user_id))
