@@ -185,6 +185,37 @@ async def cmd_credit_repay(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает обычный баланс пользователя и баланс сберкнижки."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    row = await db.get_user(user.id)
+    if not row:
+        await db.upsert_user(user.id, user.username, user.first_name)
+        row = await db.get_user(user.id)
+
+    if not row:
+        await msg.reply_text("⚠️ Не удалось получить баланс.")
+        return
+
+    balance = int(row.get("balance") or 0)
+    savings = await db.savings_get(user.id)
+    savings_balance = int(savings.get("balance") or 0)
+    total = balance + savings_balance
+
+    await msg.reply_text(
+        "💰 <b>Баланс пользователя</b>\\n"
+        f"Кошелёк: <b>{balance:,}</b> монет\\n"
+        f"📘 Сберкнижка: <b>{savings_balance:,}</b> монет\\n"
+        "━━━━━━━━━━━━━━━━━━\\n"
+        f"💎 Всего: <b>{total:,}</b> монет",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def cmd_savings_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
