@@ -1,4 +1,4 @@
-"""Магазин пакетов команд и токенов ИИ. Меню доступно только его владельцу."""
+/"""Магазин пакетов команд и токенов ИИ. Меню доступно только его владельцу."""
 import logging
 from html import escape
 
@@ -219,48 +219,54 @@ async def _buy_pocket(q, user, pocket_id: int):
     if not pocket or not pocket.get("active"):
         await q.answer("Пакет недоступен.", show_alert=True)
         return
-    if await db.shop_user_has_pocket(chat.id, user.id, pocket_id):
-        await q.answer("У тебя уже есть этот пакет.", show_alert=True)
-        return
 
     price = int(pocket["price"])
-    ok = await db.take_balance_atomic(user.id, price)
-    if not ok:
-        row = await db.get_user(user.id)
-        balance = int((row or {}).get("balance") or 0)
-        await q.answer(
-            f"Не хватает монет. Нужно {price} 🪙, у тебя {balance} 🪙.",
-            show_alert=True,
-        )
-        return
 
+    # shop_purchase_add сам атомарно проверяет баланс и списывает цену.
+    # Повторно вызывать take_balance_atomic здесь нельзя: это приводило
+    # к двойному списанию за один пакет.
     try:
-        purchased = await db.shop_purchase_add(chat.id, user.id, pocket_id, price)
+        purchased = await db.shop_purchase_add(
+            chat.id, user.id, pocket_id, price
+        )
     except Exception:
-        logger.exception("shop_purchase_add failed")
+        logger.exception(
+            "shop_purchase_add failed: chat=%s user=%s pocket=%s",
+            chat.id, user.id, pocket_id,
+        )
         purchased = False
 
     if not purchased:
-        try:
-            refunded = await db.add_balance(user.id, price)
-        except Exception:
-            logger.exception("shop purchase refund failed")
-            refunded = False
+        # shop_purchase_add самостоятельно возвращает деньги, если
+        # списание прошло, но запись покупки не удалась. Не делаем
+        # второй возврат здесь, иначе пользователю могут начислиться
+        # лишние монеты.
+        row = await db.get_user(user.id)
+        balance = int((row or {}).get("balance") or 0)
         await q.answer(
-            "Не удалось выдать пакет. " +
-            ("Монеты возвращены." if refunded else "Возврат не прошёл — обратись к администратору."),
+            "Не удалось купить пакет. "
+            f"Проверь баланс: {balance} 🪙. "
+            "Если монеты списались, но пакет не появился, обратись к администратору.",
             show_alert=True,
         )
         return
 
-    # Если казна временно недоступна, покупка уже выдана: не списываем повторно
-    # и не откатываем право на пакет. Ошибка остаётся в логе для сверки.
+    # Покупка уже выдана. Ошибка пополнения казны не должна отменять
+    # покупку или повторно списывать деньги.
     try:
         treasury_ok = await db.treasury_add(chat.id, price)
         if not treasury_ok:
-            logger.error("Пакет куплен, но treasury_add вернул False: chat=%s user=%s", chat.id, user.id)
+            logger.error(
+                "Пакет куплен, но treasury_add вернул False: "
+                "chat=%s user=%s pocket=%s",
+                chat.id, user.id, pocket_id,
+            )
     except Exception:
-        logger.exception("Пакет куплен, но не удалось пополнить казну")
+        logger.exception(
+            "Пакет куплен, но не удалось пополнить казну: "
+            "chat=%s user=%s pocket=%s",
+            chat.id, user.id, pocket_id,
+        )
 
     await q.answer(f"Куплено: {pocket['name']} за {price} 🪙", show_alert=True)
     await _view_pocket(q, user, pocket_id, answer=False)
