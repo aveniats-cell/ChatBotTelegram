@@ -369,6 +369,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Бан(\s|$)"), roles.ban_user))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Бан(\s|$)"), roles.unban_user))
 
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^Баланс\s*$"), economy.cmd_balance))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^Сберкнижка\s*$"), economy.cmd_savings_book))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\+Сберкнижка(\s|$)"), economy.cmd_savings_deposit))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^[-–−]Сберкнижка(\s|$)"), economy.cmd_savings_withdraw))
