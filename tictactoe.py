@@ -293,13 +293,22 @@ async def _finish_game(
         return
 
     if winner_id is None:
-        await db.add_balance(p1, bet)
-        await db.add_balance(p2, bet)
-
-        text = (
-            f"🤝 Ничья!\n"
-            f"Обе ставки возвращены: <b>{bet}</b> монет."
-        )
+        refund1 = await db.add_balance(p1, bet)
+        refund2 = await db.add_balance(p2, bet)
+        if refund1 and refund2:
+            text = (
+                f"🤝 Ничья!\n"
+                f"Обе ставки возвращены: <b>{bet}</b> монет."
+            )
+        else:
+            logger.critical(
+                "TTT refund failed: game=%s p1=%s ok1=%s p2=%s ok2=%s bet=%s",
+                game_id, p1, refund1, p2, refund2, bet,
+            )
+            text = (
+                "⚠️ Ничья, но автоматический возврат ставки прошёл не полностью. "
+                "Администратор должен проверить баланс игроков."
+            )
 
     else:
         bank = bet * 2
@@ -310,7 +319,7 @@ async def _finish_game(
         payout = bank - fee
 
         if winner_id == p1:
-            await db.add_balance(p1, payout)
+            credited = await db.add_balance(p1, payout)
 
             text = (
                 f"🏆 Победил "
@@ -322,7 +331,7 @@ async def _finish_game(
             )
 
         else:
-            await db.add_balance(p2, payout)
+            credited = await db.add_balance(p2, payout)
 
             text = (
                 f"🏆 Победил "
@@ -333,15 +342,21 @@ async def _finish_game(
                 f"Выплата: <b>{payout}</b>."
             )
 
-        try:
-            await db.treasury_add(
-                g["chat_id"],
-                fee,
+        if credited:
+            treasury_ok = await db.treasury_add(g["chat_id"], fee)
+            if not treasury_ok:
+                logger.critical(
+                    "TTT payout credited but fee transfer failed: game=%s fee=%s",
+                    game_id, fee,
+                )
+        else:
+            logger.critical(
+                "TTT payout failed: game=%s winner=%s payout=%s",
+                game_id, winner_id, payout,
             )
-        except Exception as e:
-            logger.warning(
-                "ttt treasury_add: %s",
-                e,
+            text = (
+                "⚠️ Победитель определён, но выплата не прошла из-за ошибки БД. "
+                "Администратор должен проверить и восстановить выплату."
             )
 
     try:
@@ -505,13 +520,19 @@ async def ttt_callback(
 
         # Списываем ставку второго игрока
         if not await db.take_balance_atomic(p2, bet):
-            await db.add_balance(p1, bet)
+            refunded = await db.add_balance(p1, bet)
+            if not refunded:
+                logger.critical(
+                    "TTT escrow rollback failed: game=%s player=%s bet=%s",
+                    game_id, p1, bet,
+                )
 
             g["state"] = "declined"
             GAMES.pop(game_id, None)
 
             await q.answer(
-                "У соперника не хватает монет.",
+                "У соперника не хватает монет." if refunded else
+                "Ошибка возврата ставки. Обратись к администратору.",
                 show_alert=True,
             )
 
