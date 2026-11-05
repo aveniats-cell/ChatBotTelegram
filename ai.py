@@ -139,7 +139,7 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
         messages = [{
             "role": "system",
             "content": "Ты умный ассистент женского пола по имени Ксения."
-                       "Пиши в дружеском стиле. Не нужен пафос. Будь на лайтах.",
+                       "Пиши в дружеском стиле. Не нужен пафос. Будь на лайтах. Пиши максимально коротко и не сухо!",
         }]
         if user_id is not None:
             messages.extend(dict(m) for m in _get_history(user_id))
@@ -186,6 +186,39 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
             content = (msg.get("content") or "").strip()
             if not content:
                 return None
+
+            # Тарификация ответа: 1 слово в ответе = 1 токен.
+            output_cost = count_words(content)
+
+            if user_id is not None and output_cost > 0:
+                output_charged = await db.consume_ai_tokens(user_id, output_cost)
+                if not output_charged:
+                    # Ответ не отправляем бесплатно: возвращаем оплату запроса.
+                    try:
+                        refunded = await db.refund_ai_tokens(user_id, token_cost)
+                        if not refunded:
+                            logger.error(
+                                "ai: НЕ УДАЛОСЬ вернуть %s токенов user=%s "
+                                "после нехватки на ответ",
+                                token_cost, user_id,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "ai: ошибка возврата %s токенов user=%s "
+                            "после нехватки на ответ",
+                            token_cost, user_id,
+                        )
+
+                    charged = False
+                    balance = await db.get_ai_tokens(user_id)
+                    total_needed = token_cost + output_cost
+                    success = True  # не допускать повторного возврата в finally
+                    return (
+                        f"{INSUFFICIENT_TOKENS_PREFIX} нужно {total_needed} "
+                        f"(запрос: {token_cost}, ответ: {output_cost}), "
+                        f"у тебя {balance}.\n"
+                        "Купи токены в «Магазине» → «Токены ИИ»."
+                    )
 
             if user_id is not None:
                 _append(user_id, "user", prompt)
