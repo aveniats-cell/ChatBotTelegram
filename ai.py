@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 AI_TOKEN = os.getenv("AI_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
-MODEL = "openai-fast"
+MODEL = "llama"
 
 INSUFFICIENT_TOKENS_PREFIX = "🧠 Недостаточно токенов:"
 MAX_PROMPT_CHARS = 16000
