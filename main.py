@@ -251,8 +251,14 @@ async def _run_ai(user, msg, prompt: str) -> None:
 
     left = await db.get_ai_tokens(user.id)
 
+    output_cost = ai.count_words(answer)
+    total_spent = needed + output_cost
+
     chunks = _split_telegram_text(answer)
-    chunks[-1] += f"\n\n🧠 Списано: {needed} · Осталось: {left}"
+    chunks[-1] += (
+        f"\n\n🧠 Списано: {total_spent} "
+        f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
+    )
 
     try:
         await thinking.edit_text(chunks[0])
@@ -862,9 +868,7 @@ def build_app() -> Application:
 
     # ИИ Ксения — только обращения к Ксюше.
     app.add_handler(MessageHandler(
-        filters.Regex(
-            r"(?i)^(ксюш(?:а|и)?|кеся|ксения|ксюха|ксю)(\s|$)"
-        ),
+        filters.Regex(_AI_WORD),
         cmd_ai,
     ))
 
