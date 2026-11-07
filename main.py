@@ -40,6 +40,7 @@ import commands_dop_handlers
 import shop
 import reputation
 import blacklist
+import helper
 
 
 logging.basicConfig(
@@ -391,6 +392,7 @@ async def _cleanup_polls_job(
 
 async def post_init(app: Application) -> None:
     await db.init_db()
+    await helper.init_db()
     await sss.restore_sss_members()
     await resolver.start_client()
     await commands_dop_handlers.sync_to_db()
@@ -443,13 +445,26 @@ def build_app() -> Application:
 
     app.add_error_handler(_error_handler)
 
+    # Личный кабинет предложки: обычные пользователи не попадают
+    # в обработчики групповых команд, экономики и активности.
+    # Администратор сохраняет существующий функционал в личке.
+    app.add_handler(
+        TypeHandler(
+            Update,
+            lambda update, context: helper.handle_private_update(
+                update, context, ADMIN_ID
+            ),
+        ),
+        group=-2,
+    )
+
     # Глобальный фильтр заблокированных пользователей.
     app.add_handler(
         TypeHandler(
             Update,
             blacklist.guard_blacklisted_update,
         ),
-        group=-1,
+        group=-3,
     )
 
     app.add_handler(CommandHandler("banbot", blacklist.cmd_banbot))
