@@ -244,6 +244,166 @@ async def ask_ai(prompt: str, user_id: Optional[int] = None) -> Optional[str]:
             except Exception:
                 logger.exception("ai: ошибка возврата %s токенов user=%s", token_cost, user_id)
 
+async def ask_ai_stream(
+    prompt: str,
+    user_id: Optional[int] = None,
+    on_chunk=None,
+) -> Optional[str]:
+    """Потоковый запрос OpenAI-compatible API (SSE).
+
+    Тарификация сохранена: 1 слово запроса + 1 слово ответа = 1 токен.
+    При ошибке API списание за запрос возвращается.
+    """
+    import json
+
+    if not AI_TOKEN:
+        logger.error("ai: AI_TOKEN не задан в переменных окружения")
+        return None
+    url = _api_url()
+    if not url:
+        return None
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None
+    if len(prompt) > MAX_PROMPT_CHARS:
+        prompt = prompt[:MAX_PROMPT_CHARS]
+
+    input_cost = max(1, count_words(prompt))
+    charged_input = False
+    completed = False
+    if user_id is not None:
+        charged_input = await db.consume_ai_tokens(user_id, input_cost)
+        if not charged_input:
+            balance = await db.get_ai_tokens(user_id)
+            return (
+                f"{INSUFFICIENT_TOKENS_PREFIX} нужно {input_cost}, у тебя {balance}.\n"
+                "Купи токены в «Магазине» → «Токены ИИ»."
+            )
+
+    try:
+        messages = [{
+            "role": "system",
+            "content": "Ты умный ассистент женского пола по имени Ксения. "
+                       "Пиши в дружеском стиле. Не нужен пафос. Будь на лайтах. "
+                       "Пиши максимально коротко и не сухо!",
+        }]
+        if user_id is not None:
+            messages.extend(dict(m) for m in _get_history(user_id))
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "stream": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {AI_TOKEN}",
+            "Accept": "text/event-stream",
+        }
+
+        session = await _get_session()
+        pieces = []
+        raw_lines = []
+        async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("ai stream: HTTP %s — %s", resp.status, body[:500])
+                return None
+
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if line:
+                    raw_lines.append(line)
+                if not line or line.startswith(":") or not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_text)
+                except Exception:
+                    continue
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}).get("content")
+                if isinstance(delta, list):
+                    delta = "".join(
+                        item.get("text", "") for item in delta if isinstance(item, dict)
+                    )
+                if not isinstance(delta, str) or not delta:
+                    continue
+                pieces.append(delta)
+                if on_chunk:
+                    result = on_chunk(delta)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            # Совместимость с провайдерами, которые игнорируют stream=true
+            # и возвращают обычный OpenAI JSON вместо SSE.
+            if not pieces and raw_lines:
+                try:
+                    fallback_data = json.loads("\n".join(raw_lines))
+                    fallback_choices = fallback_data.get("choices") or []
+                    if fallback_choices:
+                        fallback_content = ((fallback_choices[0].get("message") or {}).get("content") or "")
+                        if isinstance(fallback_content, str) and fallback_content:
+                            pieces.append(fallback_content)
+                            if on_chunk:
+                                result = on_chunk(fallback_content)
+                                if asyncio.iscoroutine(result):
+                                    await result
+                except Exception:
+                    pass
+
+        content = "".join(pieces).strip()
+        if not content:
+            return None
+
+        output_cost = count_words(content)
+        if user_id is not None and output_cost:
+            charged_output = await db.consume_ai_tokens(user_id, output_cost)
+            if not charged_output:
+                try:
+                    await db.refund_ai_tokens(user_id, input_cost)
+                except Exception:
+                    logger.exception("ai stream: не удалось вернуть оплату запроса user=%s", user_id)
+                charged_input = False
+                balance = await db.get_ai_tokens(user_id)
+                completed = True
+                return (
+                    f"{INSUFFICIENT_TOKENS_PREFIX} нужно {input_cost + output_cost} "
+                    f"(запрос: {input_cost}, ответ: {output_cost}), у тебя {balance}.\n"
+                    "Купи токены в «Магазине» → «Токены ИИ»."
+                )
+
+        if user_id is not None:
+            _append(user_id, "user", prompt)
+            _append(user_id, "assistant", content)
+        completed = True
+        return content
+
+    except asyncio.TimeoutError as exc:
+        logger.warning("ai stream: таймаут: %s", exc)
+        return None
+    except aiohttp.ClientError as exc:
+        logger.warning("ai stream: сеть: %s", exc)
+        return None
+    except Exception as exc:
+        logger.exception("ai stream: неожиданная ошибка: %s", exc)
+        return None
+    finally:
+        if charged_input and not completed:
+            try:
+                refunded = await db.refund_ai_tokens(user_id, input_cost)
+                if not refunded:
+                    logger.error("ai stream: НЕ УДАЛОСЬ вернуть %s токенов user=%s", input_cost, user_id)
+            except Exception:
+                logger.exception("ai stream: ошибка возврата токенов user=%s", user_id)
+
 
 async def try_acquire(user_id: int) -> float:
     """Атомарно проверяет и занимает cooldown.

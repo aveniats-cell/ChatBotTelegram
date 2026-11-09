@@ -2,7 +2,13 @@
 
 import os
 import re
+import json
+import asyncio
+import html
+import time
 import logging
+
+import aiohttp
 from datetime import time as dtime, timezone
 
 from telegram import Update
@@ -207,86 +213,211 @@ def _split_telegram_text(
     return chunks or [""]
 
 
-async def _run_ai(user, msg, prompt: str) -> None:
-    remain = await ai.try_acquire(user.id)
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    raw = (value or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value or ""
+    return raw[:max_bytes].decode("utf-8", errors="ignore") + "…"
 
+
+def _markdown_to_html(value: str) -> str:
+    """Безопасный небольшой Markdown-конвертер для сообщений Telegram."""
+    text = html.escape(value or "")
+    text = re.sub(r"```(?:[\w+-]+)?\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.S)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"^###\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+    text = re.sub(r"^##\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+    text = re.sub(r"^#\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+    return text
+
+
+_WIDGET_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8"><style>
+:root{color-scheme:light dark}body{font-family:system-ui,sans-serif;margin:0;color:var(--tg-theme-text-color)}
+#answer{white-space:normal;overflow-wrap:anywhere;line-height:1.48;user-select:text}
+#answer p{margin:0 0 8px}#answer h1,#answer h2,#answer h3{font-size:1.05em;margin:10px 0 6px}
+#answer pre{white-space:pre-wrap;background:var(--tg-theme-secondary-bg-color);padding:8px;border-radius:8px}
+#answer code{font-family:monospace;background:var(--tg-theme-secondary-bg-color);border-radius:4px;padding:1px 3px}
+#meta{border-top:1px solid var(--tg-theme-section-separator-color);margin-top:12px;padding-top:9px;color:var(--tg-theme-hint-color);font-size:12px}
+.stat{display:flex;justify-content:space-between;gap:12px;margin:4px 0}.value{color:var(--tg-theme-text-color);font-variant-numeric:tabular-nums;font-weight:600}
+#status{font-size:11px;color:var(--tg-theme-hint-color);margin-bottom:8px;letter-spacing:.04em;text-transform:uppercase}
+</style></head><body>
+<div id="status">Ксения готовит ответ</div><div id="answer">Загружаю…</div>
+<div id="meta"><div class="stat"><span>Потрачено</span><span class="value" id="spent">0</span></div>
+<div class="stat"><span>Остаток</span><span class="value" id="left">—</span></div></div>
+<script>
+(function(){
+ const W=window.TelegramWidget;
+ const $=id=>document.getElementById(id);
+ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+ function md(s){
+  let x=esc(s||'');
+  x=x.replace(/```([\s\S]*?)```/g,'<pre>$1</pre>');
+  x=x.replace(/`([^`]+)`/g,'<code>$1</code>');
+  x=x.replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>').replace(/^# (.+)$/gm,'<h2>$1</h2>');
+  x=x.replace(/\*\*(.+?)\*\*/gs,'<strong>$1</strong>').replace(/__(.+?)__/gs,'<strong>$1</strong>');
+  x=x.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  return x.split(/\n{2,}/).map(p=>p.startsWith('<pre>')?p:'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
+ }
+ function render(){
+  let d={};try{d=JSON.parse(W.chatData||'{}')}catch(e){}
+  $('answer').innerHTML=md(d.text||'');
+  $('spent').textContent=String(d.spent??0);
+  $('left').textContent=d.left==null?'—':String(d.left);
+  $('status').textContent=d.status==='done'?'ОТВЕТ ГОТОВ':(d.status==='error'?'НЕ УДАЛОСЬ ПОЛУЧИТЬ ОТВЕТ':'КСЕНИЯ ОТВЕЧАЕТ');
+ }
+ W.onEvent('chatDataChanged',render);render();
+})();
+</script></body></html>'''
+
+
+async def _run_ai(user, msg, prompt: str, context=None) -> None:
+    remain = await ai.try_acquire(user.id)
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
 
-    needed = ai.count_words(
-        prompt[:ai.MAX_PROMPT_CHARS].strip()
-    )
+    needed = max(1, ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip()))
+    initial_balance = await db.get_ai_tokens(user.id)
+    is_private = bool(msg.chat and msg.chat.type == "private")
+    answer_message = None
+    widget_message_id = None
+    widget_mode = False
+    http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    bot_token = context.bot.token if context else ""
 
-    # Отправляем GIF вместо текстового сообщения «Думаю…».
-    # Путь строится относительно main.py, чтобы файл находился и на Render.
-    gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videomateria.gif")
-    thinking = None
+    async def bot_api(method: str, payload: dict):
+        url = f"https://api.telegram.org/bot{bot_token}/{method}"
+        async with http.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
+            if response.status != 200 or not data.get("ok"):
+                raise RuntimeError(f"Telegram {method}: {data}")
+            return data.get("result")
 
-    if os.path.isfile(gif_path):
+    current_text = ""
+    last_update = 0.0
+    last_state = ""
+
+    async def publish(text: str, status: str = "streaming", force: bool = False):
+        nonlocal last_update, last_state
+        output_words = ai.count_words(text)
+        spent = needed + output_words
+        left = max(0, initial_balance - spent)
+        long_answer = len(text.encode("utf-8")) > 660
+        visible = _truncate_utf8(text, 660)
+        if long_answer and status == "done":
+            visible += "\n\nПолный ответ отправлен отдельным сообщением."
+        state = json.dumps({"text": visible, "spent": spent, "left": left, "status": status}, ensure_ascii=False, separators=(",", ":"))
+        if len(state.encode("utf-8")) > 1000:
+            visible = _truncate_utf8(visible, 540)
+            state = json.dumps({"text": visible, "spent": spent, "left": left, "status": status}, ensure_ascii=False, separators=(",", ":"))
+        if state == last_state and not force:
+            return
+        now = time.monotonic()
+        # editMessageWidgetData считается отправкой сообщения; выдерживаем
+        # интервал, чтобы не упираться в лимит Telegram на частые обновления.
+        if last_update and now - last_update < 1.1:
+            if not force:
+                return
+            await asyncio.sleep(1.1 - (now - last_update))
         try:
-            with open(gif_path, "rb") as gif_file:
-                thinking = await msg.reply_animation(animation=gif_file)
-        except Exception:
-            logger.exception("Не удалось отправить videomateria.gif")
-            thinking = await msg.reply_text("🤔 Думаю…")
-    else:
-        logger.error("GIF не найдена: %s", gif_path)
-        thinking = await msg.reply_text("🤔 Думаю…")
+            if widget_mode and widget_message_id:
+                await bot_api("editMessageWidgetData", {
+                    "chat_id": msg.chat_id,
+                    "message_id": widget_message_id,
+                    "chat_data": state,
+                })
+            elif answer_message:
+                body = _markdown_to_html(_truncate_utf8(text or "Ксения отвечает…", 2500))
+                footer = f"\n\n<blockquote>Потрачено: <b>{spent}</b> · Остаток: <b>{left}</b></blockquote>"
+                await answer_message.edit_text((body + footer)[:3900], parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            last_state = state
+            last_update = now
+        except Exception as exc:
+            logger.debug("AI progress update failed: %s", exc)
 
-    answer = await ai.ask_ai(prompt, user_id=user.id)
+    try:
+        if is_private and bot_token:
+            try:
+                initial_state = json.dumps({"text": "Ксения готовит ответ…", "spent": needed, "left": max(0, initial_balance - needed), "status": "streaming"}, ensure_ascii=False, separators=(",", ":"))
+                sent = await bot_api("sendWidget", {
+                    "chat_id": msg.chat_id,
+                    "html": _WIDGET_HTML,
+                    "chat_data": initial_state,
+                    "caption": "Ксения отвечает",
+                    "allow_queries": False,
+                })
+                widget_message_id = sent["message_id"]
+                widget_mode = True
+                last_state = initial_state
+            except Exception:
+                logger.exception("Не удалось отправить Telegram Widget; включаю обычный вывод")
 
-    if not answer:
+        if not widget_mode:
+            answer_message = await msg.reply_text("Ксения отвечает…", disable_web_page_preview=True)
+
+        async def on_chunk(chunk: str):
+            nonlocal current_text
+            current_text += chunk
+            await publish(current_text)
+
+        answer = await ai.ask_ai_stream(prompt, user_id=user.id, on_chunk=on_chunk)
+        if not answer:
+            error_text = "ИИ не ответил. Если токены были списаны, они возвращены. Попробуй позже."
+            if widget_mode:
+                await publish(error_text, "error", force=True)
+            elif answer_message:
+                await answer_message.edit_text(error_text)
+            return
+
+        if answer.startswith(ai.INSUFFICIENT_TOKENS_PREFIX):
+            if widget_mode:
+                await publish(answer, "error", force=True)
+            elif answer_message:
+                await answer_message.edit_text(answer)
+            return
+
+        output_cost = ai.count_words(answer)
+        total_spent = needed + output_cost
         left = await db.get_ai_tokens(user.id)
+        # Синхронизируем финальный остаток с реальным балансом БД.
+        initial_balance = left + total_spent
+        await publish(answer, "done", force=True)
+        if widget_mode and widget_message_id:
+            try:
+                await bot_api("editMessageCaption", {
+                    "chat_id": msg.chat_id,
+                    "message_id": widget_message_id,
+                    "caption": "Ответ Ксении",
+                })
+            except Exception as exc:
+                logger.debug("Не удалось обновить подпись виджета: %s", exc)
 
-        if left < needed:
-            error_text = (
-                f"🧠 Недостаточно токенов. Нужно {needed}, у тебя {left}.\n"
-                "Купи токены в «Магазине» → «Токены ИИ»."
-            )
-        else:
-            error_text = (
-                "⚠️ ИИ не ответил. Если токены были списаны, "
-                "они возвращены. Попробуй позже."
-            )
+        if widget_mode and len(answer.encode("utf-8")) > 660:
+            for chunk in _split_telegram_text(answer, limit=2500):
+                await msg.reply_text(_markdown_to_html(chunk), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        elif not widget_mode and answer_message:
+            body = _markdown_to_html(answer)
+            footer = f"\n\n<blockquote>Потрачено: <b>{total_spent}</b> · Остаток: <b>{left}</b></blockquote>"
+            if len(body) + len(footer) <= 4096:
+                await answer_message.edit_text(body + footer, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            else:
+                await answer_message.edit_text("Ответ готов. Полный текст ниже.")
+                for chunk in _split_telegram_text(answer, limit=2500):
+                    await msg.reply_text(_markdown_to_html(chunk), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
-        await msg.reply_text(error_text)
-        return
-
-    if answer.startswith("🧠 Недостаточно токенов:"):
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
-        await msg.reply_text(answer)
-        return
-
-    left = await db.get_ai_tokens(user.id)
-
-    output_cost = ai.count_words(answer)
-    total_spent = needed + output_cost
-
-    chunks = _split_telegram_text(answer)
-    chunks[-1] += (
-        f"\n\n🧠 Списано: {total_spent} "
-        f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
-    )
-
-    # Убираем GIF после завершения генерации и отправляем текстовый ответ.
-    try:
-        await thinking.delete()
     except Exception:
-        pass
-
-    try:
-        for chunk in chunks:
-            await msg.reply_text(chunk)
-    except Exception:
-        logger.exception("Не удалось отправить полный ответ ИИ")
+        logger.exception("Ошибка потокового ответа ИИ")
+        if answer_message:
+            try:
+                await answer_message.edit_text("Не удалось вывести ответ. Попробуй ещё раз.")
+            except Exception:
+                pass
+    finally:
+        await http.close()
 
 
 async def cmd_ai(
@@ -317,7 +448,7 @@ async def cmd_ai(
         )
         return
 
-    await _run_ai(user, msg, prompt)
+    await _run_ai(user, msg, prompt, context)
 
 
 async def cmd_admin_stats(
