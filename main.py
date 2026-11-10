@@ -219,23 +219,28 @@ async def _run_ai(user, msg, prompt: str) -> None:
         "videomateria.gif",
     )
 
-    if not os.path.isfile(gif_path):
-        logger.error("GIF не найдена: %s", gif_path)
-        await msg.reply_text("⚠️ Не найден файл videomateria.gif.")
-        return
-
-    # Сначала отправляем GIF. До успешной отправки генерацию не начинаем.
-    try:
-        with open(gif_path, "rb") as gif_file:
-            thinking = await msg.reply_animation(animation=gif_file)
-        logger.info(
-            "GIF отправлена ДО генерации: message_id=%s user_id=%s",
-            thinking.message_id,
-            user.id,
-        )
-    except Exception:
-        logger.exception("Не удалось отправить videomateria.gif")
-        return
+    # GIF — необязательный индикатор ожидания. Если Telegram временно
+    # недоступен или файл отсутствует, сам запрос к ИИ всё равно выполняется.
+    thinking = None
+    if os.path.isfile(gif_path):
+        try:
+            with open(gif_path, "rb") as gif_file:
+                thinking = await msg.reply_animation(animation=gif_file)
+            logger.info(
+                "GIF отправлена: message_id=%s user_id=%s",
+                thinking.message_id,
+                user.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить GIF (запрос ИИ продолжится): "
+                "user_id=%s error=%s",
+                user.id,
+                exc,
+                exc_info=True,
+            )
+    else:
+        logger.warning("GIF не найдена: %s — продолжаю без анимации", gif_path)
 
     answer = None
     error_text = None
@@ -278,19 +283,20 @@ async def _run_ai(user, msg, prompt: str) -> None:
 
     finally:
         # GIF удаляется после окончания генерации и ДО текстового ответа.
-        try:
-            await thinking.delete()
-            logger.info(
-                "GIF удалена: message_id=%s user_id=%s",
-                thinking.message_id,
-                user.id,
-            )
-        except Exception:
-            logger.exception(
-                "Не удалось удалить GIF: message_id=%s user_id=%s",
-                thinking.message_id,
-                user.id,
-            )
+        if thinking is not None:
+            try:
+                await thinking.delete()
+                logger.info(
+                    "GIF удалена: message_id=%s user_id=%s",
+                    thinking.message_id,
+                    user.id,
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось удалить GIF: message_id=%s user_id=%s",
+                    thinking.message_id,
+                    user.id,
+                )
 
     # Отправляем текст только после попытки удалить GIF.
     try:
