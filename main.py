@@ -6,6 +6,7 @@ import logging
 from datetime import time as dtime, timezone
 
 from telegram import Update
+from telegram.request import HTTPXRequest
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -458,6 +459,15 @@ def build_app() -> Application:
     app = (
         Application.builder()
         .token(TOKEN)
+        # GIF загружается на сервер Telegram; увеличиваем таймауты,
+        # чтобы медленная загрузка не обрывалась через стандартные 5 секунд.
+        .request(HTTPXRequest(
+            connection_pool_size=20,
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
+            pool_timeout=30,
+        ))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
