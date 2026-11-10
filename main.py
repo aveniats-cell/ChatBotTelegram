@@ -208,39 +208,61 @@ def _split_telegram_text(
 
 
 async def _run_ai(user, msg, prompt: str) -> None:
+    """Отправляет GIF до генерации, удаляет её и только затем отвечает."""
     remain = await ai.try_acquire(user.id)
     if remain > 0:
-        await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
+        # Не отправляем дополнительное сообщение при cooldown.
         return
 
-    needed = ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip())
     gif_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "videomateria.gif"
+        os.path.dirname(os.path.abspath(__file__)),
+        "videomateria.gif",
     )
-    thinking = None
+
+    if not os.path.isfile(gif_path):
+        logger.error("GIF не найдена: %s", gif_path)
+        await msg.reply_text("⚠️ Не найден файл videomateria.gif.")
+        return
+
+    # Сначала отправляем GIF. До успешной отправки генерацию не начинаем.
+    try:
+        with open(gif_path, "rb") as gif_file:
+            thinking = await msg.reply_animation(animation=gif_file)
+        logger.info(
+            "GIF отправлена ДО генерации: message_id=%s user_id=%s",
+            thinking.message_id,
+            user.id,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить videomateria.gif")
+        return
+
     answer = None
     error_text = None
-
-    # Во время генерации отправляем только GIF. Если файл отсутствует или
-    # Telegram не принимает его, не подменяем GIF текстом «Думаю…».
-    if os.path.isfile(gif_path):
-        try:
-            with open(gif_path, "rb") as gif_file:
-                thinking = await msg.reply_animation(animation=gif_file)
-        except Exception:
-            logger.exception("Не удалось отправить videomateria.gif")
-    else:
-        logger.error("GIF не найдена: %s", gif_path)
+    chunks = []
 
     try:
+        logger.info("Начинаю генерацию ИИ: user_id=%s", user.id)
         answer = await ai.ask_ai(prompt, user_id=user.id)
+        logger.info("Генерация ИИ завершена: user_id=%s", user.id)
+
+        needed = ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip())
 
         if not answer:
-            error_text = (
-                "⚠️ ИИ не ответил. Если токены были списаны, "
-                "они возвращены. Попробуй позже."
-            )
-        elif not answer.startswith("🧠 Недостаточно токенов:"):
+            left = await db.get_ai_tokens(user.id)
+            if left < needed:
+                error_text = (
+                    f"🧠 Недостаточно токенов. Нужно {needed}, у тебя {left}.\n"
+                    "Купи токены в «Магазине» → «Токены ИИ»."
+                )
+            else:
+                error_text = (
+                    "⚠️ ИИ не ответил. Если токены были списаны, "
+                    "они возвращены. Попробуй позже."
+                )
+        elif answer.startswith("🧠 Недостаточно токенов:"):
+            error_text = answer
+        else:
             left = await db.get_ai_tokens(user.id)
             output_cost = ai.count_words(answer)
             total_spent = needed + output_cost
@@ -249,29 +271,36 @@ async def _run_ai(user, msg, prompt: str) -> None:
                 f"\n\n🧠 Списано: {total_spent} "
                 f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
             )
-        else:
-            error_text = answer
 
     except Exception:
-        logger.exception("Ошибка при обработке запроса ИИ")
-        error_text = "⚠️ Не удалось обработать запрос. Попробуй позже."
+        logger.exception("Ошибка генерации ИИ: user_id=%s", user.id)
+        error_text = "⚠️ Ошибка ИИ. Попробуй позже."
 
     finally:
-        # Удаляем GIF при любом исходе: успехе, ошибке или исключении.
-        if thinking is not None:
-            try:
-                await thinking.delete()
-            except Exception:
-                logger.warning("Не удалось удалить GIF-индикатор", exc_info=True)
+        # GIF удаляется после окончания генерации и ДО текстового ответа.
+        try:
+            await thinking.delete()
+            logger.info(
+                "GIF удалена: message_id=%s user_id=%s",
+                thinking.message_id,
+                user.id,
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось удалить GIF: message_id=%s user_id=%s",
+                thinking.message_id,
+                user.id,
+            )
 
+    # Отправляем текст только после попытки удалить GIF.
     try:
         if error_text:
             await msg.reply_text(error_text)
-        elif answer:
+        else:
             for chunk in chunks:
                 await msg.reply_text(chunk)
     except Exception:
-        logger.exception("Не удалось отправить ответ ИИ")
+        logger.exception("Не удалось отправить ответ ИИ: user_id=%s", user.id)
 
 
 async def cmd_ai(
