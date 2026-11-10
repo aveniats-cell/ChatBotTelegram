@@ -1,4 +1,3 @@
-```python
 """Точка входа: webhook-версия для Render Web Service (Free)."""
 
 import os
