@@ -1,3 +1,4 @@
+```python
 """Точка входа: webhook-версия для Render Web Service (Free)."""
 
 import os
@@ -236,8 +237,6 @@ async def _run_ai(user, msg, prompt: str) -> None:
         answer = await ai.ask_ai(prompt, user_id=user.id)
 
         if not answer:
-            # Недостаток токенов ask_ai возвращает отдельным текстовым ответом.
-            # None означает ошибку конфигурации/API/сети, а не нехватку баланса.
             error_text = (
                 "⚠️ ИИ не ответил. Если токены были списаны, "
                 "они возвращены. Попробуй позже."
@@ -253,11 +252,13 @@ async def _run_ai(user, msg, prompt: str) -> None:
             )
         else:
             error_text = answer
+
     except Exception:
         logger.exception("Ошибка при обработке запроса ИИ")
         error_text = "⚠️ Не удалось обработать запрос. Попробуй позже."
+
     finally:
-        # Удаляем индикатор при любом исходе: успехе, ошибке или исключении.
+        # Удаляем GIF при любом исходе: успехе, ошибке или исключении.
         if thinking is not None:
             try:
                 await thinking.delete()
