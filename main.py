@@ -209,84 +209,69 @@ def _split_telegram_text(
 
 async def _run_ai(user, msg, prompt: str) -> None:
     remain = await ai.try_acquire(user.id)
-
     if remain > 0:
         await msg.reply_text(f"⏳ Подожди {remain:.1f} сек.")
         return
 
-    needed = ai.count_words(
-        prompt[:ai.MAX_PROMPT_CHARS].strip()
+    needed = ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip())
+    gif_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "videomateria.gif"
     )
-
-    # Отправляем GIF вместо текстового сообщения «Думаю…».
-    # Путь строится относительно main.py, чтобы файл находился и на Render.
-    gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videomateria.gif")
     thinking = None
+    answer = None
+    error_text = None
 
+    # Во время генерации отправляем только GIF. Если файл отсутствует или
+    # Telegram не принимает его, не подменяем GIF текстом «Думаю…».
     if os.path.isfile(gif_path):
         try:
             with open(gif_path, "rb") as gif_file:
                 thinking = await msg.reply_animation(animation=gif_file)
         except Exception:
             logger.exception("Не удалось отправить videomateria.gif")
-            thinking = await msg.reply_text("🤔 Думаю…")
     else:
         logger.error("GIF не найдена: %s", gif_path)
-        thinking = await msg.reply_text("🤔 Думаю…")
 
-    answer = await ai.ask_ai(prompt, user_id=user.id)
+    try:
+        answer = await ai.ask_ai(prompt, user_id=user.id)
 
-    if not answer:
-        left = await db.get_ai_tokens(user.id)
-
-        if left < needed:
-            error_text = (
-                f"🧠 Недостаточно токенов. Нужно {needed}, у тебя {left}.\n"
-                "Купи токены в «Магазине» → «Токены ИИ»."
-            )
-        else:
+        if not answer:
+            # Недостаток токенов ask_ai возвращает отдельным текстовым ответом.
+            # None означает ошибку конфигурации/API/сети, а не нехватку баланса.
             error_text = (
                 "⚠️ ИИ не ответил. Если токены были списаны, "
                 "они возвращены. Попробуй позже."
             )
-
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
-        await msg.reply_text(error_text)
-        return
-
-    if answer.startswith("🧠 Недостаточно токенов:"):
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
-        await msg.reply_text(answer)
-        return
-
-    left = await db.get_ai_tokens(user.id)
-
-    output_cost = ai.count_words(answer)
-    total_spent = needed + output_cost
-
-    chunks = _split_telegram_text(answer)
-    chunks[-1] += (
-        f"\n\n🧠 Списано: {total_spent} "
-        f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
-    )
-
-    # Убираем GIF после завершения генерации и отправляем текстовый ответ.
-    try:
-        await thinking.delete()
+        elif not answer.startswith("🧠 Недостаточно токенов:"):
+            left = await db.get_ai_tokens(user.id)
+            output_cost = ai.count_words(answer)
+            total_spent = needed + output_cost
+            chunks = _split_telegram_text(answer)
+            chunks[-1] += (
+                f"\n\n🧠 Списано: {total_spent} "
+                f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
+            )
+        else:
+            error_text = answer
     except Exception:
-        pass
+        logger.exception("Ошибка при обработке запроса ИИ")
+        error_text = "⚠️ Не удалось обработать запрос. Попробуй позже."
+    finally:
+        # Удаляем индикатор при любом исходе: успехе, ошибке или исключении.
+        if thinking is not None:
+            try:
+                await thinking.delete()
+            except Exception:
+                logger.warning("Не удалось удалить GIF-индикатор", exc_info=True)
 
     try:
-        for chunk in chunks:
-            await msg.reply_text(chunk)
+        if error_text:
+            await msg.reply_text(error_text)
+        elif answer:
+            for chunk in chunks:
+                await msg.reply_text(chunk)
     except Exception:
-        logger.exception("Не удалось отправить полный ответ ИИ")
+        logger.exception("Не удалось отправить ответ ИИ")
 
 
 async def cmd_ai(
