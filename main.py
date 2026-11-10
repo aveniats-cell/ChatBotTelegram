@@ -42,6 +42,7 @@ import shop
 import reputation
 import blacklist
 import helper
+import home_menu
 
 
 logging.basicConfig(
@@ -79,25 +80,8 @@ async def cmd_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    u = update.effective_user
-    msg = update.effective_message
-
-    if not msg:
-        return
-
-    if u:
-        await db.upsert_user(u.id, u.username, u.first_name)
-
-    await msg.reply_text(
-        "Привет! Я PR-бот.\n"
-        "/help — список команд по ролям\n"
-        "/check — подписка\n"
-        "/ping — жив?\n"
-        "/restart — сбросить контекст ИИ\n"
-        "Профиль — профиль\n"
-        "Казино — мини-казино\n"
-        "Магазин — пакеты команд"
-    )
+    """Показывает обновлённую главную панель."""
+    await home_menu.cmd_menu(update, context)
 
 
 async def cmd_ping(
@@ -501,6 +485,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("unbanbot", blacklist.cmd_unbanbot))
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", home_menu.cmd_menu))
+    app.add_handler(CallbackQueryHandler(home_menu.home_callback, pattern=r"^home:"))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
     app.add_handler(CommandHandler("check", pr.recheck_subscription))

@@ -26,7 +26,7 @@ ADMIN_ID = _get_admin_id()
 
 
 _SECTIONS = {
-    "general": ("📋 Общий", [
+    "general": ("Общие команды", [
         "Профиль [@user] — профиль с кнопками разделов",
         "Аура — своя аура и место в топе",
         "Топ аура — топ-10 по ауре в чате",
@@ -83,11 +83,11 @@ _SECTIONS = {
         "/start — приветствие",
     ]),
 
-    "sheriff": ("👮 Шериф", [
+    "sheriff": ("Раздел шерифа", [
         "Поймать @user — запрос админу на бан",
     ]),
 
-    "commissar": ("🎖 Комиссар", [
+    "commissar": ("Раздел комиссара", [
         "+Шериф / -Шериф @user — назначить/снять шерифа",
         "+Мут 5ч Причина @user — замутить",
         "+Мут @user 1ч 30м Причина — время и причина в любом порядке",
@@ -102,7 +102,7 @@ _SECTIONS = {
         "Опрос ССС / описание /1/ В1 / В2 — опрос для ССС (5 мин)",
     ]),
 
-    "creator": ("👑 Создатель", [
+    "creator": ("Панель создателя", [
         "+Комиссар / -Комиссар @user — назначить/снять комиссара",
         "Список шерифы — список шерифов",
         "Список комиссары — список комиссаров",
@@ -165,15 +165,15 @@ def _visible_sections(is_admin: bool, role: str | None) -> list[str]:
 
 def _main_kb(sections: list[str]) -> InlineKeyboardMarkup:
     """Клавиатура главного меню справки."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                _SECTIONS[section][0],
-                callback_data=f"help:{section}",
-            )
-        ]
+    buttons = [
+        InlineKeyboardButton(
+            _SECTIONS[section][0],
+            callback_data=f"help:{section}",
+        )
         for section in sections
-    ])
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
 
 
 def _section_kb(section: str) -> InlineKeyboardMarkup:
@@ -181,7 +181,7 @@ def _section_kb(section: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "⬅️ Назад",
+                "← Назад",
                 callback_data="help:back",
             )
         ]

@@ -55,7 +55,29 @@ def _main_keyboard():
         ],
         [InlineKeyboardButton("🎰 Слоты", callback_data="cas:game:slots")],
         [InlineKeyboardButton("📖 Правила и выплаты", callback_data="cas:help")],
+        [InlineKeyboardButton("← Главное меню", callback_data="home:back")],
     ])
+
+
+async def open_casino_from_callback(query, user) -> None:
+    """Открывает игровой стол из главной панели."""
+    if not query or not query.message or not user:
+        return
+    await _ensure_user(user)
+    key = (query.message.chat.id, query.message.message_id)
+    _CASINO_OWNERS[key] = user.id
+    try:
+        await query.edit_message_text(
+            "<b>Мини-казино</b>\n\n"
+            "Выбери игру. Ставка списывается только после проверки баланса.\n"
+            f"Диапазон ставки: <b>{MIN_BET}–{MAX_BET}</b> монет.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_main_keyboard(),
+        )
+    except TelegramError as exc:
+        if "not modified" not in str(exc).lower():
+            logger.exception("Не удалось открыть казино из меню")
+            raise
 
 
 async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

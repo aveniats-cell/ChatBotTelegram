@@ -39,9 +39,24 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Токены ИИ", callback_data="shop:ai")],
-        [InlineKeyboardButton("🎁 Пакеты команд", callback_data="shop:packages")],
+        [InlineKeyboardButton("Токены ИИ", callback_data="shop:ai")],
+        [InlineKeyboardButton("Пакеты команд", callback_data="shop:packages")],
+        [InlineKeyboardButton("← Главное меню", callback_data="home:back")],
     ])
+
+
+async def open_shop_from_callback(query, user) -> None:
+    """Открывает магазин из главной панели, сохраняя владельца меню."""
+    if not query or not query.message or not user:
+        return
+    key = (query.message.chat.id, query.message.message_id)
+    _MENU_OWNERS[key] = user.id
+    await _safe_edit(
+        query,
+        "<b>Магазин</b>\n\nВыбери, что хочешь приобрести.\n"
+        "Покупки подтверждаются отдельно; баланс проверяется при оплате.",
+        _main_keyboard(),
+    )
 
 
 async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -115,7 +130,7 @@ async def _render_packages(q):
             f"🎁 {p['name']} · {p['price']} 🪙",
             callback_data=f"shop:view:{int(p['id'])}",
         )])
-    rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="shop:main")])
+    rows.append([InlineKeyboardButton("← В главное меню", callback_data="shop:main")])
     text = (
         "🎁 <b>ПАКЕТЫ КОМАНД</b>\n\n"
         "Покупай наборы команд и расширяй свои возможности в чате.\n"
@@ -133,7 +148,7 @@ async def _render_ai_tokens(q, user, *, answer=True):
         f"🪙 {p['tokens']} токенов — {p['price']} монет",
         callback_data=f"shop:ai_buy:{pid}",
     )] for pid, p in AI_TOKEN_PACKS.items()]
-    rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="shop:main")])
+    rows.append([InlineKeyboardButton("← В главное меню", callback_data="shop:main")])
     await _safe_edit(
         q,
         "🧠 <b>ТОКЕНЫ ИИ</b>\n\n"
@@ -198,7 +213,7 @@ async def _view_pocket(q, user, pocket_id: int, *, answer=True):
     if has:
         lines.extend(["", "✅ <i>Этот пакет уже есть у тебя.</i>"])
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⬅️ К пакетам команд", callback_data="shop:packages")
+            InlineKeyboardButton("← К пакетам команд", callback_data="shop:packages")
         ]])
     else:
         keyboard = InlineKeyboardMarkup([
@@ -206,7 +221,7 @@ async def _view_pocket(q, user, pocket_id: int, *, answer=True):
                 f"🛒 Купить за {int(pocket['price'])} 🪙",
                 callback_data=f"shop:buy:{pocket_id}",
             )],
-            [InlineKeyboardButton("⬅️ К пакетам команд", callback_data="shop:packages")],
+            [InlineKeyboardButton("← К пакетам команд", callback_data="shop:packages")],
         ])
     await _safe_edit(q, "\n".join(lines), keyboard)
     if answer:

@@ -72,22 +72,23 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _kb(target_uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎮 Игры", callback_data=f"prof:games:{target_uid}"),
-            InlineKeyboardButton("✨ Аура", callback_data=f"prof:aura:{target_uid}"),
+            InlineKeyboardButton("Игры", callback_data=f"prof:games:{target_uid}"),
+            InlineKeyboardButton("Аура", callback_data=f"prof:aura:{target_uid}"),
         ],
         [
-            InlineKeyboardButton("🏅 Награды", callback_data=f"prof:awards:{target_uid}"),
-            InlineKeyboardButton("📊 Статистика", callback_data=f"prof:counters:{target_uid}"),
+            InlineKeyboardButton("Награды", callback_data=f"prof:awards:{target_uid}"),
+            InlineKeyboardButton("Статистика", callback_data=f"prof:counters:{target_uid}"),
         ],
         [
-            InlineKeyboardButton("🛡️ Безопасность", callback_data=f"prof:safety:{target_uid}"),
+            InlineKeyboardButton("Безопасность", callback_data=f"prof:safety:{target_uid}"),
         ],
+        [InlineKeyboardButton("← Главное меню", callback_data="home:back")],
     ])
 
 
 def _kb_section(target_uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("‹ Назад к профилю", callback_data=f"prof:base:{target_uid}")]
+        [InlineKeyboardButton("← К профилю", callback_data=f"prof:base:{target_uid}")]
     ])
 
 
@@ -187,7 +188,7 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
         f"{relationship}\n"
         f"🛡️ Служба ССС: <b>{'Да' if sss_member else 'Нет'}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Выбери раздел, чтобы посмотреть подробности ↓</i>"
+        "<i>Выбери раздел для подробной информации.</i>"
     )
 
 
