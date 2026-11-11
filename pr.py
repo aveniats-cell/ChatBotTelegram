@@ -91,7 +91,7 @@ def _is_normal_user_message(update: Update) -> bool:
     return True
 
 
-async def is_subscribed(bot, user_id: int) -> Optional[bool]:
+async def is_subscribed(bot, user_id: int) -> bool | None:
     """Проверяет подписку.
 
     True  — подписан;
