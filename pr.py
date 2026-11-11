@@ -91,16 +91,26 @@ def _is_normal_user_message(update: Update) -> bool:
     return True
 
 
-async def is_subscribed(bot, user_id: int) -> bool:
+async def is_subscribed(bot, user_id: int) -> Optional[bool]:
+    """Проверяет подписку.
+
+    True  — подписан;
+    False — точно не подписан;
+    None  — Telegram не дал проверить статус.
+
+    Ошибка доступа к списку участников не должна превращаться ни в
+    подтверждённую подписку, ни в отказ пользователю: в таком случае
+    пропускаем проверку и не меняем сохранённый статус.
+    """
     if not CANAL_ID:
+        logger.warning("CANAL_ID не задан: проверка подписки отключена")
         return True
 
     try:
         member = await bot.get_chat_member(
             chat_id=CANAL_ID,
-            user_id=user_id
+            user_id=user_id,
         )
-
         return member.status not in (
             ChatMember.LEFT,
             ChatMember.BANNED,
@@ -108,13 +118,13 @@ async def is_subscribed(bot, user_id: int) -> bool:
 
     except TelegramError as e:
         logger.warning(
-            "Не удалось проверить подписку %s: %s",
+            "Не удалось проверить подписку user=%s canal=%s: %s. "
+            "Статус не изменён; проверьте CANAL_ID и права бота.",
             user_id,
-            e
+            CANAL_ID,
+            e,
         )
-
-        # При ошибке API не блокируем пользователя.
-        return True
+        return None
 
 
 def _subscription_keyboard() -> InlineKeyboardMarkup:
@@ -177,6 +187,12 @@ async def check_and_delete(
 
     ok = await is_subscribed(context.bot, user.id)
 
+    # None означает, что Telegram не предоставил статус (например,
+    # бот не имеет доступа к участникам канала). Не перезаписываем БД
+    # и не удаляем сообщение пользователя из-за временной ошибки API.
+    if ok is None:
+        return
+
     try:
         await db.set_subscription(user.id, ok)
     except Exception as e:
@@ -231,13 +247,14 @@ async def on_new_member(
             )
 
             ok = await is_subscribed(context.bot, member.id)
-            await db.set_subscription(member.id, ok)
+            if ok is not None:
+                await db.set_subscription(member.id, ok)
 
         except Exception as e:
             logger.warning("Ошибка обработки нового участника: %s", e)
             continue
 
-        if ok:
+        if ok is None or ok:
             continue
 
         try:
@@ -277,6 +294,14 @@ async def recheck_subscription(
         return
 
     ok = await is_subscribed(context.bot, user.id)
+
+    if ok is None:
+        await msg.reply_text(
+            "⚠️ Сейчас не удалось проверить подписку через Telegram. "
+            "Попробуйте позже. Администратору нужно проверить, что бот "
+            "добавлен в канал и имеет права администратора."
+        )
+        return
 
     await db.set_subscription(user.id, ok)
 
