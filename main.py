@@ -70,6 +70,19 @@ _AI_WORD = re.compile(
 )
 
 
+class _CoinAmountReplyFilter(filters.MessageFilter):
+    """Пропускает только ответы на сообщение с запросом количества монет."""
+
+    def filter(self, message):
+        reply = message.reply_to_message
+        return bool(
+            reply
+            and "Введите количество монет" in (reply.text or "")
+        )
+
+
+
+
 async def _error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -921,13 +934,7 @@ def build_app() -> Application:
     # ИИ Ксения — только обращения к Ксюше.
     # Ответ числом на запрос количества монет в магазине.
     app.add_handler(MessageHandler(
-        filters.REPLY & filters.TEXT & filters.create(
-            lambda update: bool(
-                update.effective_message
-                and update.effective_message.reply_to_message
-                and "Введите количество монет" in (update.effective_message.reply_to_message.text or "")
-            )
-        ),
+        _CoinAmountReplyFilter(),
         premium.coin_amount_input,
     ))
 
