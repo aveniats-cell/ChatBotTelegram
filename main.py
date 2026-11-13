@@ -919,6 +919,18 @@ def build_app() -> Application:
     ))
 
     # ИИ Ксения — только обращения к Ксюше.
+    # Ответ числом на запрос количества монет в магазине.
+    app.add_handler(MessageHandler(
+        filters.REPLY & filters.TEXT & filters.create(
+            lambda update: bool(
+                update.effective_message
+                and update.effective_message.reply_to_message
+                and "Введите количество монет" in (update.effective_message.reply_to_message.text or "")
+            )
+        ),
+        premium.coin_amount_input,
+    ))
+
     app.add_handler(MessageHandler(
         filters.Regex(_AI_WORD),
         cmd_ai,
