@@ -9,6 +9,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import premium
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,17 @@ async def cmd_droch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.warning("upsert_user in cmd_droch: %s", e)
 
-    ok = await db.aura_droch(chat.id, user.id)
+    sub = await premium.get(user.id)
+    cooldown_minutes = 30 if sub and sub["plan"] == "pro" else 60
+    cooldown_sec = cooldown_minutes * 60
+    ok = await db.aura_droch(chat.id, user.id, cooldown_minutes)
     if not ok:
         row = await db.aura_get(chat.id, user.id)
         last = (row or {}).get("last_droch_at")
         last_dt = _parse_utc(last) if last else None
         if last_dt:
             elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-            remain = max(0, AURA_COOLDOWN_SEC - int(elapsed))
+            remain = max(0, cooldown_sec - int(elapsed))
             await msg.reply_text(
                 f"⏳ Рано! Следующий раз через <b>{_fmt_hms(remain)}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -74,7 +78,7 @@ async def cmd_droch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(
         f"✨ +1 аура!\n"
         f"Текущая аура: <b>{value}</b>{rank_line}\n"
-        f"<i>Следующий раз — через час.</i>",
+        f"<i>Следующий раз — через {'30 минут' if cooldown_minutes == 30 else 'час'}.</i>",
         parse_mode=ParseMode.HTML,
     )
 
