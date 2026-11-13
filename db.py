@@ -2386,8 +2386,8 @@ async def count_complaints_against(chat_id: int, target_id: int) -> int:
 
 # ---------- aura ----------
 
-async def aura_droch(chat_id: int, user_id: int) -> bool:
-    """один атомарный INSERT ... ON CONFLICT DO UPDATE."""
+async def aura_droch(chat_id: int, user_id: int, cooldown_minutes: int = 60) -> bool:
+    """Атомарное начисление ауры с настраиваемым интервалом."""
     rs = await _exec(
         """INSERT INTO aura (chat_id, user_id, value, last_droch_at)
            VALUES (?, ?, 1, datetime('now'))
@@ -2395,8 +2395,8 @@ async def aura_droch(chat_id: int, user_id: int) -> bool:
              value = aura.value + 1,
              last_droch_at = datetime('now')
            WHERE aura.last_droch_at IS NULL
-              OR aura.last_droch_at <= datetime('now', '-1 hour')""",
-        [chat_id, user_id],
+              OR aura.last_droch_at <= datetime('now', ?)""",
+        [chat_id, user_id, f'-{max(1, int(cooldown_minutes))} minutes'],
     )
     if getattr(rs, "error", False):
         return False
@@ -3252,11 +3252,21 @@ async def shop_commands_by_pocket(pocket_id: int) -> list[dict]:
 
 async def shop_user_has_pocket(chat_id: int, user_id: int, pocket_id: int) -> bool:
     rs = await _exec(
-        "SELECT 1 FROM shop_purchases "
-        "WHERE chat_id=? AND user_id=? AND pocket_id=? LIMIT 1",
+        "SELECT 1 FROM shop_purchases WHERE chat_id=? AND user_id=? AND pocket_id=? LIMIT 1",
         [chat_id, user_id, pocket_id],
     )
-    return bool(rs.rows)
+    if rs.rows:
+        return True
+    # Premium даёт временный доступ, не создавая постоянную покупку.
+    premium_rs = await _exec(
+        "SELECT plan, base_pocket_id FROM premium_subscriptions WHERE user_id=? AND expires_at>? LIMIT 1",
+        [user_id, __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()],
+    )
+    if premium_rs.rows:
+        plan, base_pocket = premium_rs.rows[0]
+        if plan == 'pro' or (plan == 'base' and base_pocket is not None and int(base_pocket) == int(pocket_id)):
+            return True
+    return False
 
 
 async def shop_purchase_add(chat_id: int, user_id: int, pocket_id: int,
