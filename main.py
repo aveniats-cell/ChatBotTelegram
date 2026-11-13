@@ -39,6 +39,7 @@ import command_registry   # noqa: F401 — должен идти до commands_d
 import commands_dop       # noqa: F401 — регистрирует команды в реестре
 import commands_dop_handlers
 import shop
+import premium
 import reputation
 import blacklist
 import helper
@@ -397,6 +398,7 @@ async def _cleanup_polls_job(
 
 async def post_init(app: Application) -> None:
     await db.init_db()
+    await premium.init_db()
     await helper.init_db()
     await sss.restore_sss_members()
     await resolver.start_client()
@@ -421,6 +423,7 @@ async def post_init(app: Application) -> None:
         )
 
         economy.register_jobs(app)
+        app.job_queue.run_repeating(premium.rewards_job, interval=3600, first=30)
 
     else:
         logger.warning("JobQueue не инициализирован")
@@ -508,6 +511,10 @@ def build_app() -> Application:
     app.add_handler(
         CommandHandler("ALLMONEY", economy.cmd_all_money)
     )
+    app.add_handler(CommandHandler("GetPremium", premium.admin_command))
+    from telegram.ext import PreCheckoutQueryHandler
+    app.add_handler(PreCheckoutQueryHandler(premium.precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.successful_payment))
 
     app.add_handler(MessageHandler(
         filters.Regex(r"^\+Шериф(\s|$)"),
