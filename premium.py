@@ -16,6 +16,7 @@ PLANS = {
 async def init_db():
  await db._exec('''CREATE TABLE IF NOT EXISTS premium_subscriptions (user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL, expires_at TEXT NOT NULL, last_reward_day TEXT, base_pocket_id INTEGER, free_credit_used INTEGER NOT NULL DEFAULT 0)''')
  await db._exec('''CREATE TABLE IF NOT EXISTS premium_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)''')
+ await db._exec('''CREATE TABLE IF NOT EXISTS coin_shop_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, coins INTEGER NOT NULL, created_at TEXT NOT NULL)''')
 
 async def get(user_id):
  r=await db._exec('SELECT plan, expires_at, base_pocket_id FROM premium_subscriptions WHERE user_id=?',[user_id])
@@ -28,10 +29,12 @@ async def get(user_id):
 async def has_protection(user_id): return bool(await get(user_id))
 
 async def open_menu(q):
- await q.edit_message_text('🖤 <b>Premium Shop</b>\n\nВыберите категорию:',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🪙 Покупка монет',callback_data='shop:ai')],[InlineKeyboardButton('⭐ Покупка Premium',callback_data='shop:premium')],[InlineKeyboardButton('← Назад',callback_data='shop:main')]]))
+ await q.edit_message_text('🛍 <b>МАГАЗИН</b>\n\nВыберите, что хотите приобрести:',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🪙 Купить монеты за Stars',callback_data='shop:coins')],[InlineKeyboardButton('⭐ Premium-подписка',callback_data='shop:premium')],[InlineKeyboardButton('← Назад',callback_data='shop:main')]]))
+ await q.answer()
 
 async def show_catalog(q):
- await q.edit_message_text('⭐ <b>Каталог Premium</b>',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('💎 Premium Pro (Recommended)',callback_data='shop:premium:pro')],[InlineKeyboardButton('🤑 Premium Base',callback_data='shop:premium:base')],[InlineKeyboardButton('← Назад',callback_data='shop:premium_home')]]))
+ await q.edit_message_text('⭐ <b>PREMIUM</b>\n\nВыберите подписку:',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('💎 Premium Pro',callback_data='shop:premium_plan:pro')],[InlineKeyboardButton('🤑 Premium Base',callback_data='shop:premium_plan:base')],[InlineKeyboardButton('← В магазин',callback_data='shop:premium_home')]]))
+ await q.answer()
 
 async def show_plan(q, plan):
  p=PLANS[plan]
@@ -40,7 +43,8 @@ async def show_plan(q, plan):
  else:
   perks='''1. Защита от дефолтов\n2. +100 монет сразу\n3. +10 монет ежедневно\n4. +100 токенов ИИ сразу\n5. 🤑 рядом с ником в топах\n6. Статус Premium Base 🤑 в профиле\n7. Один платный пак команд на выбор'''
  text=f"<b>{p['title']}</b>\n\nЦена: <b>{p['price']}⭐</b>\nСрок действия: <b>{p['days']} дней</b>{' + 2🎁' if plan=='pro' else ''}\n\n<b>Разблокируется:</b>\n{perks}"
- await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Оплатить {p['price']}⭐",callback_data=f'shop:premium_pay:{plan}')],[InlineKeyboardButton('← Каталог',callback_data='shop:premium')]]))
+ await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Оплатить {p['price']} ⭐",callback_data=f'shop:premium_pay:{plan}')],[InlineKeyboardButton('← Каталог',callback_data='shop:premium')]]))
+ await q.answer()
 
 async def choose_base_pack(q):
  pockets=await db.shop_pockets_list(q.message.chat.id)
@@ -48,8 +52,9 @@ async def choose_base_pack(q):
  for item in pockets or []:
   if item.get('active'):
    rows.append([InlineKeyboardButton(f"{item['name']} · {item['price']}🪙",callback_data=f"shop:premium_pack:{int(item['id'])}")])
- rows.append([InlineKeyboardButton('← Назад',callback_data='shop:premium:base')])
- await q.edit_message_text('🤑 <b>Выбери один платный пак</b>, который будет доступен на время Premium Base:',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+ rows.append([InlineKeyboardButton('← Назад',callback_data='shop:premium_plan:base')])
+ await q.edit_message_text('🤑 <b>Выберите один платный пакет</b>, который будет доступен на время Premium Base:',parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+ await q.answer()
 
 async def send_invoice(q, context, user, plan):
  p=PLANS[plan]
@@ -61,7 +66,14 @@ async def precheckout(update:Update, context:ContextTypes.DEFAULT_TYPE):
  q=update.pre_checkout_query
  if not q:return
  parts=(q.invoice_payload or '').split(':')
- ok=len(parts)==5 and parts[0]=='premium' and parts[1] in PLANS and int(parts[2])==q.from_user.id and q.currency=='XTR' and q.total_amount==PLANS[parts[1]]['price']
+ try:
+  if len(parts)==4 and parts[0]=='coins':
+   coins=int(parts[2])
+   ok=(int(parts[1])==q.from_user.id and 20<=coins<=200000 and coins%20==0 and q.currency=='XTR' and q.total_amount==coins//20)
+  else:
+   ok=(len(parts)==5 and parts[0]=='premium' and parts[1] in PLANS and int(parts[2])==q.from_user.id and q.currency=='XTR' and q.total_amount==PLANS[parts[1]]['price'])
+ except (TypeError, ValueError):
+  ok=False
  await q.answer(ok=ok,error_message=None if ok else 'Счёт недействителен. Открой магазин и создай новый.')
 
 async def activate(user, plan, context, charge_id, chat_id=None, base_pocket_id=None):
@@ -99,10 +111,48 @@ async def successful_payment(update:Update,context:ContextTypes.DEFAULT_TYPE):
  sp=msg.successful_payment if msg else None
  if not sp or not user:return
  parts=(sp.invoice_payload or '').split(':')
- if len(parts)!=5 or parts[0]!='premium' or parts[1] not in PLANS or int(parts[2])!=user.id:return
- if sp.currency!='XTR' or sp.total_amount!=PLANS[parts[1]]['price']:return
+ if parts and parts[0]=='coins':
+  try:
+   valid=(len(parts)==4 and int(parts[1])==user.id and int(parts[2])>0 and int(parts[2])%20==0 and sp.currency=='XTR' and sp.total_amount==int(parts[2])//20)
+  except (TypeError,ValueError): valid=False
+  if not valid:
+   log.error('Invalid coin purchase payment payload for user %s',user.id); return
+  coins=int(parts[2]); charge=sp.telegram_payment_charge_id
+  ins=await db._exec('INSERT OR IGNORE INTO coin_shop_payments(charge_id,user_id,coins,created_at) VALUES(?,?,?,?)',[charge,user.id,coins,datetime.now(timezone.utc).isoformat()])
+  if getattr(ins,'error',False):
+   log.error('Could not record coin payment %s',charge); return
+  if not ins.rows_affected:return
+  await db.upsert_user(user.id,user.username,user.first_name or '')
+  if not await db.add_balance(user.id,coins):
+   log.error('Payment recorded but coin credit failed: user=%s coins=%s charge=%s',user.id,coins,charge); return
+  await msg.reply_text(f'✅ Оплата прошла! На баланс начислено {coins} 🪙.')
+  return
+ if len(parts)!=5 or parts[0]!='premium' or parts[1] not in PLANS:return
+ try: valid=int(parts[2])==user.id and sp.currency=='XTR' and sp.total_amount==PLANS[parts[1]]['price']
+ except (TypeError,ValueError): valid=False
+ if not valid:return
  ok=await activate(user,parts[1],context,sp.telegram_payment_charge_id,chat_id=msg.chat_id,base_pocket_id=(int(parts[4]) or None))
  if ok: await msg.reply_text('✅ Premium активирован! Чек отправлен в личные сообщения.')
+
+async def start_coin_purchase(q, context):
+ from telegram import ForceReply
+ context.user_data['awaiting_coin_amount']=True
+ await q.message.reply_text('🪙 Введите количество монет.\n\nКурс: 1 монета = 0,05 ⭐.\nМинимум — 20 монет (1 ⭐), количество должно делиться на 20.',reply_markup=ForceReply(selective=True))
+ await q.answer('Введите количество монет ответом на сообщение бота.')
+
+async def coin_amount_input(update:Update, context:ContextTypes.DEFAULT_TYPE):
+ msg=update.effective_message; user=update.effective_user
+ if not msg or not user or not context.user_data.get('awaiting_coin_amount') or not msg.reply_to_message:return
+ try: coins=int((msg.text or '').strip())
+ except ValueError:
+  await msg.reply_text('Введите целое число монет, например 100.'); return
+ if coins<20 or coins>200000 or coins%20:
+  await msg.reply_text('Количество должно быть от 20 до 200 000 и делиться на 20. Например: 100.'); return
+ context.user_data.pop('awaiting_coin_amount',None)
+ stars=coins//20
+ payload=f'coins:{user.id}:{coins}:{int(datetime.now(timezone.utc).timestamp())}'
+ await context.bot.send_invoice(chat_id=msg.chat_id,title=f'{coins} монет',description=f'Пополнение баланса на {coins} монет по курсу 0,05 ⭐ за монету',payload=payload,provider_token='',currency='XTR',prices=[LabeledPrice(f'{coins} монет',stars)])
+ await msg.reply_text(f'🧾 К оплате: {coins} 🪙 × 0,05 ⭐ = {stars} ⭐\nНажмите кнопку оплаты в счёте выше.')
 
 async def rewards_job(context):
  today=datetime.now(timezone.utc).date().isoformat()
