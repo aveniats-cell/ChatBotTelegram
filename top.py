@@ -32,6 +32,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import premium
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,9 @@ async def _build_top_text(
             name = chat.first_name or chat.username or str(uid)
         except TelegramError:
             pass
-        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
+        sub = await premium.get(int(uid))
+        mark = (" 💎" if sub and sub["plan"] == "pro" else " 🤑" if sub else "")
+        lines.append(f"{_medal(i)} {escape(name)}{mark} — <b>{cnt}</b>")
     return "\n".join(lines)
 
 
@@ -258,7 +261,9 @@ async def _build_top_day_text(
             name = chat.first_name or chat.username or str(uid)
         except TelegramError:
             pass
-        lines.append(f"{_medal(i)} {escape(name)} — <b>{cnt}</b>")
+        sub = await premium.get(int(uid))
+        mark = (" 💎" if sub and sub["plan"] == "pro" else " 🤑" if sub else "")
+        lines.append(f"{_medal(i)} {escape(name)}{mark} — <b>{cnt}</b>")
     return "\n".join(lines)
 
 
@@ -320,7 +325,9 @@ async def cmd_top_rich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             amount = int(wealth or 0)
         except (TypeError, ValueError):
             amount = 0
-        lines.append(f"{_medal(i)} {escape(name)} — <b>{amount:,}</b> 🪙")
+        sub = await premium.get(int(user_id))
+        mark = (" 💎" if sub and sub["plan"] == "pro" else " 🤑" if sub else "")
+        lines.append(f"{_medal(i)} {escape(name)}{mark} — <b>{amount:,}</b> 🪙")
 
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
