@@ -89,12 +89,17 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await premium.open_menu(q)
     elif action == "premium":
         await premium.show_catalog(q)
+    elif action == "premium_plan" and len(parts) == 3 and parts[2] in premium.PLANS:
+        await premium.show_plan(q, parts[2])
+    elif action == "coins":
+        await premium.start_coin_purchase(q, context)
     elif action == "premium_renew" and len(parts) == 3:
         await premium.send_invoice(q, context, user, parts[2])
     elif action == "premium_pay" and len(parts) == 3:
-        if parts[2] == "base":
+        if parts[2] not in premium.PLANS:
+            await q.answer("Тариф не найден.", show_alert=True)
+        elif parts[2] == "base":
             await premium.choose_base_pack(q)
-            await q.answer()
         else:
             await premium.send_invoice(q, context, user, parts[2])
     elif action == "premium_pack" and len(parts) == 3:
