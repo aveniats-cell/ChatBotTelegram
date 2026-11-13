@@ -8,6 +8,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import premium
 
 logger = logging.getLogger(__name__)
 _MENU_OWNERS: dict[tuple[int, int], int] = {}
@@ -41,6 +42,7 @@ def _main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Токены ИИ", callback_data="shop:ai")],
         [InlineKeyboardButton("Пакеты команд", callback_data="shop:packages")],
+        [InlineKeyboardButton("🖤 Premium Shop", callback_data="shop:premium_home")],
         [InlineKeyboardButton("← Главное меню", callback_data="home:back")],
     ])
 
@@ -70,7 +72,9 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     key = (q.message.chat.id, q.message.message_id)
     owner = _MENU_OWNERS.get(key)
-    if owner is None or owner != user.id:
+    if action_is_renew := ((q.data or "").startswith("shop:premium_renew:")):
+        pass
+    elif owner is None or owner != user.id:
         await q.answer("Это не твоё меню. Вызови «Магазин» сам.", show_alert=True)
         return
 
@@ -81,6 +85,24 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _render_ai_tokens(q, user)
     elif action == "packages":
         await _render_packages(q)
+    elif action == "premium_home":
+        await premium.open_menu(q)
+    elif action == "premium":
+        await premium.show_catalog(q)
+    elif action == "premium_renew" and len(parts) == 3:
+        await premium.send_invoice(q, context, user, parts[2])
+    elif action == "premium_pay" and len(parts) == 3:
+        if parts[2] == "base":
+            await premium.choose_base_pack(q)
+            await q.answer()
+        else:
+            await premium.send_invoice(q, context, user, parts[2])
+    elif action == "premium_pack" and len(parts) == 3:
+        try:
+            context.user_data['premium_base_pack'] = int(parts[2])
+            await premium.send_invoice(q, context, user, 'base')
+        except ValueError:
+            await q.answer('Некорректный пакет.', show_alert=True)
     elif action == "ai_buy" and len(parts) == 3:
         try:
             await _buy_ai_tokens(q, user, int(parts[2]))
@@ -114,7 +136,8 @@ async def _render_main(q):
         q,
         "🛒 <b>МАГАЗИН</b>\n\nВыбери, что хочешь приобрести:\n\n"
         "🧠 <b>Токены ИИ</b> — запросы к искусственному интеллекту.\n"
-        "🎁 <b>Пакеты команд</b> — наборы дополнительных команд.",
+        "🎁 <b>Пакеты команд</b> — наборы дополнительных команд.\n"
+        "🖤 <b>Premium Shop</b> — дополнительные привилегии.",
         _main_keyboard(),
     )
     await q.answer()
