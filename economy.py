@@ -15,6 +15,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import db
+import premium
 import utils
 
 logger = logging.getLogger(__name__)
@@ -715,6 +716,8 @@ async def _collect_balances(chat_id: int, pct: int) -> tuple[int, int]:
     total = 0
     users_count = 0
     for uid, balance, savings, interest_frac, interest_remainder in rs.rows:
+        if await premium.has_protection(int(uid)):
+            continue
         balance = int(balance or 0)
         savings = int(savings or 0)
         interest_frac = int(interest_frac or 0)
