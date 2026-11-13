@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 import db
 import resolver
 import sss
+import premium
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,10 @@ async def _render_base(context, chat_id: int, target_uid: int) -> str:
     except Exception as exc:
         logger.warning("profile awards_total: %s", exc)
         awards_total = 0
+
+    prem = await premium.get(target_uid)
+    if prem:
+        role_name = role_name + " · " + ("Premium Pro 💎" if prem["plan"] == "pro" else "Premium Base 🤑")
 
     # Главная страница профиля.
     return (
