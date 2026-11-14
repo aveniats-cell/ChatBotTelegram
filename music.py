@@ -12,9 +12,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
