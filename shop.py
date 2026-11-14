@@ -2,10 +2,12 @@
 import logging
 from html import escape
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 import db
 import premium
