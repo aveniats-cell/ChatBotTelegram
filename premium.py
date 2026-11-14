@@ -1,9 +1,11 @@
 """Telegram Stars Premium: subscriptions, recurring rewards and administration."""
 import logging, os
 from datetime import datetime, timedelta, timezone
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
+from telegram import InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+from ui_design import InlineKeyboardButton
+
 import db
 
 log = logging.getLogger(__name__)
