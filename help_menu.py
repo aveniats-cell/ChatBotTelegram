@@ -4,9 +4,11 @@ import os
 import logging
 from html import escape
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 import db
 
@@ -26,7 +28,7 @@ ADMIN_ID = _get_admin_id()
 
 
 _SECTIONS = {
-    "general": ("Общие команды", [
+    "general": ("📚 Общие команды", [
         "Профиль [@user] — профиль с кнопками разделов",
         "Аура — своя аура и место в топе",
         "Топ аура — топ-10 по ауре в чате",
@@ -83,11 +85,11 @@ _SECTIONS = {
         "/start — приветствие",
     ]),
 
-    "sheriff": ("Раздел шерифа", [
+    "sheriff": ("🛡️ Раздел шерифа", [
         "Поймать @user — запрос админу на бан",
     ]),
 
-    "commissar": ("Раздел комиссара", [
+    "commissar": ("⚖️ Раздел комиссара", [
         "+Шериф / -Шериф @user — назначить/снять шерифа",
         "+Мут 5ч Причина @user — замутить",
         "+Мут @user 1ч 30м Причина — время и причина в любом порядке",
@@ -102,7 +104,7 @@ _SECTIONS = {
         "Опрос ССС / описание /1/ В1 / В2 — опрос для ССС (5 мин)",
     ]),
 
-    "creator": ("Панель создателя", [
+    "creator": ("👑 Панель создателя", [
         "+Комиссар / -Комиссар @user — назначить/снять комиссара",
         "Список шерифы — список шерифов",
         "Список комиссары — список комиссаров",
@@ -216,7 +218,7 @@ async def cmd_help(
     sections = _visible_sections(is_admin, role)
 
     await msg.reply_text(
-        "📖 <b>Справка</b>\nВыбери раздел:",
+        "📚 <b>Справка</b>\n\nВыбери нужный раздел:",
         parse_mode=ParseMode.HTML,
         reply_markup=_main_kb(sections),
     )
@@ -248,7 +250,7 @@ async def help_callback(
     if section == "back":
         try:
             await q.edit_message_text(
-                "📖 <b>Справка</b>\nВыбери раздел:",
+                "📚 <b>Справка</b>\n\nВыбери нужный раздел:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_main_kb(sections),
             )
