@@ -2,10 +2,12 @@
 import logging
 from html import escape
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 import db
 import profile
@@ -38,11 +40,10 @@ def _keyboard():
 
 def dashboard_text(user_name: str) -> str:
     return (
-        f"Привет, <b>{user_name}</b>\n"
-        "<b>PR BOT</b> · главное меню\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Общайся, играй, развивай профиль и управляй своим балансом.\n"
-        "Выбери раздел ниже."
+        f"👋 <b>Привет, {user_name}!</b>\n\n"
+        "<b>PR BOT</b>  <i>Главное меню</i>\n\n"
+        "Общайся, играй, развивай профиль и управляй балансом.\n"
+        "<i>Выбери нужный раздел:</i>"
     )
 
 
