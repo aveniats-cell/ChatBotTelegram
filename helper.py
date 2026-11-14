@@ -9,10 +9,12 @@ import secrets
 from typing import Optional
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+    Update, InlineKeyboardMarkup, ReplyKeyboardMarkup,
     KeyboardButton, ReplyKeyboardRemove,
 )
 from telegram.ext import ContextTypes, ApplicationHandlerStop
+
+from ui_design import InlineKeyboardButton
 
 import db
 
@@ -98,7 +100,7 @@ async def _create_submission(update: Update, context: ContextTypes.DEFAULT_TYPE,
         reply_markup=MENU,
     )
 
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import InlineKeyboardMarkup
     user_label = f"{user.first_name or 'Пользователь'}"
     if user.username:
         user_label += f" (@{user.username})"
