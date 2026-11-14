@@ -8,13 +8,14 @@ from html import escape
 from telegram import (
     Update,
     ChatMember,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 import db
 
