@@ -19,12 +19,13 @@ from html import escape
 from telegram import (
     Update,
     ChatPermissions,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import ContextTypes
+
+from ui_design import InlineKeyboardButton
 
 import db
 import utils
